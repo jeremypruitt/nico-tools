@@ -1,0 +1,67 @@
+# ADR-006: Concurrency — bounded parallelism, layered timeouts
+
+- **Status:** Accepted
+- **Date:** 2026-05-03
+
+## Context
+
+The whole point of `nico-doctor` is parallel I/O — running six layers of
+checks concurrently so the report comes back in seconds rather than minutes.
+Done naively, this can hammer the apiserver, leak tasks, or leave the user
+staring at a hung tool when one check goes slow.
+
+## Decision
+
+Three concurrency rules, all enforced by shared infrastructure:
+
+1. **Bounded parallelism.** All Kubernetes API calls go through a
+   `tokio::sync::Semaphore` capped at 8 concurrent permits. This protects the
+   apiserver from misuse that fans out to hundreds of pods.
+
+2. **Per-check timeout.** Every individual check has a timeout (default
+   5 seconds, configurable via `--timeout`). A timed-out check reports
+   `unknown`, not `fail` — these are distinct signals (see ADR-001).
+
+3. **Global wall-clock timeout.** The whole tool run is wrapped in a single
+   `tokio::time::timeout` (default 30 seconds). If the whole run exceeds it,
+   anything still pending is reported `unknown` and the tool exits with code
+   3 (cannot-run).
+
+Layer execution uses `tokio::join!` (or `FuturesUnordered` if streaming
+progress is added later). No unbounded `tokio::spawn` is allowed in
+production code paths.
+
+## Consequences
+
+### Positive
+- The tool is well-behaved against shared infrastructure.
+- One slow check doesn't stall the whole report.
+- Timeouts are observable — the user sees `unknown` rather than a hang.
+
+### Negative / Trade-offs
+- Choosing the right semaphore cap is a judgment call; 8 is a starting point
+  and may need tuning.
+- More code than the simplest "just run them all" version.
+
+## Alternatives Considered
+
+- **Unbounded parallelism:** rejected. We have no upper bound on how many
+  pods/services exist; we can't safely fan out unconstrained.
+- **Fully sequential:** rejected. Defeats the whole purpose; the report
+  becomes slow.
+- **Per-layer timeout only, no global:** rejected. A pathological case (many
+  slow checks) could still exceed any reasonable wall-clock budget.
+
+## Open
+
+- Concrete semaphore cap value (8) is a guess. Revisit after first production
+  run.
+- Whether to expose the semaphore cap via flag (`--max-concurrency`). Defer
+  until someone needs it.
+
+## Related
+
+- ADR-001 (exit codes) — `unknown` vs. `fail` distinction is what makes the
+  timeout behavior meaningful.
+- ADR-005 (reach mode) — port-forward setup is part of what the per-check
+  timeout has to accommodate.
