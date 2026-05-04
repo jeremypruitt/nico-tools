@@ -58,6 +58,13 @@ Read-only. No remediation. Output is human-readable by default and JSON under
 - DPU: first-class Entity type alongside Host, Workflow, Tenant, Request
 - REST Source: deferred — check log structure empirically before deciding
 
+## Key decisions to carry forward:
+- Rename GitHub repo → nico-tools, restructure as workspace
+- --type flag needs dpu added alongside workflow|host|request|tenant
+- stuck_threshold goes in [temporal] config section, default 30m
+- Timeline filtering: recency + severity first pass, Diagnosis-scoped as goal
+- REST Source: check log structure empirically before building
+
 ## Open questions
 
 - **REST access log structure**: does `infra-controller-rest` emit structured JSON access logs with `request_id` and `workflow_id` fields? If yes, build a thin `rest` Source to link `req-` IDs to workflow starts. If no, fall back to grepping Loki logs for `req-` patterns. Check with `kubectl logs -l app=rest | head -5` on a live cluster.
