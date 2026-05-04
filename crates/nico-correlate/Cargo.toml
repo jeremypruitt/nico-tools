@@ -1,0 +1,12 @@
+[package]
+name = "nico-correlate"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "nico-correlate"
+path = "src/main.rs"
+
+[dependencies]
+nico-common = { path = "../nico-common" }
+clap = { version = "4", features = ["derive"] }

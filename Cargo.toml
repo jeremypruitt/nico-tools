@@ -1,6 +1,7 @@
-[package]
-name = "nico-doctor"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
+[workspace]
+members = [
+    "crates/nico-common",
+    "crates/nico-doctor",
+    "crates/nico-correlate",
+]
+resolver = "2"
