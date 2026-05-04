@@ -3,6 +3,8 @@ use std::time::Duration;
 use clap::Parser;
 use nico_common::output::{OutputMode, Status};
 
+mod grpc;
+mod http;
 mod k8s;
 mod layer;
 mod layers;
