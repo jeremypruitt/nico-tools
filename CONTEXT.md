@@ -48,6 +48,12 @@ Read-only. No remediation. Output is human-readable by default and JSON under
 5. Is gRPC reachable?          → `grpc` layer
 6. Is Postgres pressured?      → `postgres` layer
 
+## Key design choices made:
+- RunOpts holds config only (namespace, since, timeout) — no clients. Each layer holds its own Arc<dyn K8sClient>. Keeps
+   the runner testable with zero k8s setup.
+- todo!() comment in main.rs marks where the real k8s client plugs in — that's issue #5 when the cluster layer gets
+  wired to a live cluster.
+
 ## Open questions
 
 - **REST access log structure**: does `infra-controller-rest` emit structured JSON access logs with `request_id` and `workflow_id` fields? If yes, build a thin `rest` Source to link `req-` IDs to workflow starts. If no, fall back to grepping Loki logs for `req-` patterns. Check with `kubectl logs -l app=rest | head -5` on a live cluster.
