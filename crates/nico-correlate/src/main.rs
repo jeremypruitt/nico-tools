@@ -12,7 +12,7 @@ use crate::id::{IdType, detect_id_type};
 use crate::source::{Source, SourceResult, StateEntry};
 use crate::sources::temporal::{TemporalSource, TemporalClient, RawTemporalEvent};
 use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData, SqlxPostgresClient};
-use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData};
+use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData, KubeRsK8sClient};
 use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClient, K8sLogLine};
 use crate::sources::redfish::{RedfishSource, RedfishClient, RedfishData};
 use crate::timeline::filter_timeline;
@@ -96,13 +96,14 @@ impl PostgresClient for InactivePostgresClient {
     }
 }
 
-// Real k8s client is wired when kube-rs is added.
-struct TodoK8sClient;
+struct InactiveK8sClient {
+    reason: String,
+}
 
 #[async_trait]
-impl K8sClient for TodoK8sClient {
+impl K8sClient for InactiveK8sClient {
     async fn find_pods_with_events(&self, _id: &str, _id_type: &IdType) -> Result<Vec<K8sPodData>> {
-        Err(anyhow::anyhow!("not implemented: real k8s client — uses in-cluster or kubeconfig"))
+        Err(anyhow::anyhow!("{}", self.reason))
     }
 }
 
@@ -236,10 +237,15 @@ async fn main() {
         Err(_) => Box::new(InactivePostgresClient { reason: "NICO_POSTGRES_URL not set".into() }),
     };
 
+    let k8s_client: Box<dyn K8sClient> = match KubeRsK8sClient::try_default().await {
+        Ok(c) => Box::new(c),
+        Err(e) => Box::new(InactiveK8sClient { reason: format!("kubeconfig unavailable: {e}") }),
+    };
+
     let all_sources: Vec<(&str, Box<dyn Source>)> = vec![
         ("temporal", Box::new(TemporalSource::new(Box::new(TodoTemporalClient)))),
         ("postgres", Box::new(PostgresSource::new(pg_client))),
-        ("k8s", Box::new(K8sSource::new(Box::new(TodoK8sClient)))),
+        ("k8s", Box::new(K8sSource::new(k8s_client))),
         ("loki", Box::new(LokiSource::new(
             Box::new(TodoLokiClient),
             Box::new(TodoK8sLogStreamClient),

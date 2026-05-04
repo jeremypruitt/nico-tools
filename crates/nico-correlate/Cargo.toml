@@ -17,3 +17,5 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls", "chrono"] }
+kube = { version = "0.99", features = ["client", "runtime", "derive"] }
+k8s-openapi = { version = "0.24", features = ["latest"] }
