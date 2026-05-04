@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::id::{IdType, detect_id_type};
 use crate::source::{Source, SourceResult, StateEntry};
 use crate::sources::temporal::{TemporalSource, TemporalClient, RawTemporalEvent};
-use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData};
+use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData, SqlxPostgresClient};
 use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData};
 use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClient, K8sLogLine};
 use crate::sources::redfish::{RedfishSource, RedfishClient, RedfishData};
@@ -61,7 +61,7 @@ fn parse_since(s: &str) -> Result<Duration, String> {
         } else {
             let n: i64 = num.parse().map_err(|_| format!("invalid duration: {s}"))?;
             num.clear();
-            total = total + match ch {
+            total += match ch {
                 'h' => Duration::hours(n),
                 'm' => Duration::minutes(n),
                 's' => Duration::seconds(n),
@@ -85,13 +85,14 @@ impl TemporalClient for TodoTemporalClient {
     }
 }
 
-// Real Postgres client is wired when sqlx is added.
-struct TodoPostgresClient;
+struct InactivePostgresClient {
+    reason: String,
+}
 
 #[async_trait]
-impl PostgresClient for TodoPostgresClient {
+impl PostgresClient for InactivePostgresClient {
     async fn query_entity(&self, _id: &str, _id_type: &IdType) -> Result<PgEntityData> {
-        Err(anyhow::anyhow!("not implemented: real Postgres client — connect via NICO_POSTGRES_URL"))
+        Err(anyhow::anyhow!("{}", self.reason))
     }
 }
 
@@ -227,9 +228,17 @@ async fn main() {
 
     println!("detected type: {}", id_type_str(&id_type));
 
+    let pg_client: Box<dyn PostgresClient> = match std::env::var("NICO_POSTGRES_URL") {
+        Ok(url) => match SqlxPostgresClient::connect(&url).await {
+            Ok(c) => Box::new(c),
+            Err(e) => Box::new(InactivePostgresClient { reason: format!("connect failed: {e}") }),
+        },
+        Err(_) => Box::new(InactivePostgresClient { reason: "NICO_POSTGRES_URL not set".into() }),
+    };
+
     let all_sources: Vec<(&str, Box<dyn Source>)> = vec![
         ("temporal", Box::new(TemporalSource::new(Box::new(TodoTemporalClient)))),
-        ("postgres", Box::new(PostgresSource::new(Box::new(TodoPostgresClient)))),
+        ("postgres", Box::new(PostgresSource::new(pg_client))),
         ("k8s", Box::new(K8sSource::new(Box::new(TodoK8sClient)))),
         ("loki", Box::new(LokiSource::new(
             Box::new(TodoLokiClient),

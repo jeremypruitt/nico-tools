@@ -83,6 +83,106 @@ impl Source for PostgresSource {
     }
 }
 
+pub struct SqlxPostgresClient {
+    pool: sqlx::PgPool,
+}
+
+impl SqlxPostgresClient {
+    pub async fn connect(url: &str) -> Result<Self> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(url)
+            .await?;
+        Ok(Self { pool })
+    }
+}
+
+fn col_as_string(row: &sqlx::postgres::PgRow, i: usize) -> String {
+    use sqlx::Row;
+    macro_rules! try_as {
+        ($t:ty) => {
+            if let Ok(v) = row.try_get::<Option<$t>, _>(i) {
+                return v.map(|x| x.to_string()).unwrap_or_default();
+            }
+        };
+    }
+    try_as!(String);
+    try_as!(i64);
+    try_as!(i32);
+    try_as!(i16);
+    try_as!(bool);
+    try_as!(f64);
+    try_as!(f32);
+    if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
+        return v.map(|t| t.to_rfc3339()).unwrap_or_default();
+    }
+    String::new()
+}
+
+fn sqlx_row_to_pg_row(row: &sqlx::postgres::PgRow, table: &str) -> PgRow {
+    use sqlx::{Column, Row};
+    let columns = row
+        .columns()
+        .iter()
+        .map(|col| (col.name().to_string(), col_as_string(row, col.ordinal())))
+        .collect();
+    PgRow { table: table.to_string(), columns }
+}
+
+fn is_undefined_table(e: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db) = e {
+        db.code().as_deref() == Some("42P01")
+    } else {
+        false
+    }
+}
+
+async fn fetch_table_rows(pool: &sqlx::PgPool, table: &str, id_col: &str, id: &str) -> Result<Vec<PgRow>> {
+    // table and id_col are always internal constants, not user input.
+    let sql = format!("SELECT * FROM {table} WHERE {id_col} = $1 LIMIT 20");
+    match sqlx::query(&sql).bind(id).fetch_all(pool).await {
+        Ok(rows) => Ok(rows.iter().map(|r| sqlx_row_to_pg_row(r, table)).collect()),
+        Err(ref e) if is_undefined_table(e) => Ok(vec![]),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn fetch_audit_events(pool: &sqlx::PgPool, entity_id: &str) -> Result<Vec<PgAuditEvent>> {
+    let sql = "SELECT ts, action, detail FROM audit_log \
+               WHERE entity_id = $1 ORDER BY ts DESC LIMIT 100";
+    match sqlx::query(sql).bind(entity_id).fetch_all(pool).await {
+        Ok(rows) => {
+            use sqlx::Row;
+            Ok(rows
+                .iter()
+                .map(|r| PgAuditEvent {
+                    ts: r.try_get("ts").unwrap_or_else(|_| chrono::Utc::now()),
+                    action: r.try_get("action").unwrap_or_default(),
+                    detail: r.try_get("detail").unwrap_or_default(),
+                })
+                .collect())
+        }
+        Err(ref e) if is_undefined_table(e) => Ok(vec![]),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[async_trait]
+impl PostgresClient for SqlxPostgresClient {
+    async fn query_entity(&self, id: &str, id_type: &IdType) -> Result<PgEntityData> {
+        let mut rows = Vec::new();
+        match id_type {
+            IdType::Host => rows.extend(fetch_table_rows(&self.pool, "hosts", "id", id).await?),
+            IdType::Dpu => rows.extend(fetch_table_rows(&self.pool, "hosts", "dpu_id", id).await?),
+            IdType::Workflow => rows.extend(fetch_table_rows(&self.pool, "workflows", "id", id).await?),
+            IdType::Request => {}
+        }
+        let audit_events = fetch_audit_events(&self.pool, id).await?;
+        Ok(PgEntityData { rows, audit_events })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +295,19 @@ mod tests {
             }
             _ => panic!("expected Unavailable"),
         }
+    }
+
+    #[tokio::test]
+    async fn smoke_real_postgres_skips_when_url_unset() {
+        let url = match std::env::var("NICO_POSTGRES_URL") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let client = SqlxPostgresClient::connect(&url)
+            .await
+            .expect("connect with NICO_POSTGRES_URL");
+        // Does not panic; Ok or Err both accepted (schema may differ per environment).
+        let _ = client.query_entity("host-r12u5", &IdType::Host).await;
+        let _ = client.query_entity("dpu-bf3-r12u5", &IdType::Dpu).await;
     }
 }

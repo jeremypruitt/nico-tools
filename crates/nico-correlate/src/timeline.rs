@@ -6,11 +6,11 @@ pub fn filter_timeline(mut events: Vec<Event>, first_n: usize, last_n: usize) ->
         return events;
     }
     let mut keep = vec![false; events.len()];
-    for i in 0..first_n.min(events.len()) {
-        keep[i] = true;
+    for k in keep.iter_mut().take(first_n.min(events.len())) {
+        *k = true;
     }
-    for i in events.len().saturating_sub(last_n)..events.len() {
-        keep[i] = true;
+    for k in keep.iter_mut().skip(events.len().saturating_sub(last_n)) {
+        *k = true;
     }
     for (i, e) in events.iter().enumerate() {
         if matches!(e.severity, Severity::Error | Severity::Warning) {
