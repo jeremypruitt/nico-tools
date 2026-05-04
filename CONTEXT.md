@@ -48,11 +48,6 @@ Read-only. No remediation. Output is human-readable by default and JSON under
 5. Is gRPC reachable?          → `grpc` layer
 6. Is Postgres pressured?      → `postgres` layer
 
-## Open questions
-
-- **REST access log structure**: does `infra-controller-rest` emit structured JSON access logs with `request_id` and `workflow_id` fields? If yes, build a thin `rest` Source to link `req-` IDs to workflow starts. If no, fall back to grepping Loki logs for `req-` patterns. Check with `kubectl logs -l app=rest | head -5` on a live cluster.
-
-
 ## Decisions made:
 - Workspace: convert nico-doctor to nico-tools monorepo with nico-common, nico-doctor, nico-correlate
 - Log source: Loki primary, k8s streaming fallback, no Datadog
@@ -62,6 +57,10 @@ Read-only. No remediation. Output is human-readable by default and JSON under
 - Read-only constraint: no remediation actions, ever (ADR-0002)
 - DPU: first-class Entity type alongside Host, Workflow, Tenant, Request
 - REST Source: deferred — check log structure empirically before deciding
+
+## Open questions
+
+- **REST access log structure**: does `infra-controller-rest` emit structured JSON access logs with `request_id` and `workflow_id` fields? If yes, build a thin `rest` Source to link `req-` IDs to workflow starts. If no, fall back to grepping Loki logs for `req-` patterns. Check with `kubectl logs -l app=rest | head -5` on a live cluster.
 
 ## Out of scope (explicit)
 - Remediation actions
