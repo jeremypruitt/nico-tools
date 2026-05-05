@@ -13,6 +13,7 @@ pub struct K8sPod {
     pub name: String,
     pub status: String,
     pub restart_count: u32,
+    pub crash_loop: bool,
 }
 
 #[derive(Clone)]
@@ -76,6 +77,16 @@ impl K8sClient for KubeRsK8sClient {
                 .map(|cs| cs.iter().map(|c| c.restart_count as u32).sum())
                 .unwrap_or(0);
 
+            let crash_loop = pod.status.as_ref()
+                .and_then(|s| s.container_statuses.as_ref())
+                .map(|cs| cs.iter().any(|c| {
+                    c.state.as_ref()
+                        .and_then(|s| s.waiting.as_ref())
+                        .and_then(|w| w.reason.as_deref())
+                        == Some("CrashLoopBackOff")
+                }))
+                .unwrap_or(false);
+
             let events_api: Api<CoreEvent> = Api::namespaced(self.client.clone(), &namespace);
             let field_selector = format!(
                 "involvedObject.kind=Pod,involvedObject.name={name},type=Warning"
@@ -96,7 +107,7 @@ impl K8sClient for KubeRsK8sClient {
             }).collect();
 
             results.push(K8sPodData {
-                pod: K8sPod { name, status, restart_count },
+                pod: K8sPod { name, status, restart_count, crash_loop },
                 warning_events,
             });
         }
@@ -117,10 +128,11 @@ impl K8sSource {
 
 fn pod_state_entry(pod: &K8sPod) -> StateEntry {
     let restart_word = if pod.restart_count == 1 { "restart" } else { "restarts" };
+    let display_status = if pod.crash_loop { "CrashLoopBackOff" } else { pod.status.as_str() };
     StateEntry {
         source: "k8s",
         key: pod.name.clone(),
-        value: format!("{} ({} {})", pod.status, pod.restart_count, restart_word),
+        value: format!("{display_status} ({} {})", pod.restart_count, restart_word),
     }
 }
 
@@ -193,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn pods_become_state_entries() {
         let data = vec![K8sPodData {
-            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 3 },
+            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 3, crash_loop: false },
             warning_events: vec![],
         }];
         let source = K8sSource::new(Box::new(FakeK8sClient::ok(data)));
@@ -212,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn singular_restart_word() {
         let data = vec![K8sPodData {
-            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 1 },
+            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 1, crash_loop: false },
             warning_events: vec![],
         }];
         let source = K8sSource::new(Box::new(FakeK8sClient::ok(data)));
@@ -227,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn warning_events_map_to_warning_severity_events() {
         let data = vec![K8sPodData {
-            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 2 },
+            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 2, crash_loop: false },
             warning_events: vec![K8sWarningEvent {
                 ts: ts(1000),
                 pod_name: "hp-worker-xyz".into(),
@@ -246,6 +258,21 @@ mod tests {
         assert_eq!(output.events[0].source, "k8s");
         assert_eq!(output.events[0].kind, "OOMKilled");
         assert_eq!(output.events[0].message, "hp-worker-xyz: container ran out of memory");
+    }
+
+    #[tokio::test]
+    async fn crash_loop_pod_shows_crash_loop_back_off_status() {
+        let data = vec![K8sPodData {
+            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 5, crash_loop: true },
+            warning_events: vec![],
+        }];
+        let source = K8sSource::new(Box::new(FakeK8sClient::ok(data)));
+        let result = source.collect("hp-abc", &IdType::Workflow).await;
+        let output = match result {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert_eq!(output.state[0].value, "CrashLoopBackOff (5 restarts)");
     }
 
     #[tokio::test]

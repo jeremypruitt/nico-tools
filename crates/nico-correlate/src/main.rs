@@ -481,7 +481,7 @@ async fn main() {
         .collect();
 
     let filtered = filter_timeline(events, 5, 10);
-    let diag = diagnose(&filtered);
+    let diag = diagnose(&filtered, &state);
 
     let code = exit_code(Some(&id_type), &all_results);
 
