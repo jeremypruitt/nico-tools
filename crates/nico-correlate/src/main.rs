@@ -4,6 +4,7 @@ mod event;
 mod id;
 mod source;
 mod sources;
+mod tail;
 mod timeline;
 mod tui;
 
@@ -56,6 +57,10 @@ struct Cli {
     /// Output JSON
     #[arg(short = 'j', long)]
     json: bool,
+
+    /// Stream new events after the initial dump until Ctrl-C (compatible with --json)
+    #[arg(long)]
+    tail: bool,
 
     /// ASCII-only output (no Unicode icons)
     #[arg(long)]
@@ -153,6 +158,12 @@ async fn main() {
     // Guard: --tui and --json are mutually exclusive.
     if cli.tui && cli.json {
         eprintln!("error: --tui and --json are mutually exclusive");
+        std::process::exit(3);
+    }
+
+    // Guard: --tail and --tui are mutually exclusive.
+    if cli.tail && cli.tui {
+        eprintln!("error: --tail and --tui are mutually exclusive");
         std::process::exit(3);
     }
 
@@ -550,6 +561,17 @@ async fn main() {
                 println!("    {cmd}");
             }
         }
+    }
+
+    if cli.tail {
+        let tail_sources: Vec<(&'static str, Box<dyn Source>)> = named_sources
+            .into_iter()
+            .zip(all_results.iter())
+            .filter_map(|((name, source), result)| {
+                if matches!(result, SourceResult::Output(_)) { Some((name, source)) } else { None }
+            })
+            .collect();
+        tail::run_tail(tail_sources, cli.id.clone(), id_type.clone(), &filtered, &mode, cli.json).await;
     }
 
     std::process::exit(code);
