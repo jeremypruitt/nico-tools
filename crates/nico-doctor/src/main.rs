@@ -81,24 +81,6 @@ impl loki::LokiClient for InactiveLokiClient {
     }
 }
 
-struct InactiveHttpClient { reason: &'static str }
-
-#[async_trait]
-impl http::HttpClient for InactiveHttpClient {
-    async fn get_status(&self, _url: &str) -> anyhow::Result<u16> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-}
-
-struct InactiveGrpcInspector { reason: &'static str }
-
-#[async_trait]
-impl grpc::GrpcInspector for InactiveGrpcInspector {
-    async fn inspect(&self, _addr: &str) -> anyhow::Result<grpc::GrpcInspectResult> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-}
-
 struct InactivePostgresClient { reason: &'static str }
 
 #[async_trait]
@@ -209,18 +191,29 @@ async fn main() {
                 match endpoints_str.as_deref() {
                     Some(s) if !s.is_empty() => {
                         let services: Vec<http::ServiceEndpoint> = s.split(',')
-                            .map(|u| u.trim().to_string())
-                            .filter(|u| !u.is_empty())
-                            .map(|url| http::ServiceEndpoint { name: url.clone(), base_url: url })
+                            .map(|entry| entry.trim())
+                            .filter(|entry| !entry.is_empty())
+                            .map(|entry| {
+                                if let Some((name, url)) = entry.split_once('=') {
+                                    http::ServiceEndpoint {
+                                        name: name.trim().to_string(),
+                                        base_url: url.trim().to_string(),
+                                    }
+                                } else {
+                                    http::ServiceEndpoint {
+                                        name: entry.to_string(),
+                                        base_url: entry.to_string(),
+                                    }
+                                }
+                            })
                             .collect();
                         layers.push(Box::new(layers::health::HealthLayer::new(
-                            // TODO: replace with real reqwest-based HttpClient
-                            Arc::new(InactiveHttpClient { reason: "http client not yet wired" }),
+                            Arc::new(http::ReqwestHttpClient::new()),
                             services,
                         )));
                     }
                     _ => layers.push(layer::UnconfiguredLayer::new(
-                        "health", "set NICO_HEALTH_ENDPOINTS to enable",
+                        "health", "set NICO_HEALTH_ENDPOINTS=name=http://host:port to enable",
                     )),
                 }
             }
@@ -229,8 +222,7 @@ async fn main() {
                     .or_else(|| std::env::var("NICO_TEMPORAL_ADDRESS").ok());
                 match grpc_addr {
                     Some(addr) => layers.push(Box::new(layers::grpc::GrpcLayer::new(
-                        // TODO #27: replace with real tonic-based GrpcInspector
-                        Arc::new(InactiveGrpcInspector { reason: "grpc inspector not yet wired (see #27)" }),
+                        Arc::new(grpc::TonicGrpcInspector),
                         addr,
                     ))),
                     None => layers.push(layer::UnconfiguredLayer::new(
