@@ -1631,14 +1631,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "clap",
  "futures",
  "humantime",
+ "k8s-openapi",
+ "kube",
  "nico-common",
+ "prost-wkt-types",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
+ "temporal-sdk-core-protos",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

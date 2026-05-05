@@ -34,7 +34,11 @@ impl Layer for WorkflowsLayer {
                 name: "stuck",
                 status: if stuck.is_empty() { Status::Ok } else { Status::Warn },
                 value: format!("{} stuck", stuck.len()),
-                next_command: None,
+                next_command: if stuck.is_empty() {
+                    None
+                } else {
+                    Some(r#"temporal workflow list --query "ExecutionStatus=Running""#.to_string())
+                },
             },
             Check {
                 name: "failed",

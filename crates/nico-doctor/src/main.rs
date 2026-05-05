@@ -1,6 +1,6 @@
 use std::process;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use async_trait::async_trait;
 use clap::Parser;
 use nico_common::output::{OutputMode, Status};
@@ -77,18 +77,6 @@ struct InactiveLokiClient { reason: &'static str }
 #[async_trait]
 impl loki::LokiClient for InactiveLokiClient {
     async fn query_errors(&self, _ns: &str, _since: Duration, _limit: usize) -> anyhow::Result<loki::LokiQueryResult> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-}
-
-struct InactiveTemporalClient { reason: &'static str }
-
-#[async_trait]
-impl temporal::TemporalClient for InactiveTemporalClient {
-    async fn list_stuck(&self, _ns: &str, _before: SystemTime) -> anyhow::Result<Vec<temporal::RunningWorkflow>> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-    async fn list_failed(&self, _ns: &str, _since: SystemTime) -> anyhow::Result<Vec<temporal::FailedWorkflow>> {
         Err(anyhow::anyhow!("{}", self.reason))
     }
 }
@@ -199,11 +187,18 @@ async fn main() {
             }
             "workflows" => {
                 match std::env::var("NICO_TEMPORAL_ADDRESS") {
-                    Ok(_) => layers.push(Box::new(layers::workflows::WorkflowsLayer::new(
-                        // TODO #27: replace with real gRPC Temporal client
-                        Arc::new(InactiveTemporalClient { reason: "temporal client not yet wired (see #27)" }),
-                        Duration::from_secs(30 * 60),
-                    ))),
+                    Ok(addr) => {
+                        let namespace = std::env::var("NICO_TEMPORAL_NAMESPACE")
+                            .unwrap_or_else(|_| "default".to_string());
+                        let stuck_threshold = std::env::var("NICO_STUCK_THRESHOLD")
+                            .ok()
+                            .and_then(|s| humantime::parse_duration(&s).ok())
+                            .unwrap_or(Duration::from_secs(30 * 60));
+                        layers.push(Box::new(layers::workflows::WorkflowsLayer::new(
+                            Arc::new(temporal::RealTemporalClient::new(addr, namespace)),
+                            stuck_threshold,
+                        )));
+                    }
                     Err(_) => layers.push(layer::UnconfiguredLayer::new(
                         "workflows", "set NICO_TEMPORAL_ADDRESS to enable",
                     )),
