@@ -14,7 +14,7 @@ use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, Reac
 use nico_common::output::{OutputMode, Status};
 use nico_common::reach::ReachManager;
 use crate::id::{IdType, detect_id_type};
-use crate::source::{Source, SourceResult, StateEntry, UnavailableSource};
+use crate::source::{Source, SourceKind, SourceResult, StateEntry, UnavailableSource};
 use crate::sources::temporal::{TemporalSource, TemporalClient};
 use crate::sources::temporal_grpc::GrpcTemporalClient;
 use crate::sources::postgres::{PostgresSource, SqlxPostgresClient};
@@ -138,8 +138,6 @@ struct JsonStateEntry<'a> {
     value: &'a str,
 }
 
-const KNOWN_SOURCES: &[&str] = &["temporal", "postgres", "k8s", "loki", "redfish"];
-
 fn severity_to_status(s: &crate::event::Severity) -> Status {
     match s {
         crate::event::Severity::Info => Status::Ok,
@@ -226,12 +224,9 @@ async fn main() {
 
     if !use_all {
         for s in &cli.sources {
-            if !KNOWN_SOURCES.contains(&s.as_str()) {
-                eprintln!(
-                    "error: unknown source {:?}; valid sources: {} or \"all\"",
-                    s,
-                    KNOWN_SOURCES.join(", ")
-                );
+            if SourceKind::from_name(s.as_str()).is_none() {
+                let valid = SourceKind::ALL.iter().map(|k| k.name()).collect::<Vec<_>>().join(", ");
+                eprintln!("error: unknown source {:?}; valid sources: {} or \"all\"", s, valid);
                 std::process::exit(1);
             }
         }
@@ -240,16 +235,16 @@ async fn main() {
     let restricted_names: Vec<&str> = if use_all {
         vec![]
     } else {
-        KNOWN_SOURCES
+        SourceKind::ALL
             .iter()
-            .copied()
+            .map(|k| k.name())
             .filter(|&name| !cli.sources.iter().any(|s| s == name))
             .collect()
     };
 
-    let attempted_names: Vec<&str> = KNOWN_SOURCES
+    let attempted_names: Vec<&str> = SourceKind::ALL
         .iter()
-        .copied()
+        .map(|k| k.name())
         .filter(|&name| !restricted_names.contains(&name))
         .collect();
 

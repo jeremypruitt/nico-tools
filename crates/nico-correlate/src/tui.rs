@@ -17,7 +17,7 @@ use crossterm::{
 };
 use nico_common::output::OutputMode;
 use crate::event::{Event as CorrelateEvent, Severity};
-use crate::source::{StateEntry, SourceResult};
+use crate::source::{SourceKind, StateEntry, SourceResult};
 use crate::diagnosis::{diagnose, Diagnosis};
 use crate::timeline::filter_timeline;
 
@@ -456,14 +456,13 @@ fn render_status_bar(
     frame.render_widget(Paragraph::new(left), cols[0]);
 
     // Centre: per-source state indicators
-    const ALL_SOURCES: &[&str] = &["temporal", "postgres", "k8s", "loki", "redfish"];
-
     let fetch_dot = if ascii { "~" } else { "\u{27F3}" };
     let avail_dot = if ascii { "*" } else { "\u{25CF}" };
     let err_dot   = if ascii { "x" } else { "\u{2717}" };
     let skip_dot  = if ascii { "-" } else { "\u{25CB}" };
 
-    let spans: Vec<Span> = ALL_SOURCES.iter().flat_map(|&src| {
+    let spans: Vec<Span> = SourceKind::ALL.iter().flat_map(|kind| {
+        let src = kind.name();
         let ss = state.source_states.get(src);
         let (dot, color) = match ss {
             Some(SourceState::Fetching)    => (fetch_dot, Color::Yellow),
@@ -511,7 +510,7 @@ mod tests {
     fn sample_config() -> TuiConfig {
         TuiConfig {
             id: "wf-abc123".into(),
-            source_names: vec!["temporal", "postgres", "k8s", "loki", "redfish"],
+            source_names: SourceKind::ALL.iter().map(|k| k.name()).collect(),
             restricted: vec![],
         }
     }
