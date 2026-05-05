@@ -88,10 +88,15 @@ struct IncrementalState {
     has_unavailable: bool,
 
     // Cursor — pinned to the selected event by identity, not row index.
+    // list_state holds a *filtered visual index*, not a raw events index.
     selected_key: Option<EventKey>,
     list_state: ListState,
 
     help_open: bool,
+
+    // Filter bar — view-layer only, does not mutate self.events.
+    filter_query: String,
+    filter_active: bool,
 }
 
 impl IncrementalState {
@@ -115,6 +120,8 @@ impl IncrementalState {
             selected_key: None,
             list_state: ListState::default(),
             help_open: false,
+            filter_query: String::new(),
+            filter_active: false,
         }
     }
 
@@ -162,33 +169,60 @@ impl IncrementalState {
         self.list_state.selected()
     }
 
-    /// Re-pin the list cursor to the previously selected event after a merge.
+    /// Indices into `self.events` that pass the current filter query.
+    /// Returns all indices when the query is empty.
+    fn filtered_indices(&self) -> Vec<usize> {
+        if self.filter_query.is_empty() {
+            return (0..self.events.len()).collect();
+        }
+        let needle = self.filter_query.to_lowercase();
+        self.events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.source.to_lowercase().contains(&needle)
+                    || e.kind.to_lowercase().contains(&needle)
+                    || e.message.to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Re-pin the list cursor to the previously selected event after a merge or
+    /// filter change.  list_state is a *filtered visual index*.
     fn sync_cursor(&mut self) {
         if let Some(ref key) = self.selected_key.clone() {
-            let new_idx = self.events.iter().position(|e| {
+            let raw_idx = self.events.iter().position(|e| {
                 e.ts == key.ts && e.source == key.source && e.kind == key.kind
             });
-            self.list_state.select(new_idx);
+            let visual_idx = raw_idx.and_then(|ri| {
+                self.filtered_indices().iter().position(|&fi| fi == ri)
+            });
+            self.list_state.select(visual_idx);
         }
     }
 
-    fn select_at(&mut self, idx: usize) {
-        if let Some(e) = self.events.get(idx) {
-            self.selected_key = Some(event_key(e));
-            self.list_state.select(Some(idx));
+    /// Select the event at `vis_idx` in the current filtered list.
+    fn select_at(&mut self, vis_idx: usize) {
+        let indices = self.filtered_indices();
+        if let Some(&raw_idx) = indices.get(vis_idx) {
+            if let Some(e) = self.events.get(raw_idx) {
+                self.selected_key = Some(event_key(e));
+                self.list_state.select(Some(vis_idx));
+            }
         }
     }
 
     fn select_first(&mut self) {
-        if !self.events.is_empty() {
+        if !self.filtered_indices().is_empty() {
             self.select_at(0);
         }
     }
 
     fn select_last(&mut self) {
-        if !self.events.is_empty() {
-            let idx = self.events.len() - 1;
-            self.select_at(idx);
+        let n = self.filtered_indices().len();
+        if n > 0 {
+            self.select_at(n - 1);
         }
     }
 
@@ -201,12 +235,13 @@ impl IncrementalState {
     }
 
     fn select_next(&mut self) {
-        if self.events.is_empty() {
+        let count = self.filtered_indices().len();
+        if count == 0 {
             return;
         }
         let n = match self.list_state.selected() {
             None => 0,
-            Some(n) => (n + 1).min(self.events.len() - 1),
+            Some(n) => (n + 1).min(count - 1),
         };
         self.select_at(n);
     }
@@ -220,14 +255,35 @@ impl IncrementalState {
     }
 
     fn select_next_page(&mut self, page: usize) {
-        if self.events.is_empty() {
+        let count = self.filtered_indices().len();
+        if count == 0 {
             return;
         }
         let n = match self.list_state.selected() {
             None => 0,
-            Some(n) => (n + page).min(self.events.len() - 1),
+            Some(n) => (n + page).min(count - 1),
         };
         self.select_at(n);
+    }
+
+    fn open_filter(&mut self) {
+        self.filter_active = true;
+    }
+
+    fn close_filter(&mut self) {
+        self.filter_active = false;
+        self.filter_query.clear();
+        self.sync_cursor();
+    }
+
+    fn push_filter_char(&mut self, c: char) {
+        self.filter_query.push(c);
+        self.sync_cursor();
+    }
+
+    fn pop_filter_char(&mut self) {
+        self.filter_query.pop();
+        self.sync_cursor();
     }
 }
 
@@ -283,11 +339,29 @@ fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     _ => {}
                 }
+            } else if state.filter_active {
+                match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Esc => state.close_filter(),
+                    KeyCode::Backspace => state.pop_filter_char(),
+                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Down => state.select_next(),
+                    KeyCode::PageUp => state.select_prev_page(PAGE_SIZE),
+                    KeyCode::PageDown => state.select_next_page(PAGE_SIZE),
+                    KeyCode::Char(c) => state.push_filter_char(c),
+                    _ => {}
+                }
             } else {
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('?') => state.help_open = true,
+                    KeyCode::Char('/') => state.open_filter(),
+                    KeyCode::Esc => {
+                        if !state.filter_query.is_empty() {
+                            state.close_filter();
+                        }
+                    }
                     KeyCode::Up => state.select_prev(),
                     KeyCode::Down => state.select_next(),
                     KeyCode::PageUp => state.select_prev_page(PAGE_SIZE),
@@ -371,32 +445,69 @@ fn render_timeline(
     let ascii = ctx.mode.ascii;
     let use_color = ctx.mode.color;
     let selector = if ascii { ">" } else { "▶" };
-    let selected = state.selected();
 
-    let title = format!(" Timeline ({} events) ", state.events.len());
+    // Pre-compute before any mutable borrow of list_state.
+    let filtered = state.filtered_indices();
+    let total = state.events.len();
+    let selected_vis = state.list_state.selected();
+    let filter_active = state.filter_active;
+    let filter_query = state.filter_query.clone();
+    let show_placeholder = state.show_placeholder();
+
+    let title = if !filter_query.is_empty() {
+        format!(" Timeline ({}/{}) ", filtered.len(), total)
+    } else {
+        format!(" Timeline ({} events) ", total)
+    };
+
     let block = make_block(&title, ascii);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    if state.show_placeholder() {
+    // Carve out a one-line filter bar at the bottom when the bar is open or a
+    // query is live (so the bar stays visible after pressing Enter to commit).
+    let (list_area, bar_area) = if filter_active || !filter_query.is_empty() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (inner, None)
+    };
+
+    if show_placeholder {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let placeholder = ListItem::new(Line::from(Span::styled("waiting for sources\u{2026}", dim)));
-        let list = List::new(vec![placeholder]).block(block);
-        frame.render_stateful_widget(list, area, &mut state.list_state);
-        return;
+        let list = List::new(vec![placeholder]);
+        frame.render_stateful_widget(list, list_area, &mut state.list_state);
+    } else {
+        let items: Vec<ListItem> = filtered.iter().enumerate().map(|(vis_idx, &raw_idx)| {
+            let e = &state.events[raw_idx];
+            let ts = e.ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let prefix = if selected_vis == Some(vis_idx) { selector } else { " " };
+            let row = format!("{prefix} {}  {}  {}", ts, e.source, e.kind);
+            let mut style = severity_style(&e.severity, use_color);
+            if selected_vis == Some(vis_idx) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            ListItem::new(Line::from(Span::styled(row, style)))
+        }).collect();
+
+        let list = List::new(items);
+        frame.render_stateful_widget(list, list_area, &mut state.list_state);
     }
 
-    let items: Vec<ListItem> = state.events.iter().enumerate().map(|(i, e)| {
-        let ts = e.ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let prefix = if selected == Some(i) { selector } else { " " };
-        let row = format!("{prefix} {}  {}  {}", ts, e.source, e.kind);
-        let mut style = severity_style(&e.severity, use_color);
-        if selected == Some(i) {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        ListItem::new(Line::from(Span::styled(row, style)))
-    }).collect();
-
-    let list = List::new(items).block(block);
-    frame.render_stateful_widget(list, area, &mut state.list_state);
+    if let Some(bar) = bar_area {
+        let cursor = if filter_active { "_" } else { "" };
+        let bar_text = format!("/{}{}", filter_query, cursor);
+        let style = if use_color {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Span::styled(bar_text, style)), bar);
+    }
 }
 
 fn render_detail(
@@ -409,34 +520,48 @@ fn render_detail(
     let block = make_block(" Event detail ", ascii);
     let dim = Style::default().add_modifier(Modifier::DIM);
 
-    let widget = match state.selected().and_then(|i| state.events.get(i)) {
-        None => {
-            let hint = if ascii { "up/down to select an event" } else { "↑↓ to select an event" };
-            Paragraph::new(Line::from(Span::styled(hint, dim))).block(block)
-        }
-        Some(e) => {
-            let detail = if e.message.is_empty() { e.kind.as_str() } else { e.message.as_str() };
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled("source:  ", dim),
-                    Span::raw(e.source.clone()),
-                ]),
-                Line::from(vec![
-                    Span::styled("kind:    ", dim),
-                    Span::raw(e.kind.clone()),
-                ]),
-                Line::from(vec![
-                    Span::styled("detail:  ", dim),
-                    Span::raw(detail.to_string()),
-                ]),
-            ];
-            if let Some(cmd) = state.diagnosis.as_ref().and_then(|d| d.next_commands.first()) {
-                lines.push(Line::from(vec![
-                    Span::styled("next:    ", dim),
-                    Span::raw(cmd.clone()),
-                ]));
+    let filtered = state.filtered_indices();
+    let filter_has_no_results = !state.filter_query.is_empty() && filtered.is_empty();
+
+    // Translate visual index → raw event index.
+    let selected_event: Option<&CorrelateEvent> = state
+        .list_state
+        .selected()
+        .and_then(|vis| filtered.get(vis))
+        .and_then(|&raw| state.events.get(raw));
+
+    let widget = if filter_has_no_results {
+        Paragraph::new(Line::from(Span::styled("No events match filter", dim))).block(block)
+    } else {
+        match selected_event {
+            None => {
+                let hint = if ascii { "up/down to select an event" } else { "↑↓ to select an event" };
+                Paragraph::new(Line::from(Span::styled(hint, dim))).block(block)
             }
-            Paragraph::new(lines).block(block).wrap(Wrap { trim: false })
+            Some(e) => {
+                let detail = if e.message.is_empty() { e.kind.as_str() } else { e.message.as_str() };
+                let mut lines = vec![
+                    Line::from(vec![
+                        Span::styled("source:  ", dim),
+                        Span::raw(e.source.clone()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("kind:    ", dim),
+                        Span::raw(e.kind.clone()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("detail:  ", dim),
+                        Span::raw(detail.to_string()),
+                    ]),
+                ];
+                if let Some(cmd) = state.diagnosis.as_ref().and_then(|d| d.next_commands.first()) {
+                    lines.push(Line::from(vec![
+                        Span::styled("next:    ", dim),
+                        Span::raw(cmd.clone()),
+                    ]));
+                }
+                Paragraph::new(lines).block(block).wrap(Wrap { trim: false })
+            }
         }
     };
     frame.render_widget(widget, area);
@@ -501,9 +626,14 @@ fn render_status_bar(
     }).collect();
     frame.render_widget(Paragraph::new(Line::from(spans)), cols[1]);
 
-    // Right: quit hint
+    // Right: quit hint (shows Esc hint while filter is active)
+    let hint = if state.filter_active {
+        "Esc:clear  q:quit"
+    } else {
+        "?:help  q:quit"
+    };
     frame.render_widget(
-        Paragraph::new("?:help  q:quit").alignment(Alignment::Right),
+        Paragraph::new(hint).alignment(Alignment::Right),
         cols[2],
     );
 }
@@ -610,6 +740,36 @@ mod tests {
             result: SourceResult::Unavailable(SourceUnavailable { name: "redfish", reason: "not configured".into() }),
         });
         state
+    }
+
+    /// Three events across two sources: temporal(0), k8s(1), temporal(2).
+    /// Useful for filter tests: query "temporal" → 2 hits, query "k8s" → 1 hit.
+    fn three_event_state() -> (TuiConfig, IncrementalState) {
+        let config = TuiConfig {
+            id: "wf-filter-test".into(),
+            source_names: vec!["temporal", "k8s"],
+            restricted: vec![],
+            diagnosis: DiagnosisConfig::default(),
+        };
+        let mut state = IncrementalState::new(&config);
+        state.apply_update(TuiUpdate::SourceDone {
+            name: "temporal".into(),
+            result: SourceResult::Output(SourceOutput {
+                events: vec![
+                    make_event(1_000, "temporal", "started",  Severity::Info,  "workflow started"),
+                    make_event(3_000, "temporal", "failed",   Severity::Error, "attempt 3/3"),
+                ],
+                state: vec![],
+            }),
+        });
+        state.apply_update(TuiUpdate::SourceDone {
+            name: "k8s".into(),
+            result: SourceResult::Output(SourceOutput {
+                events: vec![make_event(2_000, "k8s", "warning", Severity::Warning, "pod restarted")],
+                state: vec![],
+            }),
+        });
+        (config, state)
     }
 
     fn row_str(buf: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
@@ -833,6 +993,7 @@ mod tests {
         assert_eq!(state.selected(), Some(1), "cursor should follow ev-b to its new index");
 
         // The event at the new cursor position should still be ev-b.
+        // No filter active, so visual index == raw index.
         let selected_event = state.events.get(state.selected().unwrap()).unwrap();
         assert_eq!(selected_event.kind, "ev-b");
     }
@@ -991,5 +1152,213 @@ mod tests {
         let row0 = row_str(&buf, 0, 120);
         // sample_state sends 3 events; filter_timeline keeps all 3 (≤ 5+10).
         assert!(row0.contains("3 events"), "Expected '3 events' in title: {row0}");
+    }
+
+    // ─── Filter bar ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn filtered_indices_empty_query_returns_all() {
+        let (_, state) = three_event_state();
+        assert_eq!(state.filtered_indices(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filtered_indices_matches_source_name_case_insensitive() {
+        let (_, mut state) = three_event_state();
+        state.filter_query = "TEMPORAL".into();
+        let fi = state.filtered_indices();
+        assert_eq!(fi.len(), 2, "Expected 2 temporal events");
+        assert!(fi.iter().all(|&i| state.events[i].source == "temporal"));
+    }
+
+    #[test]
+    fn filtered_indices_matches_message_text() {
+        let (_, mut state) = three_event_state();
+        state.filter_query = "attempt".into();
+        let fi = state.filtered_indices();
+        assert_eq!(fi.len(), 1, "Expected 1 event with 'attempt' in message");
+        assert_eq!(state.events[fi[0]].kind, "failed");
+    }
+
+    #[test]
+    fn filtered_indices_matches_kind_text() {
+        let (_, mut state) = three_event_state();
+        state.filter_query = "warning".into();
+        let fi = state.filtered_indices();
+        assert_eq!(fi.len(), 1, "Expected 1 event with kind 'warning'");
+        assert_eq!(state.events[fi[0]].source, "k8s");
+    }
+
+    #[test]
+    fn filter_zero_match_returns_empty() {
+        let (_, mut state) = three_event_state();
+        state.filter_query = "xyzzy_no_such_source".into();
+        assert!(state.filtered_indices().is_empty());
+    }
+
+    #[test]
+    fn cursor_identity_preserved_when_event_survives_filter() {
+        let (_, mut state) = three_event_state();
+        // Select the k8s event (raw index 1, visual index 1 with no filter).
+        state.select_at(1);
+        assert_eq!(state.selected(), Some(1));
+
+        // Apply a filter that keeps only k8s events.
+        state.filter_query = "k8s".into();
+        state.sync_cursor();
+
+        // k8s event is now at filtered visual index 0.
+        assert_eq!(state.selected(), Some(0), "k8s event should be at visual 0 after filter");
+        let raw = state.filtered_indices()[0];
+        assert_eq!(state.events[raw].source, "k8s");
+    }
+
+    #[test]
+    fn cursor_deselects_when_event_filtered_out() {
+        let (_, mut state) = three_event_state();
+        // Select the first temporal event (raw index 0).
+        state.select_at(0);
+        assert_eq!(state.selected(), Some(0));
+
+        // Apply a filter that hides temporal events.
+        state.filter_query = "k8s".into();
+        state.sync_cursor();
+
+        // temporal event is now hidden — cursor should be None.
+        assert_eq!(state.selected(), None, "Cursor should deselect when event is filtered out");
+    }
+
+    #[test]
+    fn close_filter_restores_cursor_to_correct_position() {
+        let (_, mut state) = three_event_state();
+        // Select k8s event (raw 1).
+        state.select_at(1);
+
+        // Filter to k8s → visual index 0.
+        state.filter_query = "k8s".into();
+        state.sync_cursor();
+        assert_eq!(state.selected(), Some(0));
+
+        // Clear filter — k8s event is back at raw 1, which is visual 1 with no filter.
+        state.close_filter();
+        assert_eq!(state.selected(), Some(1), "Cursor should restore to raw position after filter cleared");
+        let raw_at_visual_1 = state.filtered_indices()[1];
+        assert_eq!(state.events[raw_at_visual_1].source, "k8s");
+    }
+
+    #[test]
+    fn navigation_in_filtered_list_stays_in_bounds() {
+        let (_, mut state) = three_event_state();
+        state.filter_query = "temporal".into();
+        state.sync_cursor();
+
+        // Filtered list has 2 events; select_last should land on visual 1.
+        state.select_last();
+        assert_eq!(state.selected(), Some(1), "select_last should clamp to filtered list length - 1");
+    }
+
+    #[test]
+    fn filter_bar_visible_in_render_when_active() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (config, mut state) = three_event_state();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        state.filter_active = true;
+        state.filter_query = "tem".into();
+        state.sync_cursor();
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+        assert!(all_rows.contains("/tem"), "Expected filter bar '/tem' in render: {all_rows}");
+    }
+
+    #[test]
+    fn timeline_title_shows_filtered_ratio_when_query_active() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (config, mut state) = three_event_state();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        state.filter_query = "temporal".into();
+        state.filter_active = true;
+        state.sync_cursor();
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let row0 = row_str(&buf, 0, 120);
+        assert!(row0.contains("2/3"), "Expected '2/3' ratio in title: {row0}");
+    }
+
+    #[test]
+    fn timeline_title_reverts_to_events_count_after_filter_cleared() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (config, mut state) = three_event_state();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+
+        // Apply filter then clear it.
+        state.filter_query = "temporal".into();
+        state.filter_active = true;
+        state.close_filter();
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let row0 = row_str(&buf, 0, 120);
+        assert!(row0.contains("3 events"), "Expected '3 events' after filter cleared: {row0}");
+    }
+
+    #[test]
+    fn zero_match_filter_shows_no_events_message() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (config, mut state) = three_event_state();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        state.filter_query = "xyzzy_no_such_source".into();
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+        assert!(
+            all_rows.contains("No events match filter"),
+            "Expected 'No events match filter': {all_rows}"
+        );
+    }
+
+    #[test]
+    fn filter_does_not_mutate_underlying_events() {
+        let (_, mut state) = three_event_state();
+        let event_count_before = state.events.len();
+
+        state.filter_query = "temporal".into();
+        assert_eq!(state.filtered_indices().len(), 2);
+
+        // Underlying list unchanged.
+        assert_eq!(state.events.len(), event_count_before, "filter must not mutate self.events");
+
+        state.close_filter();
+        assert_eq!(state.events.len(), event_count_before);
+        assert_eq!(state.filtered_indices().len(), event_count_before);
+    }
+
+    #[test]
+    fn status_bar_shows_esc_hint_while_filter_active() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (config, mut state) = three_event_state();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        state.filter_active = true;
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+        assert!(
+            all_rows.contains("Esc:clear"),
+            "Expected 'Esc:clear' hint while filter is active: {all_rows}"
+        );
     }
 }
