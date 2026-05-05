@@ -31,11 +31,7 @@ impl TemporalSource {
 }
 
 fn map_event(raw: RawTemporalEvent) -> Event {
-    let severity = if raw.event_type.contains("Failed") || raw.event_type.contains("TimedOut") {
-        Severity::Error
-    } else {
-        Severity::Info
-    };
+    let severity = Severity::classify("temporal", &raw.event_type, "");
     let mut tags = HashMap::new();
     if let Some(name) = raw.activity_name {
         tags.insert("activity_name".into(), name);

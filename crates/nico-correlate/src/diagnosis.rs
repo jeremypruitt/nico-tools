@@ -1,5 +1,5 @@
 use chrono::Utc;
-use crate::event::Event;
+use crate::event::{Event, Severity};
 use crate::source::StateEntry;
 
 #[derive(Debug, PartialEq)]
@@ -88,7 +88,7 @@ fn match_stuck_workflow(events: &[Event]) -> Option<Diagnosis> {
     }
 
     let has_terminal = temporal_events.iter().any(|e| {
-        e.kind.contains("WorkflowExecutionCompleted") || e.kind.contains("WorkflowExecutionFailed")
+        e.kind.contains("WorkflowExecutionCompleted") || e.severity == Severity::Error
     });
     if has_terminal {
         return None;
@@ -185,7 +185,7 @@ mod tests {
             source: "temporal".into(),
             kind: kind.into(),
             message: kind.into(),
-            severity: Severity::Info,
+            severity: Severity::classify("temporal", kind, ""),
             tags: Default::default(),
         }
     }

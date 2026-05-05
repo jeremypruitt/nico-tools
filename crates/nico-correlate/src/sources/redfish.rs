@@ -49,16 +49,7 @@ impl RedfishSource {
 }
 
 fn map_event(raw: RedfishRawEvent) -> Event {
-    let severity = if raw.event_type.contains("Fault")
-        || raw.event_type.contains("Critical")
-        || raw.event_type.contains("Failed")
-    {
-        Severity::Error
-    } else if raw.event_type.contains("Warning") || raw.event_type.contains("Degraded") {
-        Severity::Warning
-    } else {
-        Severity::Info
-    };
+    let severity = Severity::classify("redfish", &raw.event_type, &raw.detail);
     Event {
         ts: raw.ts,
         source: "redfish".into(),

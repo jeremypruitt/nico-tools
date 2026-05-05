@@ -71,19 +71,20 @@ fn loki_line_to_event(line: LokiLogLine) -> Event {
         ts: line.ts,
         source: "loki".into(),
         kind: kind.into(),
-        message: line.message,
-        severity: Severity::Info,
+        message: line.message.clone(),
+        severity: Severity::classify("loki", kind, &line.message),
         tags: Default::default(),
     }
 }
 
 fn k8s_line_to_event(line: K8sLogLine) -> Event {
+    let message = format!("[{}] {}", line.pod, line.message);
     Event {
         ts: line.ts,
         source: "k8s-logs".into(),
         kind: "Log".into(),
-        message: format!("[{}] {}", line.pod, line.message),
-        severity: Severity::Info,
+        message: message.clone(),
+        severity: Severity::classify("k8s-logs", "Log", &message),
         tags: Default::default(),
     }
 }
