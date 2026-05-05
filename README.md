@@ -81,6 +81,80 @@ can point the tools at already-forwarded ports without any Kubernetes access.
 
 ---
 
+## Tests
+
+### Running the test suite
+
+```bash
+cargo test                          # all crates
+cargo test -p nico-doctor           # one crate
+cargo test --test json_snapshot     # snapshot tests only
+```
+
+All tests are offline — no cluster, no database, no network required.
+
+### JSON snapshot tests
+
+`crates/nico-doctor/tests/json_snapshot.rs` and `crates/nico-correlate/tests/json_snapshot.rs` enforce the `--json` output schema contract (ADR-003). Each test builds a fixture `Report` or `Event` slice, calls the public `format_json` function, and compares the result against a committed golden file.
+
+**What each test covers:**
+
+| Crate | Test | Scenario |
+|-------|------|----------|
+| `nico-doctor` | `all_ok` | All layers green |
+| `nico-doctor` | `warn_only` | Two warn-status layers |
+| `nico-doctor` | `fail_report` | Two fail-status layers |
+| `nico-doctor` | `skipped_layer` | Mix of active and skipped layers |
+| `nico-doctor` | `unknown_timeout_layer` | Layers that timed out (status: unknown) |
+| `nico-correlate` | `empty_timeline` | Workflow ID with zero events |
+| `nico-correlate` | `one_event_per_severity` | One info, one warning, one error event |
+| `nico-correlate` | `with_diagnosis` | Events + state entries + a diagnosis block |
+| `nico-correlate` | `without_diagnosis` | Events with restricted/unavailable sources, no diagnosis |
+
+Snapshot files live alongside the test files:
+
+```
+crates/nico-doctor/tests/snapshots/
+crates/nico-correlate/tests/snapshots/
+```
+
+### Interpreting a snapshot failure
+
+A snapshot failure means the `--json` output changed. `insta` prints a side-by-side diff:
+
+```
+-old snapshot
++new results
+────────────┬──────────────────────────────────────
+   12    12 │       "name": "cluster",
+   13       │-      "status": "ok"
+         13 │+      "state": "ok"
+```
+
+A `-` line is what was committed; a `+` line is what the code now produces. If the change was accidental (e.g. a refactor silently renamed a field), fix the code. If it was intentional, update the snapshots (see below).
+
+### Updating snapshots after an intentional schema change
+
+```bash
+# 1. Re-run tests, writing .snap.new files for anything that changed
+INSTA_UPDATE=new cargo test --test json_snapshot
+
+# 2. Inspect the diffs, then promote the new files
+find . -name "*.snap.new" -exec sh -c 'mv "$1" "${1%.new}"' _ {} \;
+
+# 3. Commit the updated snapshot files alongside the schema change
+git add crates/*/tests/snapshots/
+git commit -m "test: update snapshots for <field rename>"
+```
+
+If `cargo-insta` is installed you can use the interactive review workflow instead:
+
+```bash
+make snapshots   # wraps cargo insta review
+```
+
+---
+
 ## Configuration file
 
 Both `nico-doctor` and `nico-correlate` load `~/.config/nico-tools/config.toml` automatically if it exists. Write it once and stop juggling environment variables every session.
