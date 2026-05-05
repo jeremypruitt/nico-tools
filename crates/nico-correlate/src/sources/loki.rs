@@ -152,10 +152,10 @@ fn loki_label_query(id: &str, id_type: &IdType, pod_pattern: Option<&str>) -> St
 }
 
 fn parse_k8s_timestamp_log(line: &str) -> (DateTime<Utc>, &str) {
-    if let Some((ts_part, rest)) = line.split_once(' ') {
-        if let Ok(ts) = ts_part.parse::<DateTime<Utc>>() {
-            return (ts, rest);
-        }
+    if let Some((ts_part, rest)) = line.split_once(' ')
+        && let Ok(ts) = ts_part.parse::<DateTime<Utc>>()
+    {
+        return (ts, rest);
     }
     (Utc::now(), line)
 }

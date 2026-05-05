@@ -8,6 +8,7 @@ mod timeline;
 use clap::Parser;
 use chrono::Duration;
 use serde::Serialize;
+use nico_common::output::{OutputMode, Status};
 use crate::id::{IdType, detect_id_type};
 use crate::source::{Source, SourceResult, StateEntry};
 use crate::sources::temporal::{TemporalSource, TemporalClient, RawTemporalEvent};
@@ -47,6 +48,14 @@ struct Cli {
     /// Output JSON
     #[arg(short = 'j', long)]
     json: bool,
+
+    /// ASCII-only output (no Unicode icons)
+    #[arg(long)]
+    ascii: bool,
+
+    /// Disable color output
+    #[arg(long)]
+    no_color: bool,
 }
 
 fn parse_since(s: &str) -> Result<Duration, String> {
@@ -201,6 +210,14 @@ fn parse_id_type(s: &str) -> Option<IdType> {
     }
 }
 
+fn severity_to_status(s: &crate::event::Severity) -> Status {
+    match s {
+        crate::event::Severity::Info => Status::Ok,
+        crate::event::Severity::Warning => Status::Warn,
+        crate::event::Severity::Error => Status::Fail,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -238,6 +255,12 @@ async fn main() {
             .collect()
     };
 
+    let attempted_names: Vec<&str> = KNOWN_SOURCES
+        .iter()
+        .copied()
+        .filter(|&name| !restricted_names.contains(&name))
+        .collect();
+
     let id_type = if let Some(ref t) = cli.r#type {
         match parse_id_type(t) {
             Some(it) => Some(it),
@@ -258,8 +281,6 @@ async fn main() {
         std::process::exit(1);
     }
     let id_type = id_type.unwrap();
-
-    println!("detected type: {}", id_type_str(&id_type));
 
     let pg_client: Box<dyn PostgresClient> = match std::env::var("NICO_POSTGRES_URL") {
         Ok(url) => match SqlxPostgresClient::connect(&url).await {
@@ -295,15 +316,11 @@ async fn main() {
     let redfish_client: Box<dyn RedfishClient> = match std::env::var("REDFISH_BMC_BASE_URL") {
         Ok(bmc_url) => {
             let pg_pool = match std::env::var("NICO_POSTGRES_URL") {
-                Ok(pg_url) => match sqlx::postgres::PgPoolOptions::new()
+                Ok(pg_url) => sqlx::postgres::PgPoolOptions::new()
                     .max_connections(1)
                     .acquire_timeout(std::time::Duration::from_secs(5))
                     .connect(&pg_url)
-                    .await
-                {
-                    Ok(pool) => Some(pool),
-                    Err(_) => None,
-                },
+                    .await.ok(),
                 Err(_) => None,
             };
             Box::new(RealRedfishClient::new(bmc_url, pg_pool))
@@ -357,6 +374,11 @@ async fn main() {
 
     let code = exit_code(Some(&id_type), &all_results);
 
+    let mode = OutputMode {
+        color: !cli.no_color && std::env::var("NO_COLOR").is_err(),
+        ascii: cli.ascii,
+    };
+
     if cli.json {
         let out = JsonOutput {
             version: 1,
@@ -384,7 +406,13 @@ async fn main() {
     } else {
         println!("Timeline ({} events):", filtered.len());
         for e in &filtered {
-            println!("  {}  {}  {}", e.ts.format("%H:%M:%S"), e.source, e.kind);
+            let status = severity_to_status(&e.severity);
+            let icon = status.style(status.icon(&mode), &mode);
+            if e.message.is_empty() {
+                println!("  {}  {}  {}  {}", e.ts.format("%H:%M:%S"), icon, e.source, e.kind);
+            } else {
+                println!("  {}  {}  {}  {}  {}", e.ts.format("%H:%M:%S"), icon, e.source, e.kind, e.message);
+            }
         }
 
         let pg_state: Vec<&StateEntry> = state.iter().filter(|s| s.source == "postgres").collect();
@@ -414,6 +442,15 @@ async fn main() {
         for s in state.iter().filter(|s| s.source == "loki") {
             println!("{}", s.value);
         }
+
+        let sources_line: Vec<String> = attempted_names.iter().map(|name| {
+            if unavailable.contains(name) {
+                format!("{name} (unavailable)")
+            } else {
+                name.to_string()
+            }
+        }).collect();
+        println!("\nSources: {}", sources_line.join("  "));
 
         for name in &restricted_names {
             println!("[source restricted: {name}]");
