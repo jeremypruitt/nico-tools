@@ -40,7 +40,10 @@ jobs:
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -q && sudo apt-get install -yq protobuf-compiler
+        run: |
+          curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-linux-x86_64.zip -o /tmp/protoc.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+          sudo chmod +x /usr/local/bin/protoc
 
       - name: Install cross
         if: matrix.use_cross
@@ -63,8 +66,8 @@ jobs:
       - name: Build (cross)
         if: matrix.use_cross
         env:
-          PROTOC: /usr/bin/protoc
-          CROSS_CONTAINER_OPTS: "--volume /usr/bin/protoc:/usr/bin/protoc"
+          PROTOC: /usr/local/bin/protoc
+          CROSS_CONTAINER_OPTS: "--volume /usr/local/bin/protoc:/usr/local/bin/protoc"
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Package
