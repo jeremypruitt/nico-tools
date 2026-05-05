@@ -484,4 +484,117 @@ mod tests {
             SourceResult::Output(_) => panic!("expected Unavailable, not Output"),
         }
     }
+
+    #[tokio::test]
+    async fn loki_error_message_severity_is_info() {
+        let loki = FakeLokiClient::ok(vec![LokiLogLine {
+            ts: ts(5000),
+            message: "error: connection refused".into(),
+            pod: Some("hp-worker".into()),
+            is_serial_console: false,
+        }]);
+        let source = make_source(loki, None::<FakeK8sLogStreamClient>);
+        let output = match source.collect("hp-abc", &IdType::Workflow).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert_eq!(output.events[0].severity, Severity::Info);
+        assert_eq!(output.events[0].kind, "Log");
+    }
+
+    #[tokio::test]
+    async fn k8s_log_message_has_pod_name_prefix() {
+        let k8s = FakeK8sLogStreamClient::ok(vec![K8sLogLine {
+            ts: ts(6000),
+            message: "init container finished".into(),
+            pod: "hp-worker-xyz".into(),
+        }]);
+        let source = make_source(FakeLokiClient::err("loki down"), Some(k8s));
+        let output = match source.collect("hp-abc", &IdType::Workflow).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert_eq!(output.events[0].source, "k8s-logs");
+        assert_eq!(output.events[0].kind, "Log");
+        assert_eq!(output.events[0].message, "[hp-worker-xyz] init container finished");
+    }
+
+    #[tokio::test]
+    async fn loki_empty_ok_produces_empty_output_no_k8s_fallback() {
+        struct CheckK8sNotCalled;
+
+        #[async_trait]
+        impl K8sLogStreamClient for CheckK8sNotCalled {
+            async fn stream_logs(
+                &self,
+                _id: &str,
+                _id_type: &IdType,
+                _since: Duration,
+                _pod_pattern: Option<&str>,
+            ) -> Result<Vec<K8sLogLine>> {
+                panic!("k8s should not be called when loki returns Ok");
+            }
+        }
+
+        let source = LokiSource::new(
+            Box::new(FakeLokiClient::ok(vec![])),
+            Some(Box::new(CheckK8sNotCalled)),
+            None,
+            Duration::hours(1),
+        );
+        let output = match source.collect("hp-abc", &IdType::Workflow).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert!(output.events.is_empty());
+        assert!(output.state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loki_unavailable_with_no_k8s_configured_returns_unavailable() {
+        let source = LokiSource::new(
+            Box::new(FakeLokiClient::err("loki down")),
+            None::<Box<dyn K8sLogStreamClient>>,
+            None,
+            Duration::hours(1),
+        );
+        match source.collect("hp-abc", &IdType::Workflow).await {
+            SourceResult::Unavailable(u) => {
+                assert_eq!(u.name, "loki");
+                assert!(u.reason.contains("loki down"));
+            }
+            SourceResult::Output(_) => panic!("expected Unavailable"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pod_pattern_forwarded_to_k8s_stream_logs() {
+        struct CaptureK8s {
+            captured: Arc<Mutex<Option<String>>>,
+        }
+
+        #[async_trait]
+        impl K8sLogStreamClient for CaptureK8s {
+            async fn stream_logs(
+                &self,
+                _id: &str,
+                _id_type: &IdType,
+                _since: Duration,
+                pod_pattern: Option<&str>,
+            ) -> Result<Vec<K8sLogLine>> {
+                *self.captured.lock().unwrap() = pod_pattern.map(str::to_string);
+                Ok(vec![])
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let source = LokiSource::new(
+            Box::new(FakeLokiClient::err("loki down")),
+            Some(Box::new(CaptureK8s { captured: captured.clone() })),
+            Some("hp-worker-*".into()),
+            Duration::hours(1),
+        );
+        source.collect("hp-abc", &IdType::Workflow).await;
+        assert_eq!(*captured.lock().unwrap(), Some("hp-worker-*".to_string()));
+    }
 }

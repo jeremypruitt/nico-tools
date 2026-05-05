@@ -149,4 +149,43 @@ mod tests {
             _ => panic!("expected Unavailable"),
         }
     }
+
+    #[tokio::test]
+    async fn workflow_timed_out_maps_to_error_severity() {
+        let client = FakeTemporalClient::ok(vec![
+            RawTemporalEvent { event_type: "WorkflowExecutionTimedOut".into(), ts: ts(3000), ..Default::default() },
+        ]);
+        let source = TemporalSource::new(Box::new(client));
+        let output = match source.collect("hp-abc", &IdType::Workflow).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert_eq!(output.events[0].severity, Severity::Error);
+        assert_eq!(output.events[0].kind, "WorkflowExecutionTimedOut");
+    }
+
+    #[tokio::test]
+    async fn activity_task_failed_maps_to_error_severity() {
+        let client = FakeTemporalClient::ok(vec![
+            RawTemporalEvent { event_type: "ActivityTaskFailed".into(), ts: ts(4000), ..Default::default() },
+        ]);
+        let source = TemporalSource::new(Box::new(client));
+        let output = match source.collect("hp-abc", &IdType::Workflow).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert_eq!(output.events[0].severity, Severity::Error);
+    }
+
+    #[tokio::test]
+    async fn empty_history_returns_empty_output() {
+        let client = FakeTemporalClient::ok(vec![]);
+        let source = TemporalSource::new(Box::new(client));
+        let output = match source.collect("hp-abc", &IdType::Workflow).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert!(output.events.is_empty());
+        assert!(output.state.is_empty());
+    }
 }

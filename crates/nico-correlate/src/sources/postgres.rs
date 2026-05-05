@@ -295,6 +295,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_rows_become_workflow_state_entries() {
+        let data = PgEntityData {
+            rows: vec![PgRow {
+                table: "workflows".into(),
+                columns: vec![
+                    ("id".into(), "hp-abc".into()),
+                    ("status".into(), "running".into()),
+                ],
+            }],
+            audit_events: vec![],
+        };
+        let source = PostgresSource::new(Box::new(FakePostgresClient::ok(data)));
+        let output = match source.collect("hp-abc", &IdType::Workflow).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert_eq!(output.state.len(), 2);
+        assert_eq!(output.state[0].key, "workflows.id");
+        assert_eq!(output.state[0].value, "hp-abc");
+        assert_eq!(output.state[1].key, "workflows.status");
+        assert_eq!(output.state[1].value, "running");
+        assert!(output.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_entity_data_produces_empty_output() {
+        let data = PgEntityData { rows: vec![], audit_events: vec![] };
+        let source = PostgresSource::new(Box::new(FakePostgresClient::ok(data)));
+        let output = match source.collect("hp-abc", &IdType::Workflow).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert!(output.events.is_empty());
+        assert!(output.state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multiple_rows_produce_all_state_entries() {
+        let data = PgEntityData {
+            rows: vec![
+                PgRow {
+                    table: "hosts".into(),
+                    columns: vec![("id".into(), "host-r12u5".into()), ("rack".into(), "r12".into())],
+                },
+                PgRow {
+                    table: "hosts".into(),
+                    columns: vec![("id".into(), "host-r13u5".into()), ("rack".into(), "r13".into())],
+                },
+            ],
+            audit_events: vec![],
+        };
+        let source = PostgresSource::new(Box::new(FakePostgresClient::ok(data)));
+        let output = match source.collect("host-r12u5", &IdType::Host).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert_eq!(output.state.len(), 4);
+        assert!(output.state.iter().all(|s| s.key.starts_with("hosts.")));
+    }
+
+    #[tokio::test]
+    async fn multiple_audit_events_become_multiple_events() {
+        let data = PgEntityData {
+            rows: vec![],
+            audit_events: vec![
+                PgAuditEvent { ts: ts(1000), action: "create_host".into(), detail: "".into() },
+                PgAuditEvent { ts: ts(2000), action: "provision_fail".into(), detail: "timeout".into() },
+                PgAuditEvent { ts: ts(3000), action: "delete_host".into(), detail: "decommissioned".into() },
+            ],
+        };
+        let source = PostgresSource::new(Box::new(FakePostgresClient::ok(data)));
+        let output = match source.collect("host-r12u5", &IdType::Host).await {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
+        };
+        assert_eq!(output.events.len(), 3);
+        assert_eq!(output.events[0].severity, Severity::Info);
+        assert_eq!(output.events[1].severity, Severity::Warning);
+        assert_eq!(output.events[2].severity, Severity::Warning);
+        assert!(output.state.is_empty());
+    }
+
+    #[tokio::test]
     async fn smoke_real_postgres_skips_when_url_unset() {
         let url = match std::env::var("NICO_POSTGRES_URL") {
             Ok(u) => u,
