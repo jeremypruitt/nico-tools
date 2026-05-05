@@ -10,7 +10,8 @@ mod timeline;
 mod tui;
 
 use clap::Parser;
-use chrono::Duration;
+use chrono::{Duration, Utc};
+use std::sync::Arc;
 use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, ReachMode};
 use nico_common::output::{OutputMode, Status};
 use nico_common::reach::ReachManager;
@@ -123,12 +124,6 @@ async fn main() {
     // Guard: --tui and --json are mutually exclusive.
     if cli.tui && cli.json {
         eprintln!("error: --tui and --json are mutually exclusive");
-        std::process::exit(3);
-    }
-
-    // Guard: --tail and --tui are mutually exclusive.
-    if cli.tail && cli.tui {
-        eprintln!("error: --tail and --tui are mutually exclusive");
         std::process::exit(3);
     }
 
@@ -379,26 +374,70 @@ async fn main() {
             source_names,
             restricted: restricted_names.iter().map(|s| s.to_string()).collect(),
             diagnosis: DiagnosisConfig { stuck_threshold: config.temporal.stuck_threshold },
+            tail: cli.tail,
         };
         let id_clone = cli.id.clone();
         let id_type_clone = id_type.clone();
+        let do_tail = cli.tail;
         let mut join_set = tokio::task::JoinSet::new();
-        for (name, source) in named_sources {
+
+        // Wrap sources in Arc so tail mode can reuse them after the initial collect.
+        let named_sources_arc: Vec<(&'static str, Arc<dyn Source>)> = named_sources
+            .into_iter()
+            .map(|(n, s)| (n, Arc::from(s) as Arc<dyn Source>))
+            .collect();
+
+        for (name, source) in named_sources_arc {
             let tx = tx.clone();
             let id = id_clone.clone();
             let idt = id_type_clone.clone();
             join_set.spawn(async move {
                 let result = source.collect(&id, &idt).await;
+                // Compute the tail cutoff from the newest event seen in the initial dump.
+                let cutoff = match &result {
+                    SourceResult::Output(o) => o.events.iter().map(|e| e.ts).max().unwrap_or_else(Utc::now),
+                    SourceResult::Unavailable(_) => Utc::now(),
+                };
                 let _ = tx.send(tui::TuiUpdate::SourceDone { name: name.to_string(), result });
+
+                if do_tail {
+                    let mut cutoff = cutoff;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        match source.collect(&id, &idt).await {
+                            SourceResult::Output(o) => {
+                                let mut new_events: Vec<Event> = o.events
+                                    .into_iter()
+                                    .filter(|e| e.ts > cutoff)
+                                    .collect();
+                                if !new_events.is_empty() {
+                                    new_events.sort_by_key(|e| e.ts);
+                                    cutoff = new_events.iter().map(|e| e.ts).max().unwrap_or(cutoff);
+                                    if tx.send(tui::TuiUpdate::TailEvents { events: new_events }).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            SourceResult::Unavailable(u) => {
+                                if tx.send(tui::TuiUpdate::TailSourceError {
+                                    source: name.to_string(),
+                                    message: u.reason.clone(),
+                                }).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             });
         }
-        drop(tx); // rx signals EOF when all tasks have sent their result and dropped their tx clone
+        drop(tx);
         let ctx = tui::TuiContext { mode };
         let tui_exit = tokio::task::block_in_place(|| {
             tui::run_tui_incremental(tui_config, rx, ctx)
         });
-        // Wait for any tasks that outlived the TUI (user quit early).
-        while join_set.join_next().await.is_some() {}
+        // Drop the JoinSet to abort any in-flight tasks (initial fetches or tail pollers).
+        drop(join_set);
         drop(_pf_guards);
         std::process::exit(tui_exit);
     }

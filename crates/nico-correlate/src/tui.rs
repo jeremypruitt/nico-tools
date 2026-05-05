@@ -1,6 +1,7 @@
 use std::io;
 use std::collections::HashMap;
 use std::sync::mpsc;
+use chrono::Utc;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -33,6 +34,8 @@ pub struct TuiConfig {
     /// Names of sources that were skipped entirely (shown as ○).
     pub restricted: Vec<String>,
     pub diagnosis: DiagnosisConfig,
+    /// Whether the TUI was launched with `--tail` (enables FOLLOW/PAUSED indicator).
+    pub tail: bool,
 }
 
 /// Message sent from a source-fetch task to the TUI event loop.
@@ -41,10 +44,19 @@ pub enum TuiUpdate {
         name: String,
         result: SourceResult,
     },
+    /// New events streamed from a tail-polling task.
+    TailEvents {
+        events: Vec<CorrelateEvent>,
+    },
+    /// A source that was polling encountered an error.
+    TailSourceError {
+        source: String,
+        message: String,
+    },
 }
 
 /// Per-source loading state — drives the four-state bottom-bar indicators.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SourceState {
     Fetching,    // ⟳  in-flight
     Available,   // ●  SourceResult::Output
@@ -98,6 +110,10 @@ struct IncrementalState {
     // Filter bar — view-layer only, does not mutate self.events.
     filter_query: String,
     filter_active: bool,
+
+    // Tail mode — follow causes new events to auto-scroll to the last row.
+    tail_mode: bool,
+    follow: bool,
 }
 
 impl IncrementalState {
@@ -124,31 +140,66 @@ impl IncrementalState {
             detail_open: false,
             filter_query: String::new(),
             filter_active: false,
+            tail_mode: config.tail,
+            follow: config.tail,
         }
     }
 
     fn apply_update(&mut self, update: TuiUpdate) {
-        let TuiUpdate::SourceDone { name, result } = update;
-        self.done_count += 1;
-        match result {
-            SourceResult::Output(output) => {
-                self.source_states.insert(name, SourceState::Available);
-                self.events.extend(output.events);
+        match update {
+            TuiUpdate::SourceDone { name, result } => {
+                self.done_count += 1;
+                match result {
+                    SourceResult::Output(output) => {
+                        self.source_states.insert(name, SourceState::Available);
+                        self.events.extend(output.events);
+                        self.events.sort_unstable_by_key(|e| e.ts);
+                        self.state_entries.extend(output.state);
+                    }
+                    SourceResult::Unavailable(_) => {
+                        self.source_states.insert(name, SourceState::Errored);
+                        self.has_unavailable = true;
+                    }
+                }
+                if self.all_done() {
+                    // Apply the same timeline filter used by the non-TUI path.
+                    let filtered = filter_timeline(std::mem::take(&mut self.events), 5, 10);
+                    self.events = filtered;
+                    self.diagnosis = diagnose(&self.events, &self.state_entries, &self.diag_config);
+                }
+                self.sync_cursor();
+            }
+            TuiUpdate::TailEvents { events } => {
+                // Tail events bypass the timeline filter — stream them all in.
+                self.events.extend(events);
                 self.events.sort_unstable_by_key(|e| e.ts);
-                self.state_entries.extend(output.state);
+                self.sync_cursor();
+                if self.follow {
+                    self.select_last();
+                }
             }
-            SourceResult::Unavailable(_) => {
-                self.source_states.insert(name, SourceState::Errored);
-                self.has_unavailable = true;
+            TuiUpdate::TailSourceError { source, message } => {
+                // Only inject the synthetic event once: on the Available→Errored transition.
+                let was_available = self.source_states.get(&source) == Some(&SourceState::Available);
+                self.source_states.insert(source.clone(), SourceState::Errored);
+                if was_available {
+                    let synthetic = CorrelateEvent {
+                        ts: Utc::now(),
+                        source,
+                        kind: "source_error".to_string(),
+                        message,
+                        severity: Severity::Error,
+                        tags: HashMap::new(),
+                    };
+                    self.events.push(synthetic);
+                    self.events.sort_unstable_by_key(|e| e.ts);
+                }
+                self.sync_cursor();
+                if self.follow {
+                    self.select_last();
+                }
             }
         }
-        if self.all_done() {
-            // Apply the same timeline filter used by the non-TUI path.
-            let filtered = filter_timeline(std::mem::take(&mut self.events), 5, 10);
-            self.events = filtered;
-            self.diagnosis = diagnose(&self.events, &self.state_entries, &self.diag_config);
-        }
-        self.sync_cursor();
     }
 
     fn all_done(&self) -> bool {
@@ -288,6 +339,13 @@ impl IncrementalState {
         self.filter_query.pop();
         self.sync_cursor();
     }
+
+    fn toggle_follow(&mut self) {
+        self.follow = !self.follow;
+        if self.follow {
+            self.select_last();
+        }
+    }
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -353,9 +411,15 @@ fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Esc => state.close_filter(),
                     KeyCode::Backspace => state.pop_filter_char(),
-                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Up => {
+                        state.select_prev();
+                        if state.tail_mode { state.follow = false; }
+                    }
                     KeyCode::Down => state.select_next(),
-                    KeyCode::PageUp => state.select_prev_page(PAGE_SIZE),
+                    KeyCode::PageUp => {
+                        state.select_prev_page(PAGE_SIZE);
+                        if state.tail_mode { state.follow = false; }
+                    }
                     KeyCode::PageDown => state.select_next_page(PAGE_SIZE),
                     KeyCode::Char(c) => state.push_filter_char(c),
                     _ => {}
@@ -371,12 +435,24 @@ fn event_loop<B: ratatui::backend::Backend>(
                             state.close_filter();
                         }
                     }
-                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Up => {
+                        state.select_prev();
+                        if state.tail_mode { state.follow = false; }
+                    }
                     KeyCode::Down => state.select_next(),
-                    KeyCode::PageUp => state.select_prev_page(PAGE_SIZE),
+                    KeyCode::PageUp => {
+                        state.select_prev_page(PAGE_SIZE);
+                        if state.tail_mode { state.follow = false; }
+                    }
                     KeyCode::PageDown => state.select_next_page(PAGE_SIZE),
                     KeyCode::Char('g') => state.select_first(),
-                    KeyCode::Char('G') | KeyCode::End => state.select_last(),
+                    KeyCode::Char('G') | KeyCode::End => {
+                        state.select_last();
+                        if state.tail_mode { state.follow = true; }
+                    }
+                    KeyCode::Char('f') => {
+                        if state.tail_mode { state.toggle_follow(); }
+                    }
                     KeyCode::Enter => state.detail_open = true,
                     _ => {}
                 }
@@ -711,14 +787,29 @@ fn render_status_bar(
     }).collect();
     frame.render_widget(Paragraph::new(Line::from(spans)), cols[1]);
 
-    // Right: quit hint (shows Esc hint while filter is active)
-    let hint = if state.filter_active {
-        "Esc:clear  q:quit"
+    // Right: FOLLOW/PAUSED indicator in tail mode, otherwise standard quit hint.
+    // Filter-active hint always wins over tail indicator.
+    let hint_line: Line = if state.filter_active {
+        Line::from("Esc:clear  q:quit")
+    } else if state.tail_mode {
+        let (indicator, color) = if state.follow {
+            ("FOLLOW", Color::Green)
+        } else {
+            ("PAUSED", Color::Yellow)
+        };
+        if use_color {
+            Line::from(vec![
+                Span::styled(indicator, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::raw("  q:quit"),
+            ])
+        } else {
+            Line::from(format!("{indicator}  q:quit"))
+        }
     } else {
-        "?:help  q:quit"
+        Line::from("?:help  q:quit")
     };
     frame.render_widget(
-        Paragraph::new(hint).alignment(Alignment::Right),
+        Paragraph::new(hint_line).alignment(Alignment::Right),
         cols[2],
     );
 }
@@ -788,6 +879,7 @@ mod tests {
             source_names: SourceKind::ALL.iter().map(|k| k.name()).collect(),
             restricted: vec![],
             diagnosis: DiagnosisConfig::default(),
+            tail: false,
         }
     }
 
@@ -835,6 +927,7 @@ mod tests {
             source_names: vec!["temporal", "k8s"],
             restricted: vec![],
             diagnosis: DiagnosisConfig::default(),
+            tail: false,
         };
         let mut state = IncrementalState::new(&config);
         state.apply_update(TuiUpdate::SourceDone {
@@ -1003,6 +1096,7 @@ mod tests {
             source_names: vec!["temporal"],
             restricted: vec![],
             diagnosis: DiagnosisConfig::default(),
+            tail: false,
         };
         let ctx = TuiContext { mode: OutputMode { color: false, ascii: true } };
         let mut state = IncrementalState::new(&config); // temporal still fetching
@@ -1024,6 +1118,7 @@ mod tests {
             source_names: vec!["temporal"],
             restricted: vec![],
             diagnosis: DiagnosisConfig::default(),
+            tail: false,
         };
         let ctx = TuiContext { mode: OutputMode { color: false, ascii: true } };
         let mut state = IncrementalState::new(&config);
@@ -1109,6 +1204,7 @@ mod tests {
             source_names: vec!["temporal"],
             restricted: vec![],
             diagnosis: DiagnosisConfig::default(),
+            tail: false,
         };
         let mut state = IncrementalState::new(&config);
         state.apply_update(TuiUpdate::SourceDone {
@@ -1157,6 +1253,7 @@ mod tests {
             source_names: vec![],
             restricted: vec![],
             diagnosis: DiagnosisConfig::default(),
+            tail: false,
         };
         let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
         let mut state = IncrementalState::new(&config);
@@ -1567,6 +1664,293 @@ mod tests {
         assert!(
             all_rows.contains("Esc:clear"),
             "Expected 'Esc:clear' hint while filter is active: {all_rows}"
+        );
+    }
+
+    // ─── Tail mode: follow / paused indicator ─────────────────────────────────
+
+    fn tail_config() -> TuiConfig {
+        TuiConfig {
+            id: "wf-tail".into(),
+            source_names: vec!["temporal", "k8s"],
+            restricted: vec![],
+            diagnosis: DiagnosisConfig::default(),
+            tail: true,
+        }
+    }
+
+    /// Build an IncrementalState in tail mode with initial events loaded.
+    fn tail_state(config: &TuiConfig) -> IncrementalState {
+        let mut state = IncrementalState::new(config);
+        state.apply_update(TuiUpdate::SourceDone {
+            name: "temporal".into(),
+            result: SourceResult::Output(SourceOutput {
+                events: vec![
+                    make_event(1_000, "temporal", "started", Severity::Info, ""),
+                    make_event(2_000, "temporal", "scheduled", Severity::Info, ""),
+                ],
+                state: vec![],
+            }),
+        });
+        state.apply_update(TuiUpdate::SourceDone {
+            name: "k8s".into(),
+            result: SourceResult::Output(SourceOutput {
+                events: vec![make_event(3_000, "k8s", "warning", Severity::Warning, "")],
+                state: vec![],
+            }),
+        });
+        state
+    }
+
+    #[test]
+    fn follow_indicator_shown_in_tail_mode() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = tail_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = tail_state(&config);
+        assert!(state.follow, "follow should start true in tail mode");
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+        assert!(all_rows.contains("FOLLOW"), "Expected 'FOLLOW' in status bar: {all_rows}");
+    }
+
+    #[test]
+    fn paused_indicator_shown_when_follow_disabled() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = tail_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = tail_state(&config);
+        state.follow = false;
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+        assert!(all_rows.contains("PAUSED"), "Expected 'PAUSED' in status bar: {all_rows}");
+        assert!(!all_rows.contains("FOLLOW"), "Should not show 'FOLLOW' when paused: {all_rows}");
+    }
+
+    #[test]
+    fn tail_events_appended_to_timeline() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        let count_before = state.events.len();
+
+        state.apply_update(TuiUpdate::TailEvents {
+            events: vec![
+                make_event(5_000, "temporal", "completed", Severity::Info, ""),
+                make_event(6_000, "k8s", "restarted", Severity::Warning, ""),
+            ],
+        });
+
+        assert_eq!(state.events.len(), count_before + 2, "tail events should be appended");
+        let last = state.events.last().unwrap();
+        assert_eq!(last.kind, "restarted", "events should be sorted by ts");
+    }
+
+    #[test]
+    fn tail_events_with_follow_moves_cursor_to_last() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        state.follow = true;
+        state.select_first();
+
+        state.apply_update(TuiUpdate::TailEvents {
+            events: vec![make_event(9_000, "temporal", "new-event", Severity::Info, "")],
+        });
+
+        let n = state.filtered_indices().len();
+        assert_eq!(state.selected(), Some(n - 1), "follow should move cursor to last after tail event");
+    }
+
+    #[test]
+    fn tail_events_with_follow_false_do_not_move_cursor() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        state.follow = false;
+        state.select_first();
+        assert_eq!(state.selected(), Some(0));
+
+        state.apply_update(TuiUpdate::TailEvents {
+            events: vec![make_event(9_000, "temporal", "new-event", Severity::Info, "")],
+        });
+
+        assert_eq!(state.selected(), Some(0), "cursor should not jump when follow is false");
+    }
+
+    #[test]
+    fn cursor_tracks_event_identity_during_tail_streaming() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        state.follow = false;
+
+        // Select k8s/warning at raw index 2 (ts=3000) — visual index 2.
+        state.select_at(2);
+        let selected_kind = state.events[state.filtered_indices()[2]].kind.clone();
+        assert_eq!(selected_kind, "warning");
+
+        // Stream in two earlier events — they land before the k8s event.
+        state.apply_update(TuiUpdate::TailEvents {
+            events: vec![
+                make_event(500,  "temporal", "earlier-a", Severity::Info, ""),
+                make_event(1_500, "temporal", "earlier-b", Severity::Info, ""),
+            ],
+        });
+
+        // The k8s event moved in raw index; cursor should still point at it.
+        let sel_vis = state.selected().expect("cursor must not be None");
+        let raw = state.filtered_indices()[sel_vis];
+        assert_eq!(state.events[raw].kind, "warning", "cursor should track 'warning' event after insertions above");
+    }
+
+    #[test]
+    fn source_error_injects_synthetic_event_and_flips_indicator() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        state.follow = false;
+        let count_before = state.events.len();
+
+        state.apply_update(TuiUpdate::TailSourceError {
+            source: "temporal".into(),
+            message: "connection lost".into(),
+        });
+
+        assert_eq!(state.events.len(), count_before + 1, "one synthetic event should be injected");
+        let synthetic = state.events.iter().find(|e| e.kind == "source_error").unwrap();
+        assert_eq!(synthetic.source, "temporal");
+        assert_eq!(synthetic.message, "connection lost");
+        assert_eq!(synthetic.severity, Severity::Error);
+
+        assert_eq!(
+            state.source_states.get("temporal"),
+            Some(&SourceState::Errored),
+            "source indicator should flip to Errored"
+        );
+    }
+
+    #[test]
+    fn source_error_not_injected_twice_for_same_source() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        state.follow = false;
+
+        state.apply_update(TuiUpdate::TailSourceError {
+            source: "temporal".into(),
+            message: "first error".into(),
+        });
+        let count_after_first = state.events.len();
+
+        // Second error on the same source — already Errored, no new synthetic event.
+        state.apply_update(TuiUpdate::TailSourceError {
+            source: "temporal".into(),
+            message: "second error".into(),
+        });
+
+        assert_eq!(state.events.len(), count_after_first, "no second synthetic event for already-errored source");
+    }
+
+    #[test]
+    fn scroll_up_pauses_follow_in_tail_mode() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        state.follow = true;
+        state.select_last();
+
+        // Simulate Up key by calling select_prev + clearing follow (as event_loop does).
+        state.select_prev();
+        if state.tail_mode { state.follow = false; }
+
+        assert!(!state.follow, "follow should be false after scrolling up");
+    }
+
+    #[test]
+    fn g_end_reenables_follow_in_tail_mode() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        state.follow = false;
+        state.select_first();
+
+        // Simulate G/End key.
+        state.select_last();
+        if state.tail_mode { state.follow = true; }
+
+        assert!(state.follow, "follow should be re-enabled after G/End in tail mode");
+        let n = state.filtered_indices().len();
+        assert_eq!(state.selected(), Some(n - 1), "cursor should be at last row");
+    }
+
+    #[test]
+    fn toggle_follow_jumps_to_last_when_enabling() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        state.follow = false;
+        state.select_first();
+        assert_eq!(state.selected(), Some(0));
+
+        state.toggle_follow();
+
+        assert!(state.follow, "follow should be enabled after toggle");
+        let n = state.filtered_indices().len();
+        assert_eq!(state.selected(), Some(n - 1), "cursor should jump to last when follow is enabled");
+    }
+
+    #[test]
+    fn toggle_follow_disables_without_moving_cursor() {
+        let config = tail_config();
+        let mut state = tail_state(&config);
+        state.follow = true;
+        state.select_first();
+        assert_eq!(state.selected(), Some(0));
+
+        state.toggle_follow();
+
+        assert!(!state.follow, "follow should be disabled after toggle");
+        assert_eq!(state.selected(), Some(0), "cursor should not move when disabling follow");
+    }
+
+    #[test]
+    fn no_tail_indicator_in_non_tail_mode() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config(); // tail: false
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+        assert!(!all_rows.contains("FOLLOW"), "No FOLLOW indicator in non-tail mode: {all_rows}");
+        assert!(!all_rows.contains("PAUSED"), "No PAUSED indicator in non-tail mode: {all_rows}");
+        assert!(all_rows.contains("?:help"), "Should show ?:help hint in non-tail mode: {all_rows}");
+    }
+
+    #[test]
+    fn synthetic_source_error_event_styled_in_render() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = tail_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = tail_state(&config);
+        state.follow = false;
+
+        state.apply_update(TuiUpdate::TailSourceError {
+            source: "k8s".into(),
+            message: "watch stream closed".into(),
+        });
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+        assert!(
+            all_rows.contains("source_error"),
+            "Expected 'source_error' event in timeline: {all_rows}"
         );
     }
 }
