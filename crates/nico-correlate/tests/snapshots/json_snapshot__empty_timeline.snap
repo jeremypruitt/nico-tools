@@ -1,0 +1,14 @@
+---
+source: crates/nico-correlate/tests/json_snapshot.rs
+assertion_line: 33
+expression: v
+---
+{
+  "events": [],
+  "id": "wf-abc123",
+  "id_type": "workflow",
+  "sources_restricted": [],
+  "sources_unavailable": [],
+  "state": [],
+  "version": 1
+}

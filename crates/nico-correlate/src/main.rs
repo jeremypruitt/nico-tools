@@ -1,6 +1,7 @@
 mod correlate;
 mod diagnosis;
 mod event;
+mod formatter;
 mod id;
 mod source;
 mod sources;
@@ -10,7 +11,6 @@ mod tui;
 
 use clap::Parser;
 use chrono::Duration;
-use serde::Serialize;
 use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, ReachMode};
 use nico_common::output::{OutputMode, Status};
 use nico_common::reach::ReachManager;
@@ -107,41 +107,6 @@ fn parse_since(s: &str) -> Result<Duration, String> {
 }
 
 
-#[derive(Serialize)]
-struct JsonDiagnosis {
-    pattern: String,
-    activity: String,
-    error_signature: String,
-    next_commands: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct JsonOutput<'a> {
-    version: u32,
-    id: &'a str,
-    id_type: &'a str,
-    events: Vec<JsonEvent<'a>>,
-    sources_restricted: Vec<&'a str>,
-    sources_unavailable: Vec<&'a str>,
-    state: Vec<JsonStateEntry<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    diagnosis: Option<JsonDiagnosis>,
-}
-
-#[derive(Serialize)]
-struct JsonEvent<'a> {
-    ts: String,
-    source: &'a str,
-    kind: &'a str,
-    severity: &'a str,
-}
-
-#[derive(Serialize)]
-struct JsonStateEntry<'a> {
-    source: &'a str,
-    key: &'a str,
-    value: &'a str,
-}
 
 fn severity_to_status(s: &crate::event::Severity) -> Status {
     match s {
@@ -468,35 +433,15 @@ async fn main() {
     let code = exit_code(Some(&id_type), &all_results);
 
     if matches!(config.output.format, OutputFormat::Json) {
-        let out = JsonOutput {
-            version: 1,
-            id: &cli.id,
-            id_type: id_type.cli_name(),
-            events: filtered.iter().map(|e| JsonEvent {
-                ts: e.ts.to_rfc3339(),
-                source: &e.source,
-                kind: &e.kind,
-                severity: match e.severity {
-                    crate::event::Severity::Info => "info",
-                    crate::event::Severity::Warning => "warning",
-                    crate::event::Severity::Error => "error",
-                },
-            }).collect(),
-            sources_restricted: restricted_names.clone(),
-            sources_unavailable: unavailable.clone(),
-            state: state.iter().map(|s| JsonStateEntry {
-                source: s.source,
-                key: &s.key,
-                value: &s.value,
-            }).collect(),
-            diagnosis: diag.map(|d| JsonDiagnosis {
-                pattern: d.pattern,
-                activity: d.activity,
-                error_signature: d.error_signature,
-                next_commands: d.next_commands,
-            }),
-        };
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        println!("{}", formatter::format_json(
+            &cli.id,
+            id_type.cli_name(),
+            &filtered,
+            &restricted_names,
+            &unavailable,
+            &state,
+            diag.as_ref(),
+        ));
     } else {
         println!("Timeline ({} events):", filtered.len());
         for e in &filtered {
