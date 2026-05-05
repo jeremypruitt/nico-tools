@@ -1,0 +1,54 @@
+---
+source: crates/nico-doctor/tests/json_snapshot.rs
+assertion_line: 110
+expression: v
+---
+{
+  "layers": [
+    {
+      "checks": [
+        {
+          "name": "pods_ready",
+          "status": "ok",
+          "value": "2/2"
+        }
+      ],
+      "duration_ms": 42,
+      "name": "cluster",
+      "status": "ok"
+    },
+    {
+      "checks": [],
+      "duration_ms": 0,
+      "name": "logs",
+      "status": "skipped"
+    },
+    {
+      "checks": [],
+      "duration_ms": 0,
+      "name": "grpc",
+      "status": "skipped"
+    },
+    {
+      "checks": [
+        {
+          "name": "pool",
+          "status": "ok",
+          "value": "pool 5/20 in-use"
+        }
+      ],
+      "duration_ms": 42,
+      "name": "postgres",
+      "status": "ok"
+    }
+  ],
+  "namespace": "nico",
+  "summary": {
+    "fail": 0,
+    "ok": 2,
+    "skipped": 2,
+    "unknown": 0,
+    "warn": 0
+  },
+  "version": 1
+}

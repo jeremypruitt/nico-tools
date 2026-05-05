@@ -1,0 +1,31 @@
+---
+source: crates/nico-correlate/tests/json_snapshot.rs
+assertion_line: 94
+expression: v
+---
+{
+  "events": [
+    {
+      "kind": "WorkflowExecutionStarted",
+      "severity": "info",
+      "source": "temporal",
+      "ts": "2023-11-14T22:13:20+00:00"
+    },
+    {
+      "kind": "provision_start",
+      "severity": "info",
+      "source": "postgres",
+      "ts": "2023-11-14T22:18:20+00:00"
+    }
+  ],
+  "id": "wf-abc123",
+  "id_type": "workflow",
+  "sources_restricted": [
+    "redfish"
+  ],
+  "sources_unavailable": [
+    "loki"
+  ],
+  "state": [],
+  "version": 1
+}

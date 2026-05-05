@@ -1,0 +1,74 @@
+---
+source: crates/nico-doctor/tests/json_snapshot.rs
+assertion_line: 61
+expression: v
+---
+{
+  "layers": [
+    {
+      "checks": [
+        {
+          "name": "pods_ready",
+          "status": "ok",
+          "value": "3/3"
+        },
+        {
+          "name": "recent_restarts",
+          "status": "ok",
+          "value": "0"
+        },
+        {
+          "name": "warning_events",
+          "status": "ok",
+          "value": "0"
+        }
+      ],
+      "duration_ms": 42,
+      "name": "cluster",
+      "status": "ok"
+    },
+    {
+      "checks": [
+        {
+          "name": "error_lines",
+          "status": "ok",
+          "value": "0 errors"
+        },
+        {
+          "name": "source",
+          "status": "ok",
+          "value": "loki"
+        }
+      ],
+      "duration_ms": 42,
+      "name": "logs",
+      "status": "ok"
+    },
+    {
+      "checks": [
+        {
+          "name": "stuck",
+          "status": "ok",
+          "value": "0 stuck"
+        },
+        {
+          "name": "failed",
+          "status": "ok",
+          "value": "0 failed"
+        }
+      ],
+      "duration_ms": 42,
+      "name": "workflows",
+      "status": "ok"
+    }
+  ],
+  "namespace": "nico",
+  "summary": {
+    "fail": 0,
+    "ok": 3,
+    "skipped": 0,
+    "unknown": 0,
+    "warn": 0
+  },
+  "version": 1
+}

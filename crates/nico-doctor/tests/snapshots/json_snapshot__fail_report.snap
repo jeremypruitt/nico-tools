@@ -1,0 +1,47 @@
+---
+source: crates/nico-doctor/tests/json_snapshot.rs
+assertion_line: 96
+expression: v
+---
+{
+  "layers": [
+    {
+      "checks": [
+        {
+          "name": "endpoints",
+          "status": "fail",
+          "value": "1/2 healthy, 1 failed"
+        },
+        {
+          "name": "service",
+          "status": "fail",
+          "value": "core /healthz failed"
+        }
+      ],
+      "duration_ms": 42,
+      "name": "health",
+      "status": "fail"
+    },
+    {
+      "checks": [
+        {
+          "name": "reachable",
+          "status": "fail",
+          "value": "unreachable"
+        }
+      ],
+      "duration_ms": 42,
+      "name": "grpc",
+      "status": "fail"
+    }
+  ],
+  "namespace": "prod",
+  "summary": {
+    "fail": 2,
+    "ok": 0,
+    "skipped": 0,
+    "unknown": 0,
+    "warn": 0
+  },
+  "version": 1
+}

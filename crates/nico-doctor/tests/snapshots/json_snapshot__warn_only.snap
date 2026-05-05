@@ -1,0 +1,52 @@
+---
+source: crates/nico-doctor/tests/json_snapshot.rs
+assertion_line: 79
+expression: v
+---
+{
+  "layers": [
+    {
+      "checks": [
+        {
+          "name": "pods_ready",
+          "status": "warn",
+          "value": "2/3"
+        },
+        {
+          "name": "recent_restarts",
+          "status": "ok",
+          "value": "0"
+        }
+      ],
+      "duration_ms": 42,
+      "name": "cluster",
+      "status": "warn"
+    },
+    {
+      "checks": [
+        {
+          "name": "pool",
+          "status": "warn",
+          "value": "pool 18/20 in-use"
+        },
+        {
+          "name": "locks",
+          "status": "ok",
+          "value": "0 lock waits"
+        }
+      ],
+      "duration_ms": 42,
+      "name": "postgres",
+      "status": "warn"
+    }
+  ],
+  "namespace": "staging",
+  "summary": {
+    "fail": 0,
+    "ok": 0,
+    "skipped": 0,
+    "unknown": 0,
+    "warn": 2
+  },
+  "version": 1
+}

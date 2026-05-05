@@ -1,0 +1,47 @@
+---
+source: crates/nico-correlate/tests/json_snapshot.rs
+assertion_line: 80
+expression: v
+---
+{
+  "diagnosis": {
+    "activity": "(n/a — pod-level failure)",
+    "error_signature": "pod worker-xyz in CrashLoopBackOff (3 restarts)",
+    "next_commands": [
+      "kubectl describe pod worker-xyz -n <namespace>",
+      "kubectl logs worker-xyz -n <namespace> --previous"
+    ],
+    "pattern": "k8s_crash_loop"
+  },
+  "events": [
+    {
+      "kind": "WorkflowExecutionStarted",
+      "severity": "info",
+      "source": "temporal",
+      "ts": "2023-11-14T22:13:20+00:00"
+    },
+    {
+      "kind": "WorkflowExecutionFailed",
+      "severity": "error",
+      "source": "temporal",
+      "ts": "2023-11-14T22:14:20+00:00"
+    }
+  ],
+  "id": "wf-abc123",
+  "id_type": "workflow",
+  "sources_restricted": [],
+  "sources_unavailable": [],
+  "state": [
+    {
+      "key": "provision_attempt",
+      "source": "postgres",
+      "value": "3"
+    },
+    {
+      "key": "worker-xyz",
+      "source": "k8s",
+      "value": "CrashLoopBackOff (3 restarts)"
+    }
+  ],
+  "version": 1
+}

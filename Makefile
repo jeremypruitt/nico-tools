@@ -1,4 +1,4 @@
-.PHONY: smoke run-doctor run-correlate
+.PHONY: smoke run-doctor run-correlate snapshots
 
 smoke: ## Run smoke tests against a live cluster (requires .env.local)
 	./scripts/smoke.sh
@@ -8,3 +8,6 @@ run-doctor: ## Quick run of nico-doctor (requires .env.local)
 
 run-correlate: ## Quick run of nico-correlate (requires .env.local)
 	source .env.local && cargo run -p nico-correlate -- $(ARGS)
+
+snapshots: ## Regenerate and review committed JSON snapshots (wraps cargo insta review)
+	cargo insta review
