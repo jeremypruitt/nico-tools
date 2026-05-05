@@ -130,6 +130,7 @@ fn warning_event_to_event(e: K8sWarningEvent) -> Event {
         kind: e.reason.clone(),
         message: format!("{}: {}", e.pod_name, e.message),
         severity: Severity::Warning,
+        tags: Default::default(),
     }
 }
 

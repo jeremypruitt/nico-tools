@@ -1,4 +1,5 @@
 mod correlate;
+mod diagnosis;
 mod event;
 mod id;
 mod source;
@@ -19,6 +20,7 @@ use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClie
 use crate::sources::redfish::{RedfishSource, RedfishClient, RedfishData, RealRedfishClient};
 use crate::timeline::filter_timeline;
 use crate::correlate::exit_code;
+use crate::diagnosis::diagnose;
 use crate::event::Event;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -164,6 +166,14 @@ impl RedfishClient for InactiveRedfishClient {
 }
 
 #[derive(Serialize)]
+struct JsonDiagnosis {
+    pattern: String,
+    activity: String,
+    error_signature: String,
+    next_commands: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct JsonOutput<'a> {
     version: u32,
     id: &'a str,
@@ -172,6 +182,8 @@ struct JsonOutput<'a> {
     sources_restricted: Vec<&'a str>,
     sources_unavailable: Vec<&'a str>,
     state: Vec<JsonStateEntry<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnosis: Option<JsonDiagnosis>,
 }
 
 #[derive(Serialize)]
@@ -371,6 +383,7 @@ async fn main() {
         .collect();
 
     let filtered = filter_timeline(events, 5, 10);
+    let diag = diagnose(&filtered);
 
     let code = exit_code(Some(&id_type), &all_results);
 
@@ -401,6 +414,12 @@ async fn main() {
                 key: &s.key,
                 value: &s.value,
             }).collect(),
+            diagnosis: diag.map(|d| JsonDiagnosis {
+                pattern: d.pattern,
+                activity: d.activity,
+                error_signature: d.error_signature,
+                next_commands: d.next_commands,
+            }),
         };
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
     } else {
@@ -457,6 +476,17 @@ async fn main() {
         }
         for name in &unavailable {
             println!("[source unavailable: {name}]");
+        }
+
+        if let Some(d) = diag {
+            println!("\nLikely diagnosis:");
+            println!("  Pattern:  {}", d.pattern);
+            println!("  Activity: {}", d.activity);
+            println!("  Error:    {}", d.error_signature);
+            println!("  Confirm with:");
+            for cmd in &d.next_commands {
+                println!("    {cmd}");
+            }
         }
     }
 

@@ -73,6 +73,7 @@ fn loki_line_to_event(line: LokiLogLine) -> Event {
         kind: kind.into(),
         message: line.message,
         severity: Severity::Info,
+        tags: Default::default(),
     }
 }
 
@@ -83,6 +84,7 @@ fn k8s_line_to_event(line: K8sLogLine) -> Event {
         kind: "Log".into(),
         message: format!("[{}] {}", line.pod, line.message),
         severity: Severity::Info,
+        tags: Default::default(),
     }
 }
 

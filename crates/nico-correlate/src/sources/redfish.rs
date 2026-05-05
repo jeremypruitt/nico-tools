@@ -65,6 +65,7 @@ fn map_event(raw: RedfishRawEvent) -> Event {
         kind: raw.event_type.clone(),
         message: if raw.detail.is_empty() { raw.event_type } else { raw.detail },
         severity,
+        tags: Default::default(),
     }
 }
 

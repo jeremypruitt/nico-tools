@@ -21,7 +21,7 @@ mod tests {
     use chrono::Utc;
 
     fn info_event() -> Event {
-        Event { ts: Utc::now(), source: "temporal".into(), kind: "Started".into(), message: "".into(), severity: Severity::Info }
+        Event { ts: Utc::now(), source: "temporal".into(), kind: "Started".into(), message: "".into(), severity: Severity::Info, tags: Default::default() }
     }
 
     fn ok_result(events: Vec<Event>) -> SourceResult {

@@ -52,6 +52,7 @@ fn audit_event_to_event(e: PgAuditEvent) -> Event {
         kind: e.action,
         message,
         severity,
+        tags: Default::default(),
     }
 }
 

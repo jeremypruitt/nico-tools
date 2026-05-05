@@ -33,6 +33,7 @@ mod tests {
             kind: kind.into(),
             message: kind.into(),
             severity,
+            tags: Default::default(),
         }
     }
 
@@ -40,8 +41,8 @@ mod tests {
     fn stable_sort_preserves_insertion_order_on_tie() {
         let ts = Utc.timestamp_opt(100, 0).unwrap();
         let events = vec![
-            Event { ts, source: "temporal".into(), kind: "First".into(), message: "".into(), severity: Severity::Info },
-            Event { ts, source: "postgres".into(), kind: "Second".into(), message: "".into(), severity: Severity::Info },
+            Event { ts, source: "temporal".into(), kind: "First".into(), message: "".into(), severity: Severity::Info, tags: Default::default() },
+            Event { ts, source: "postgres".into(), kind: "Second".into(), message: "".into(), severity: Severity::Info, tags: Default::default() },
         ];
         let result = filter_timeline(events, 10, 10);
         assert_eq!(result[0].kind, "First");

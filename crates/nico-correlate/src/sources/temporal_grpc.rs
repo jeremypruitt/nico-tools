@@ -1,8 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use temporal_sdk_core_protos::temporal::api::common::v1::WorkflowExecution;
-use temporal_sdk_core_protos::temporal::api::enums::v1::EventType;
+use temporal_sdk_core_protos::temporal::api::enums::v1::{EventType, RetryState};
+use temporal_sdk_core_protos::temporal::api::history::v1::history_event::Attributes;
 use temporal_sdk_core_protos::temporal::api::workflowservice::v1::{
     GetWorkflowExecutionHistoryRequest,
     workflow_service_client::WorkflowServiceClient,
@@ -53,17 +55,40 @@ impl TemporalClient for GrpcTemporalClient {
 
         let history = response.into_inner().history.unwrap_or_default();
 
-        let events = history
-            .events
-            .into_iter()
-            .map(|e| {
-                let ts = e.event_time.map(proto_ts_to_chrono).unwrap_or_else(Utc::now);
-                let event_type = EventType::try_from(e.event_type)
-                    .map(|et| et.as_str_name().to_string())
-                    .unwrap_or_else(|_| format!("UnknownEventType({})", e.event_type));
-                RawTemporalEvent { event_type, ts }
-            })
-            .collect();
+        // Pass 1: build event_id -> activity_name from ActivityTaskScheduled events
+        let mut activity_by_event_id: HashMap<i64, String> = HashMap::new();
+        for e in &history.events {
+            if let Some(Attributes::ActivityTaskScheduledEventAttributes(attrs)) = &e.attributes {
+                let name = attrs.activity_type.as_ref().map(|t| t.name.clone()).unwrap_or_default();
+                if !name.is_empty() {
+                    activity_by_event_id.insert(e.event_id, name);
+                }
+            }
+        }
+
+        // Pass 2: create RawTemporalEvents, enriching activity failures with diagnosis tags
+        let events = history.events.into_iter().map(|e| {
+            let (activity_name, error_message, at_max_retries) =
+                if let Some(Attributes::ActivityTaskFailedEventAttributes(failed)) = &e.attributes {
+                    let name = activity_by_event_id.get(&failed.scheduled_event_id).cloned();
+                    let err = failed.failure.as_ref()
+                        .map(|f| f.message.clone())
+                        .filter(|s| !s.is_empty());
+                    let at_max = RetryState::try_from(failed.retry_state)
+                        .ok()
+                        .map(|s| s == RetryState::MaximumAttemptsReached)
+                        .unwrap_or(false);
+                    (name, err, at_max)
+                } else {
+                    (None, None, false)
+                };
+
+            let ts = e.event_time.map(proto_ts_to_chrono).unwrap_or_else(Utc::now);
+            let event_type = EventType::try_from(e.event_type)
+                .map(|et| et.as_str_name().to_string())
+                .unwrap_or_else(|_| format!("UnknownEventType({})", e.event_type));
+            RawTemporalEvent { event_type, ts, activity_name, error_message, at_max_retries }
+        }).collect();
 
         Ok(events)
     }

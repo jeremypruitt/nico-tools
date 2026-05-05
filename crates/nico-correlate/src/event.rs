@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Severity {
@@ -14,4 +15,5 @@ pub struct Event {
     pub kind: String,
     pub message: String,
     pub severity: Severity,
+    pub tags: HashMap<String, String>,
 }

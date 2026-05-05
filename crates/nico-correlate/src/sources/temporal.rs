@@ -1,13 +1,18 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use crate::event::{Event, Severity};
 use crate::id::IdType;
 use crate::source::{Source, SourceResult, SourceOutput, SourceUnavailable};
 
+#[derive(Clone, Default)]
 pub struct RawTemporalEvent {
     pub event_type: String,
     pub ts: DateTime<Utc>,
+    pub activity_name: Option<String>,
+    pub error_message: Option<String>,
+    pub at_max_retries: bool,
 }
 
 #[async_trait]
@@ -31,12 +36,23 @@ fn map_event(raw: RawTemporalEvent) -> Event {
     } else {
         Severity::Info
     };
+    let mut tags = HashMap::new();
+    if let Some(name) = raw.activity_name {
+        tags.insert("activity_name".into(), name);
+    }
+    if let Some(err) = raw.error_message {
+        tags.insert("error_signature".into(), err);
+    }
+    if raw.at_max_retries {
+        tags.insert("at_max_retries".into(), "true".into());
+    }
     Event {
         ts: raw.ts,
         source: "temporal".into(),
         kind: raw.event_type.clone(),
         message: raw.event_type,
         severity,
+        tags,
     }
 }
 
@@ -82,10 +98,7 @@ mod tests {
     impl TemporalClient for FakeTemporalClient {
         async fn get_history(&self, _workflow_id: &str) -> Result<Vec<RawTemporalEvent>> {
             match &self.result {
-                Ok(v) => Ok(v.iter().map(|e| RawTemporalEvent {
-                    event_type: e.event_type.clone(),
-                    ts: e.ts,
-                }).collect()),
+                Ok(v) => Ok(v.clone()),
                 Err(e) => Err(anyhow::anyhow!(e.to_string())),
             }
         }
@@ -98,7 +111,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_started_maps_to_info_event() {
         let client = FakeTemporalClient::ok(vec![
-            RawTemporalEvent { event_type: "WorkflowExecutionStarted".into(), ts: ts(1000) },
+            RawTemporalEvent { event_type: "WorkflowExecutionStarted".into(), ts: ts(1000), ..Default::default() },
         ]);
         let source = TemporalSource::new(Box::new(client));
         let result = source.collect("hp-abc", &IdType::Workflow).await;
@@ -116,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_failed_maps_to_error_event() {
         let client = FakeTemporalClient::ok(vec![
-            RawTemporalEvent { event_type: "WorkflowExecutionFailed".into(), ts: ts(2000) },
+            RawTemporalEvent { event_type: "WorkflowExecutionFailed".into(), ts: ts(2000), ..Default::default() },
         ]);
         let source = TemporalSource::new(Box::new(client));
         let result = source.collect("hp-abc", &IdType::Workflow).await;
