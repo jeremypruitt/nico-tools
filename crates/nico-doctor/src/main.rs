@@ -55,9 +55,7 @@ struct Cli {
 }
 
 // --- Inactive client stubs ---
-// Each stub implements a client trait with an immediate Err so its layer shows
-// Unknown/degraded status when the backing service is absent. Swap for real
-// implementations in follow-on issues #25 (k8s), #26 (loki), #27 (temporal/grpc).
+// Used when the backing service is absent or unconfigured.
 
 struct InactiveK8sClient { reason: &'static str }
 
@@ -148,6 +146,19 @@ async fn main() {
 
     let opts = RunOpts { namespace: cli.namespace.clone(), since, timeout };
 
+    // Build k8s client once — uses explicit context or auto-detects kubeconfig/in-cluster.
+    let k8s_client: Option<Arc<dyn k8s::K8sClient>> =
+        match k8s::KubeRsK8sClient::try_new(cli.context.as_deref()).await {
+            Ok(c) => Some(Arc::new(c) as Arc<dyn k8s::K8sClient>),
+            Err(_) => None,
+        };
+
+    // Build loki client when LOKI_URL is configured.
+    let loki_client: Arc<dyn loki::LokiClient> = match std::env::var("LOKI_URL") {
+        Ok(url) => Arc::new(loki::RealLokiClient::new(url)) as Arc<dyn loki::LokiClient>,
+        Err(_) => Arc::new(InactiveLokiClient { reason: "LOKI_URL not set" }),
+    };
+
     let mut layers: Vec<Box<dyn layer::Layer>> = vec![];
 
     for &name in LAYER_ORDER {
@@ -157,29 +168,33 @@ async fn main() {
         }
         match name {
             "cluster" => {
-                match cli.context.as_deref() {
-                    Some(_) => layers.push(Box::new(layers::cluster::ClusterLayer::new(
-                        // TODO #25: replace with real kube-rs client
-                        Arc::new(InactiveK8sClient { reason: "k8s client not yet wired (see #25)" }),
-                    ))),
+                match k8s_client.as_ref() {
+                    Some(k8s) => layers.push(Box::new(layers::cluster::ClusterLayer::new(k8s.clone()))),
                     None => layers.push(layer::UnconfiguredLayer::new(
-                        "cluster", "set --context or NICO_CONTEXT to enable",
+                        "cluster", "kubeconfig not found; set --context or NICO_CONTEXT",
                     )),
                 }
             }
             "logs" => {
                 let has_loki = std::env::var("LOKI_URL").is_ok();
-                if has_loki || cli.context.is_some() {
-                    layers.push(Box::new(layers::logs::LogsLayer::new(
-                        // TODO #26: replace with real LokiClient
-                        Arc::new(InactiveLokiClient { reason: "loki client not yet wired (see #26)" }),
-                        // TODO #25: replace with real K8sClient
-                        Arc::new(InactiveK8sClient { reason: "k8s client not yet wired (see #25)" }),
-                    )));
-                } else {
-                    layers.push(layer::UnconfiguredLayer::new(
-                        "logs", "set LOKI_URL or NICO_CONTEXT to enable",
-                    ));
+                match (k8s_client.as_ref(), has_loki) {
+                    (Some(k8s), _) => {
+                        layers.push(Box::new(layers::logs::LogsLayer::new(
+                            loki_client.clone(),
+                            k8s.clone(),
+                        )));
+                    }
+                    (None, true) => {
+                        layers.push(Box::new(layers::logs::LogsLayer::new(
+                            loki_client.clone(),
+                            Arc::new(InactiveK8sClient { reason: "kubeconfig not found" }),
+                        )));
+                    }
+                    (None, false) => {
+                        layers.push(layer::UnconfiguredLayer::new(
+                            "logs", "set LOKI_URL or ensure kubeconfig is accessible",
+                        ));
+                    }
                 }
             }
             "workflows" => {
