@@ -5,6 +5,7 @@ mod id;
 mod source;
 mod sources;
 mod timeline;
+mod tui;
 
 use clap::Parser;
 use chrono::Duration;
@@ -48,6 +49,10 @@ struct Cli {
     /// Look-back window for log sources (e.g. 1h, 30m, 2h30m; default: 1h)
     #[arg(long, default_value = "1h")]
     since: String,
+
+    /// Launch interactive TUI (requires a TTY; mutually exclusive with --json)
+    #[arg(long)]
+    tui: bool,
 
     /// Output JSON
     #[arg(short = 'j', long)]
@@ -232,6 +237,22 @@ fn severity_to_status(s: &crate::event::Severity) -> Status {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // Guard: --tui and --json are mutually exclusive.
+    if cli.tui && cli.json {
+        eprintln!("error: --tui and --json are mutually exclusive");
+        std::process::exit(3);
+    }
+
+    // Guard: --tui requires an interactive terminal.
+    if cli.tui {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            eprintln!("`--tui` requires an interactive terminal (stdout is not a TTY)");
+            std::process::exit(3);
+        }
+        tui::install_panic_hook();
+    }
 
     // Load config file from --config or the default path.
     let config_path = cli.config.as_deref()
@@ -493,6 +514,22 @@ async fn main() {
         },
         ascii: cli.ascii,
     };
+
+    if cli.tui {
+        let output = tui::CorrelateOutput {
+            id: cli.id.clone(),
+            id_type: id_type_str(&id_type).to_string(),
+            events: filtered,
+            state,
+            diagnosis: diag,
+            restricted: restricted_names.iter().map(|s| s.to_string()).collect(),
+            unavailable: unavailable.iter().map(|s| s.to_string()).collect(),
+            exit_code: code,
+        };
+        let ctx = tui::TuiContext { mode };
+        let exit = tui::run_tui(output, ctx);
+        std::process::exit(exit);
+    }
 
     if matches!(config.output.format, OutputFormat::Json) {
         let out = JsonOutput {
