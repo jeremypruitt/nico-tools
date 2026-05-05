@@ -523,8 +523,8 @@ mod tests {
             name: "temporal".into(),
             result: SourceResult::Output(SourceOutput {
                 events: vec![
-                    make_event(1_746_450_063, "temporal", "started", Severity::Info, "workflow started"),
-                    make_event(1_746_450_069, "temporal", "activity_failed", Severity::Error, "attempt 3/3"),
+                    make_event(1_746_450_063, "temporal", "WorkflowExecutionStarted", Severity::Info, "workflow started"),
+                    make_event(1_746_450_069, "temporal", "ActivityTaskScheduled", Severity::Info, "attempt 1/3"),
                 ],
                 state: vec![],
             }),

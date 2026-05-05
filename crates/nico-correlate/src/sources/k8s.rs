@@ -136,7 +136,7 @@ fn warning_event_to_event(e: K8sWarningEvent) -> Event {
         source: "k8s".into(),
         kind: e.reason.clone(),
         message: format!("{}: {}", e.pod_name, e.message),
-        severity: Severity::Warning,
+        severity: Severity::classify("k8s", &e.reason, &e.message),
         tags: Default::default(),
     }
 }

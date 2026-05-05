@@ -40,11 +40,7 @@ impl PostgresSource {
 }
 
 fn audit_event_to_event(e: PgAuditEvent) -> Event {
-    let severity = if e.action.contains("fail") || e.action.contains("error") || e.action.contains("delete") {
-        Severity::Warning
-    } else {
-        Severity::Info
-    };
+    let severity = Severity::classify("postgres", &e.action, &e.detail);
     let message = if e.detail.is_empty() { e.action.clone() } else { e.detail };
     Event {
         ts: e.ts,
