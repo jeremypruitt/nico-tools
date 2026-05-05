@@ -2,6 +2,28 @@
 
 Diagnostic CLI tooling for NICO/carbide/NCX installations. Read-only — never modifies cluster state.
 
+## Install
+
+```bash
+# macOS / Linux one-liner (installs to /usr/local/bin):
+curl -fsSL https://raw.githubusercontent.com/jeremypruitt/nico-tools/main/scripts/install.sh | bash
+
+# Custom install directory:
+INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/jeremypruitt/nico-tools/main/scripts/install.sh | bash
+```
+
+Or download a tarball directly from [GitHub Releases](https://github.com/jeremypruitt/nico-tools/releases/latest) and extract manually:
+
+```bash
+# Example: Linux x86_64
+tar -xzf nico-tools-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+sudo mv nico-doctor nico-correlate /usr/local/bin/
+```
+
+Supported platforms: macOS arm64, macOS x86_64, Linux x86_64, Linux arm64.
+
+---
+
 ## Testing against a live cluster
 
 ### Prerequisites
