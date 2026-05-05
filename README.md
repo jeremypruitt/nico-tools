@@ -2,6 +2,63 @@
 
 Diagnostic CLI tooling for NICO/carbide/NCX installations. Read-only — never modifies cluster state.
 
+## Testing against a live cluster
+
+### Prerequisites
+
+- A running NICO/carbide cluster accessible via kubeconfig.
+- `jq` installed (for the JSON parse check; optional but recommended).
+- `cargo` installed (or set `NICO_BIN_DIR` to point at pre-built binaries).
+
+### Setup
+
+```bash
+cp .env.example .env.local
+# Edit .env.local with your cluster values.
+# At minimum, set KUBECONFIG and SMOKE_WORKFLOW_ID (a known recent workflow UUID or hp-* ID).
+# If port-forward auto-detect works (requires kubeconfig), you can leave the URL vars unset.
+```
+
+### Run the smoke test
+
+```bash
+make smoke
+# or directly:
+./scripts/smoke.sh
+# or with a custom env file:
+./scripts/smoke.sh --env /path/to/other.env
+```
+
+The script:
+1. Sources your env file.
+2. Builds `nico-doctor` and `nico-correlate` (or uses `NICO_BIN_DIR` pre-built binaries).
+3. Runs `nico-doctor` — asserts exit code is 0 (ok), 1 (warn), or 2 (fail), **not** 3 (internal error).
+4. Runs `nico-correlate $SMOKE_WORKFLOW_ID` — asserts exit code is 0 (found) or 2 (no data), **not** 1 (ID not found).
+5. Runs `nico-doctor --json | jq .` — asserts the JSON output parses cleanly.
+6. Prints a pass/fail summary with timing.
+
+### Quick dev runs
+
+```bash
+# Run nico-doctor with any extra flags via ARGS=
+make run-doctor
+make run-doctor ARGS="--skip postgres,loki"
+make run-doctor ARGS="--json"
+
+# Run nico-correlate against a specific entity
+make run-correlate ARGS="host-r12u5"
+make run-correlate ARGS="--json some-workflow-id"
+```
+
+### Reach mode and env vars
+
+After #31 lands (auto-detect reach mode), the script relies on port-forward auto-detect when
+`NICO_REACH_MODE` is unset and `KUBERNETES_SERVICE_HOST` is absent. Explicit URL env vars
+(`NICO_TEMPORAL_ADDRESS`, `NICO_POSTGRES_URL`, `LOKI_URL`) still override auto-detect, so you
+can point the tools at already-forwarded ports without any Kubernetes access.
+
+---
+
 ## Configuration file
 
 Both `nico-doctor` and `nico-correlate` load `~/.config/nico-tools/config.toml` automatically if it exists. Write it once and stop juggling environment variables every session.
