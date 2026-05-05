@@ -14,7 +14,7 @@ use crate::sources::temporal::{TemporalSource, TemporalClient, RawTemporalEvent}
 use crate::sources::temporal_grpc::GrpcTemporalClient;
 use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData, SqlxPostgresClient};
 use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData, KubeRsK8sClient};
-use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClient, K8sLogLine};
+use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClient, K8sLogLine, RealLokiClient, RealK8sLogStreamClient};
 use crate::sources::redfish::{RedfishSource, RedfishClient, RedfishData};
 use crate::timeline::filter_timeline;
 use crate::correlate::exit_code;
@@ -109,11 +109,12 @@ impl K8sClient for InactiveK8sClient {
     }
 }
 
-// Real Loki HTTP client is wired when reqwest is added.
-struct TodoLokiClient;
+struct InactiveLokiClient {
+    reason: String,
+}
 
 #[async_trait]
-impl LokiClient for TodoLokiClient {
+impl LokiClient for InactiveLokiClient {
     async fn query_range(
         &self,
         _id: &str,
@@ -121,15 +122,16 @@ impl LokiClient for TodoLokiClient {
         _since: Duration,
         _pod_pattern: Option<&str>,
     ) -> Result<Vec<LokiLogLine>> {
-        Err(anyhow::anyhow!("not implemented: real Loki HTTP client — query LOKI_URL with label selectors derived from entity ID"))
+        Err(anyhow::anyhow!("{}", self.reason))
     }
 }
 
-// Real k8s log streaming client is wired when kube-rs is added.
-struct TodoK8sLogStreamClient;
+struct InactiveK8sLogStreamClient {
+    reason: String,
+}
 
 #[async_trait]
-impl K8sLogStreamClient for TodoK8sLogStreamClient {
+impl K8sLogStreamClient for InactiveK8sLogStreamClient {
     async fn stream_logs(
         &self,
         _id: &str,
@@ -137,7 +139,7 @@ impl K8sLogStreamClient for TodoK8sLogStreamClient {
         _since: Duration,
         _pod_pattern: Option<&str>,
     ) -> Result<Vec<K8sLogLine>> {
-        Err(anyhow::anyhow!("not implemented: real k8s log streaming client — kubectl logs equivalent"))
+        Err(anyhow::anyhow!("{}", self.reason))
     }
 }
 
@@ -252,13 +254,23 @@ async fn main() {
         Err(_) => Box::new(InactiveTemporalClient { reason: "NICO_TEMPORAL_ADDRESS not set".into() }),
     };
 
+    let loki_client: Box<dyn LokiClient> = match std::env::var("LOKI_URL") {
+        Ok(url) => Box::new(RealLokiClient::new(url)),
+        Err(_) => Box::new(InactiveLokiClient { reason: "LOKI_URL not set".into() }),
+    };
+
+    let k8s_log_client: Box<dyn K8sLogStreamClient> = match kube::Client::try_default().await {
+        Ok(c) => Box::new(RealK8sLogStreamClient::new(c)),
+        Err(e) => Box::new(InactiveK8sLogStreamClient { reason: format!("kubeconfig unavailable: {e}") }),
+    };
+
     let all_sources: Vec<(&str, Box<dyn Source>)> = vec![
         ("temporal", Box::new(TemporalSource::new(temporal_client))),
         ("postgres", Box::new(PostgresSource::new(pg_client))),
         ("k8s", Box::new(K8sSource::new(k8s_client))),
         ("loki", Box::new(LokiSource::new(
-            Box::new(TodoLokiClient),
-            Box::new(TodoK8sLogStreamClient),
+            loki_client,
+            k8s_log_client,
             cli.pod.clone(),
             since,
         ))),

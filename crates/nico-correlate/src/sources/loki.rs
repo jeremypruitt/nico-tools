@@ -1,6 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use reqwest::Client as HttpClient;
+use serde::Deserialize;
+use std::collections::HashMap;
+use kube::{Client as KubeClient, Api};
+use kube::api::{ListParams, LogParams};
+use k8s_openapi::api::core::v1::Pod;
 use crate::event::{Event, Severity};
 use crate::id::IdType;
 use crate::source::{Source, SourceResult, SourceOutput, SourceUnavailable, StateEntry};
@@ -110,6 +116,179 @@ impl Source for LokiSource {
                 }
             }
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct LokiResponse {
+    data: LokiData,
+}
+
+#[derive(Deserialize)]
+struct LokiData {
+    result: Vec<LokiStream>,
+}
+
+#[derive(Deserialize)]
+struct LokiStream {
+    stream: HashMap<String, String>,
+    values: Vec<(String, String)>,
+}
+
+fn loki_label_query(id: &str, id_type: &IdType, pod_pattern: Option<&str>) -> String {
+    let label_key = match id_type {
+        IdType::Workflow => "workflow_id",
+        IdType::Host => "host_id",
+        IdType::Dpu => "dpu_id",
+        IdType::Request => "request_id",
+    };
+    let mut q = format!("{{{label_key}=\"{id}\"");
+    if let Some(pattern) = pod_pattern {
+        let rx = pattern.replace('*', ".*");
+        q.push_str(&format!(", pod=~\"{rx}\""));
+    }
+    q.push('}');
+    q
+}
+
+fn parse_k8s_timestamp_log(line: &str) -> (DateTime<Utc>, &str) {
+    if let Some((ts_part, rest)) = line.split_once(' ') {
+        if let Ok(ts) = ts_part.parse::<DateTime<Utc>>() {
+            return (ts, rest);
+        }
+    }
+    (Utc::now(), line)
+}
+
+pub struct RealLokiClient {
+    loki_url: String,
+    client: HttpClient,
+}
+
+impl RealLokiClient {
+    pub fn new(loki_url: String) -> Self {
+        let client = HttpClient::builder()
+            .build()
+            .expect("failed to build reqwest client");
+        Self { loki_url: loki_url.trim_end_matches('/').to_string(), client }
+    }
+}
+
+#[async_trait]
+impl LokiClient for RealLokiClient {
+    async fn query_range(
+        &self,
+        id: &str,
+        id_type: &IdType,
+        since: Duration,
+        pod_pattern: Option<&str>,
+    ) -> Result<Vec<LokiLogLine>> {
+        let query = loki_label_query(id, id_type, pod_pattern);
+        let now = Utc::now();
+        let start_ns = (now - since)
+            .timestamp_nanos_opt()
+            .ok_or_else(|| anyhow::anyhow!("start timestamp out of i64 nanosecond range"))?;
+        let end_ns = now
+            .timestamp_nanos_opt()
+            .ok_or_else(|| anyhow::anyhow!("end timestamp out of i64 nanosecond range"))?;
+
+        let resp = self.client
+            .get(format!("{}/loki/api/v1/query_range", self.loki_url))
+            .query(&[
+                ("query", query.as_str()),
+                ("start", &start_ns.to_string()),
+                ("end", &end_ns.to_string()),
+                ("limit", "5000"),
+            ])
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("loki request failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("loki HTTP error: {e}"))?
+            .json::<LokiResponse>()
+            .await
+            .map_err(|e| anyhow::anyhow!("loki response parse error: {e}"))?;
+
+        let mut lines = Vec::new();
+        for stream in resp.data.result {
+            let pod = stream.stream.get("pod").cloned();
+            let is_serial_console = pod.as_deref().map(|p| p.contains("serial")).unwrap_or(false);
+            for (ts_str, message) in stream.values {
+                let ts_ns: i64 = ts_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid loki timestamp: {ts_str}"))?;
+                let secs = ts_ns / 1_000_000_000;
+                let nanos = (ts_ns % 1_000_000_000).unsigned_abs() as u32;
+                let ts = Utc
+                    .timestamp_opt(secs, nanos)
+                    .single()
+                    .ok_or_else(|| anyhow::anyhow!("loki timestamp out of range: {ts_ns}"))?;
+                lines.push(LokiLogLine { ts, message, pod: pod.clone(), is_serial_console });
+            }
+        }
+        Ok(lines)
+    }
+}
+
+pub struct RealK8sLogStreamClient {
+    client: KubeClient,
+}
+
+impl RealK8sLogStreamClient {
+    pub fn new(client: KubeClient) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl K8sLogStreamClient for RealK8sLogStreamClient {
+    async fn stream_logs(
+        &self,
+        id: &str,
+        id_type: &IdType,
+        since: Duration,
+        pod_pattern: Option<&str>,
+    ) -> Result<Vec<K8sLogLine>> {
+        let label_key = match id_type {
+            IdType::Workflow => "workflow_id",
+            IdType::Host => "host_id",
+            IdType::Dpu => "dpu_id",
+            IdType::Request => "request_id",
+        };
+        let label_selector = format!("{label_key}={id}");
+
+        let pods: Api<Pod> = Api::all(self.client.clone());
+        let pod_list = pods
+            .list(&ListParams::default().labels(&label_selector))
+            .await
+            .map_err(|e| anyhow::anyhow!("k8s pod list failed: {e}"))?;
+
+        let mut lines = Vec::new();
+        for pod in pod_list.items {
+            let pod_name = pod.metadata.name.unwrap_or_default();
+            let namespace = pod.metadata.namespace.unwrap_or_else(|| "default".into());
+
+            if let Some(pattern) = pod_pattern {
+                let clean = pattern.trim_matches('*');
+                if !pod_name.contains(clean) {
+                    continue;
+                }
+            }
+
+            let pods_ns: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
+            let lp = LogParams {
+                since_seconds: Some(since.num_seconds()),
+                timestamps: true,
+                ..Default::default()
+            };
+            let log_data = pods_ns.logs(&pod_name, &lp).await.unwrap_or_default();
+
+            for line in log_data.lines() {
+                let (ts, message) = parse_k8s_timestamp_log(line);
+                lines.push(K8sLogLine { ts, message: message.to_string(), pod: pod_name.clone() });
+            }
+        }
+        Ok(lines)
     }
 }
 
