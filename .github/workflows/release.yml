@@ -38,6 +38,10 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -yq protobuf-compiler
+
       - name: Install cross
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -58,6 +62,9 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
+        env:
+          PROTOC: /usr/bin/protoc
+          CROSS_CONTAINER_OPTS: "--volume /usr/bin/protoc:/usr/bin/protoc"
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Package
