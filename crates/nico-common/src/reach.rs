@@ -206,8 +206,6 @@ impl ReachManager {
     /// List services that look like HTTP application services (excluding
     /// well-known non-HTTP ports like Temporal gRPC, Postgres, and Loki).
     async fn discover_http_services(&self) -> Result<Vec<(String, u16)>> {
-        const SKIP_PORTS: &[i32] = &[5432, 7233, 3100];
-
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
         let svc_list = services
             .list(&ListParams::default())
@@ -226,23 +224,9 @@ impl ReachManager {
 
             let Some(ports) = spec.ports.as_ref() else { continue };
 
-            let http_port = ports.iter().find_map(|p| {
-                if SKIP_PORTS.contains(&p.port) {
-                    return None;
-                }
-                let port = p.port as u16;
-                if matches!(port, 80 | 8080 | 8443 | 443) {
-                    return Some(port);
-                }
-                if p.name
-                    .as_deref()
-                    .map(|n| n.contains("http") || n.contains("web"))
-                    .unwrap_or(false)
-                {
-                    return Some(port);
-                }
-                None
-            });
+            let http_port = ports
+                .iter()
+                .find_map(|p| http_port_from(p.port, p.name.as_deref()));
 
             if let Some(port) = http_port {
                 result.push((name, port));
@@ -251,6 +235,34 @@ impl ReachManager {
 
         Ok(result)
     }
+}
+
+/// Returns the port number if the given service port looks like an HTTP application
+/// port, or `None` if it should be skipped.
+///
+/// Excluded: well-known non-HTTP ports (Postgres, Temporal, Loki) and sidecar ports
+/// (metrics on 1080, profiler on 1081). Also excluded: ports named `grpc` or `proxy`.
+fn http_port_from(port: i32, name: Option<&str>) -> Option<u16> {
+    const SKIP_PORTS: &[i32] = &[5432, 7233, 3100, 1080, 1081];
+    const SKIP_NAMES: &[&str] = &["grpc", "proxy"];
+
+    if SKIP_PORTS.contains(&port) {
+        return None;
+    }
+    if name.map(|n| SKIP_NAMES.contains(&n)).unwrap_or(false) {
+        return None;
+    }
+    let u = port as u16;
+    if matches!(u, 80 | 8080 | 8443 | 443) {
+        return Some(u);
+    }
+    if name
+        .map(|n| n.contains("http") || n.contains("web"))
+        .unwrap_or(false)
+    {
+        return Some(u);
+    }
+    None
 }
 
 /// Spawn a local TCP listener that tunnels each accepted connection through a
@@ -304,6 +316,42 @@ pub fn replace_pg_host(base_url: &str, new_host: &str, new_port: u16) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidecar_port_1080_is_excluded() {
+        assert_eq!(http_port_from(1080, Some("http")), None);
+    }
+
+    #[test]
+    fn sidecar_port_1081_is_excluded() {
+        assert_eq!(http_port_from(1081, Some("http")), None);
+    }
+
+    #[test]
+    fn grpc_named_port_is_excluded() {
+        assert_eq!(http_port_from(8080, Some("grpc")), None);
+    }
+
+    #[test]
+    fn proxy_named_port_is_excluded() {
+        assert_eq!(http_port_from(8080, Some("proxy")), None);
+    }
+
+    #[test]
+    fn standard_http_port_by_number_is_discovered() {
+        assert_eq!(http_port_from(8080, Some("http")), Some(8080));
+    }
+
+    #[test]
+    fn nonstandard_port_with_http_name_is_discovered() {
+        // e.g. carbide-api on port 1079 named "http"
+        assert_eq!(http_port_from(1079, Some("http")), Some(1079));
+    }
+
+    #[test]
+    fn port_with_web_name_is_discovered() {
+        assert_eq!(http_port_from(9090, Some("web")), Some(9090));
+    }
 
     #[test]
     fn replace_pg_host_basic() {
