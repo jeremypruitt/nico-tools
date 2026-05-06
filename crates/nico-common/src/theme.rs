@@ -80,6 +80,105 @@ pub fn resolve_theme(flag: Option<&str>) -> Result<Theme, String> {
 mod tests {
     use super::*;
 
+    // --- color-science helpers (used by visual-QA tests) ---
+
+    fn rgb_vals(c: Color) -> (u8, u8, u8) {
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => panic!("expected Color::Rgb, got {c:?}"),
+        }
+    }
+
+    fn rgb_distance(a: Color, b: Color) -> f64 {
+        let (r1, g1, b1) = rgb_vals(a);
+        let (r2, g2, b2) = rgb_vals(b);
+        let (dr, dg, db) = (r1 as f64 - r2 as f64, g1 as f64 - g2 as f64, b1 as f64 - b2 as f64);
+        (dr*dr + dg*dg + db*db).sqrt()
+    }
+
+    fn linearize(c: u8) -> f64 {
+        let v = c as f64 / 255.0;
+        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    }
+
+    fn relative_luminance(r: u8, g: u8, b: u8) -> f64 {
+        0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b)
+    }
+
+    fn contrast_ratio(fg: Color, bg: Color) -> f64 {
+        let (r1, g1, b1) = rgb_vals(fg);
+        let (r2, g2, b2) = rgb_vals(bg);
+        let l1 = relative_luminance(r1, g1, b1);
+        let l2 = relative_luminance(r2, g2, b2);
+        let (lighter, darker) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    // --- visual QA tests (acceptance criteria for issue #99) ---
+
+    // AC: status indicators (ok, warn, error, muted) are visually distinct
+    #[test]
+    fn default_status_indicators_are_pairwise_distinct() {
+        let indicators = [
+            ("ok",    DEFAULT.ok),
+            ("warn",  DEFAULT.warn),
+            ("error", DEFAULT.error),
+            ("muted", DEFAULT.muted),
+        ];
+        let min_dist = 80.0_f64;
+        for i in 0..indicators.len() {
+            for j in (i+1)..indicators.len() {
+                let (na, ca) = indicators[i];
+                let (nb, cb) = indicators[j];
+                let d = rgb_distance(ca, cb);
+                assert!(
+                    d >= min_dist,
+                    "default: {na} vs {nb} distance={d:.1} < {min_dist}; colors too similar to distinguish"
+                );
+            }
+        }
+    }
+
+    // AC: overlay background/foreground are legible (WCAG AA >= 4.5)
+    #[test]
+    fn all_themes_overlay_fg_contrast_meets_wcag_aa() {
+        let min = 4.5_f64;
+        for (name, theme) in [("default", DEFAULT), ("dracula", DRACULA), ("nord", NORD), ("gruvbox", GRUVBOX)] {
+            let ratio = contrast_ratio(theme.overlay_fg, theme.overlay_bg);
+            assert!(
+                ratio >= min,
+                "theme={name}: overlay_fg/overlay_bg contrast {ratio:.2} < {min} (WCAG AA)"
+            );
+        }
+    }
+
+    // AC: overlay key color is legible over the overlay background
+    #[test]
+    fn all_themes_overlay_key_contrast_meets_wcag_aa() {
+        let min = 4.5_f64;
+        for (name, theme) in [("default", DEFAULT), ("dracula", DRACULA), ("nord", NORD), ("gruvbox", GRUVBOX)] {
+            let ratio = contrast_ratio(theme.overlay_key, theme.overlay_bg);
+            assert!(
+                ratio >= min,
+                "theme={name}: overlay_key/overlay_bg contrast {ratio:.2} < {min} (WCAG AA)"
+            );
+        }
+    }
+
+    // AC: grey/white palette is replaced — ok/warn/error must be chromatic (channel spread >= 50)
+    #[test]
+    fn default_ok_warn_error_are_chromatic_not_grey() {
+        let min_spread = 50u8;
+        for (name, color) in [("ok", DEFAULT.ok), ("warn", DEFAULT.warn), ("error", DEFAULT.error)] {
+            let (r, g, b) = rgb_vals(color);
+            let spread = r.max(g).max(b) - r.min(g).min(b);
+            assert!(
+                spread >= min_spread,
+                "default: {name} ({r},{g},{b}) channel spread={spread} < {min_spread}; looks grey/white"
+            );
+        }
+    }
+
     #[test]
     fn default_theme_has_correct_ok_color() {
         assert_eq!(DEFAULT.ok, Color::Rgb(97, 175, 74));

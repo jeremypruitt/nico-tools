@@ -1389,7 +1389,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first();
 
@@ -1715,7 +1715,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first();
 
