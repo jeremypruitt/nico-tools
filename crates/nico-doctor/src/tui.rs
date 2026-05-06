@@ -182,42 +182,38 @@ fn event_loop<B: ratatui::backend::Backend>(
             trigger_refresh();
         }
 
-        if event::poll(Duration::from_millis(100)).expect("poll") {
-            if let Ok(CrosstermEvent::Key(key)) = event::read() {
-                if state.detail_open {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => state.detail_open = false,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                        _ => {}
+        if event::poll(Duration::from_millis(100)).expect("poll")
+            && let Ok(CrosstermEvent::Key(key)) = event::read()
+        {
+            if state.detail_open {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => state.detail_open = false,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    _ => {}
+                }
+            } else if state.help_open {
+                match key.code {
+                    KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                        state.help_open = false;
                     }
-                } else if state.help_open {
-                    match key.code {
-                        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
-                            state.help_open = false;
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                        _ => {}
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('?') => state.help_open = true,
+                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Down => state.select_next(),
+                    KeyCode::Enter if state.list_state.selected().is_some() => {
+                        state.detail_open = true;
                     }
-                } else {
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                        KeyCode::Char('?') => state.help_open = true,
-                        KeyCode::Up => state.select_prev(),
-                        KeyCode::Down => state.select_next(),
-                        KeyCode::Enter => {
-                            if state.list_state.selected().is_some() {
-                                state.detail_open = true;
-                            }
-                        }
-                        KeyCode::Char('r') => {
-                            if !state.running {
-                                state.start_new_run();
-                                trigger_refresh();
-                            }
-                        }
-                        _ => {}
+                    KeyCode::Char('r') if !state.running => {
+                        state.start_new_run();
+                        trigger_refresh();
                     }
+                    _ => {}
                 }
             }
         }

@@ -259,11 +259,11 @@ impl IncrementalState {
     /// Select the event at `vis_idx` in the current filtered list.
     fn select_at(&mut self, vis_idx: usize) {
         let indices = self.filtered_indices();
-        if let Some(&raw_idx) = indices.get(vis_idx) {
-            if let Some(e) = self.events.get(raw_idx) {
-                self.selected_key = Some(event_key(e));
-                self.list_state.select(Some(vis_idx));
-            }
+        if let Some(&raw_idx) = indices.get(vis_idx)
+            && let Some(e) = self.events.get(raw_idx)
+        {
+            self.selected_key = Some(event_key(e));
+            self.list_state.select(Some(vis_idx));
         }
     }
 
@@ -430,10 +430,8 @@ fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('?') => state.help_open = true,
                     KeyCode::Char('/') => state.open_filter(),
-                    KeyCode::Esc => {
-                        if !state.filter_query.is_empty() {
-                            state.close_filter();
-                        }
+                    KeyCode::Esc if !state.filter_query.is_empty() => {
+                        state.close_filter();
                     }
                     KeyCode::Up => {
                         state.select_prev();
@@ -450,9 +448,7 @@ fn event_loop<B: ratatui::backend::Backend>(
                         state.select_last();
                         if state.tail_mode { state.follow = true; }
                     }
-                    KeyCode::Char('f') => {
-                        if state.tail_mode { state.toggle_follow(); }
-                    }
+                    KeyCode::Char('f') if state.tail_mode => { state.toggle_follow(); }
                     KeyCode::Enter => state.detail_open = true,
                     _ => {}
                 }
@@ -672,7 +668,8 @@ fn render_detail_overlay(
     area: Rect,
 ) {
     let ascii = ctx.mode.ascii;
-    let close_hint = if ascii { "q / Esc to close" } else { "q / Esc to close" };
+    let close_hint = "q / Esc to close";
+    let _ = ascii;
     let title = format!(" Event detail  \u{2014}  {} ", close_hint);
 
     frame.render_widget(Clear, area);

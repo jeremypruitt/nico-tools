@@ -1,6 +1,5 @@
 ---
 source: crates/nico-doctor/tests/json_snapshot.rs
-assertion_line: 61
 expression: v
 ---
 {
@@ -63,6 +62,9 @@ expression: v
     }
   ],
   "namespace": "nico",
+  "preflight": {
+    "ok": true
+  },
   "summary": {
     "fail": 0,
     "ok": 3,

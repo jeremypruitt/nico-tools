@@ -57,7 +57,7 @@ fn all_ok_report() -> Report {
 #[test]
 fn all_ok() {
     let report = all_ok_report();
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
     insta::assert_json_snapshot!(v);
 }
 
@@ -75,7 +75,7 @@ fn warn_only() {
             ]),
         ],
     };
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "staging")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "staging", serde_json::json!({"ok": true}))).unwrap();
     insta::assert_json_snapshot!(v);
 }
 
@@ -92,7 +92,7 @@ fn fail_report() {
             ]),
         ],
     };
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "prod")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "prod", serde_json::json!({"ok": true}))).unwrap();
     insta::assert_json_snapshot!(v);
 }
 
@@ -106,7 +106,7 @@ fn skipped_layer() {
             layer_from_checks("postgres", vec![ok_check("pool", "pool 5/20 in-use")]),
         ],
     };
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
     insta::assert_json_snapshot!(v);
 }
 
@@ -119,6 +119,6 @@ fn unknown_timeout_layer() {
             unknown_timeout("grpc"),
         ],
     };
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
     insta::assert_json_snapshot!(v);
 }
