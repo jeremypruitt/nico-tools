@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
-use crate::postgres::PostgresClient;
+use crate::postgres::{LockWait, PoolStats, PostgresClient};
 use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
 
 const POOL_WARN_RATIO: f64 = 0.90;
@@ -16,6 +16,61 @@ impl PostgresLayer {
     pub fn new(client: Arc<dyn PostgresClient>) -> Self {
         Self { client }
     }
+}
+
+fn pool_check(stats: &PoolStats) -> Check {
+    let ratio = if stats.max_conn > 0 {
+        stats.active as f64 / stats.max_conn as f64
+    } else {
+        0.0
+    };
+    let status = if ratio >= POOL_WARN_RATIO { Status::Warn } else { Status::Ok };
+    Check {
+        name: "pool",
+        status: status.clone(),
+        value: format!("pool {}/{} in-use", stats.active, stats.max_conn),
+        next_command: if status == Status::Warn {
+            Some(
+                "SELECT * FROM pg_stat_activity WHERE state != 'idle' ORDER BY query_start".into(),
+            )
+        } else {
+            None
+        },
+    }
+}
+
+fn lock_checks(waits: &[LockWait]) -> Vec<Check> {
+    let long_waits: Vec<_> = waits.iter().filter(|w| w.wait_secs >= LOCK_WARN_SECS).collect();
+    let mut checks = vec![Check {
+        name: "locks",
+        status: if long_waits.is_empty() { Status::Ok } else { Status::Warn },
+        value: format!("{} lock waits", long_waits.len()),
+        next_command: None,
+    }];
+    for w in &long_waits {
+        let pids: Vec<String> = std::iter::once(w.waiting_pid)
+            .chain(w.blocking_pid)
+            .map(|p| p.to_string())
+            .collect();
+        checks.push(Check {
+            name: "lock_wait",
+            status: Status::Warn,
+            value: format!(
+                "pid {} waiting {:.0}s on {} (blocked by pid {})",
+                w.waiting_pid,
+                w.wait_secs,
+                w.relation.as_deref().unwrap_or("unknown"),
+                w.blocking_pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+            ),
+            next_command: Some(format!(
+                "SELECT * FROM pg_stat_activity WHERE pid IN ({})",
+                pids.join(", ")
+            )),
+        });
+    }
+    checks
 }
 
 #[async_trait]
@@ -42,60 +97,10 @@ impl Layer for PostgresLayer {
             }
         };
 
-        let ratio = if stats.max_conn > 0 {
-            stats.active as f64 / stats.max_conn as f64
-        } else {
-            0.0
-        };
-        let pool_status = if ratio >= POOL_WARN_RATIO { Status::Warn } else { Status::Ok };
-        let mut checks = vec![Check {
-            name: "pool",
-            status: pool_status.clone(),
-            value: format!("pool {}/{} in-use", stats.active, stats.max_conn),
-            next_command: if pool_status == Status::Warn {
-                Some(
-                    "SELECT * FROM pg_stat_activity WHERE state != 'idle' ORDER BY query_start"
-                        .into(),
-                )
-            } else {
-                None
-            },
-        }];
+        let mut checks = vec![pool_check(&stats)];
 
         match self.client.lock_waits().await {
-            Ok(waits) => {
-                let long_waits: Vec<_> =
-                    waits.iter().filter(|w| w.wait_secs >= LOCK_WARN_SECS).collect();
-                checks.push(Check {
-                    name: "locks",
-                    status: if long_waits.is_empty() { Status::Ok } else { Status::Warn },
-                    value: format!("{} lock waits", long_waits.len()),
-                    next_command: None,
-                });
-                for w in &long_waits {
-                    let pids: Vec<String> = std::iter::once(w.waiting_pid)
-                        .chain(w.blocking_pid)
-                        .map(|p| p.to_string())
-                        .collect();
-                    checks.push(Check {
-                        name: "lock_wait",
-                        status: Status::Warn,
-                        value: format!(
-                            "pid {} waiting {:.0}s on {} (blocked by pid {})",
-                            w.waiting_pid,
-                            w.wait_secs,
-                            w.relation.as_deref().unwrap_or("unknown"),
-                            w.blocking_pid
-                                .map(|p| p.to_string())
-                                .unwrap_or_else(|| "unknown".into()),
-                        ),
-                        next_command: Some(format!(
-                            "SELECT * FROM pg_stat_activity WHERE pid IN ({})",
-                            pids.join(", ")
-                        )),
-                    });
-                }
-            }
+            Ok(waits) => checks.extend(lock_checks(&waits)),
             Err(_) => {
                 checks.push(Check {
                     name: "locks",
@@ -123,6 +128,44 @@ mod tests {
     use std::time::Duration;
     use anyhow::Result;
     use crate::postgres::{LockWait, PoolStats};
+
+    // --- sync unit tests for pure functions ---
+
+    #[test]
+    fn pool_check_healthy_pool_is_ok() {
+        let check = pool_check(&PoolStats { active: 10, max_conn: 20 });
+        assert_eq!(check.status, Status::Ok);
+        assert!(check.next_command.is_none());
+    }
+
+    #[test]
+    fn pool_check_at_90_pct_is_warn_with_hint() {
+        let check = pool_check(&PoolStats { active: 18, max_conn: 20 });
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.next_command.as_deref().unwrap().contains("pg_stat_activity"));
+    }
+
+    #[test]
+    fn lock_checks_no_waits_is_ok() {
+        let checks = lock_checks(&[]);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "locks");
+        assert_eq!(checks[0].status, Status::Ok);
+    }
+
+    #[test]
+    fn lock_checks_long_wait_is_warn_with_lock_wait_entry() {
+        let waits = vec![LockWait {
+            waiting_pid: 100,
+            blocking_pid: Some(200),
+            relation: Some("orders".into()),
+            wait_secs: 10.0,
+        }];
+        let checks = lock_checks(&waits);
+        assert_eq!(checks[0].status, Status::Warn);
+        let lw = checks.iter().find(|c| c.name == "lock_wait").unwrap();
+        assert_eq!(lw.status, Status::Warn);
+    }
 
     struct MockPostgresClient {
         pool: std::result::Result<PoolStats, String>,
