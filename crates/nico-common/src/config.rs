@@ -13,6 +13,7 @@ pub struct Config {
 pub struct ClusterConfig {
     pub context: Option<String>,
     pub namespace: String,
+    pub postgres_namespace: String,
     pub reach_mode: ReachMode,
     pub grpc_address: Option<String>,
 }
@@ -95,6 +96,7 @@ struct FileConfig {
 struct FileClusterConfig {
     context: Option<String>,
     namespace: Option<String>,
+    postgres_namespace: Option<String>,
     reach_mode: Option<String>,
     grpc_address: Option<String>,
 }
@@ -139,6 +141,9 @@ impl Config {
         let namespace = env.get("NICO_NAMESPACE").cloned()
             .or(cluster.namespace)
             .unwrap_or_else(|| "nico".into());
+        let postgres_namespace = env.get("NICO_POSTGRES_NAMESPACE").cloned()
+            .or(cluster.postgres_namespace)
+            .unwrap_or_else(|| "postgres".into());
         let postgres_url = env.get("NICO_POSTGRES_URL").cloned()
             .or(postgres.url)
             .unwrap_or_else(|| "postgres://nico:nico@localhost:5432/nico".into());
@@ -201,7 +206,7 @@ impl Config {
         let tui_refresh = overrides.tui_refresh.unwrap_or(tui_refresh);
 
         Ok(Config {
-            cluster: ClusterConfig { context, namespace, reach_mode, grpc_address },
+            cluster: ClusterConfig { context, namespace, postgres_namespace, reach_mode, grpc_address },
             postgres: PostgresConfig { url: postgres_url },
             temporal: TemporalConfig {
                 address: temporal_address,
@@ -379,6 +384,36 @@ url = "postgres://prod:secret@db:5432/prod"
         env.insert("NICO_GRPC_ADDRESS".to_string(), "from-env:1079".to_string());
         let config = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
         assert_eq!(config.cluster.grpc_address.as_deref(), Some("from-env:1079"));
+    }
+
+    #[test]
+    fn postgres_namespace_defaults_to_postgres() {
+        let config = Config::load(None, &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.postgres_namespace, "postgres");
+    }
+
+    #[test]
+    fn postgres_namespace_from_env() {
+        let mut env = HashMap::new();
+        env.insert("NICO_POSTGRES_NAMESPACE".to_string(), "db-tier".to_string());
+        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.postgres_namespace, "db-tier");
+    }
+
+    #[test]
+    fn postgres_namespace_from_file() {
+        let toml = "[cluster]\npostgres_namespace = \"data\"";
+        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.postgres_namespace, "data");
+    }
+
+    #[test]
+    fn postgres_namespace_env_overrides_file() {
+        let toml = "[cluster]\npostgres_namespace = \"from-file\"";
+        let mut env = HashMap::new();
+        env.insert("NICO_POSTGRES_NAMESPACE".to_string(), "from-env".to_string());
+        let config = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.postgres_namespace, "from-env");
     }
 
     #[test]

@@ -26,11 +26,17 @@ pub struct ReachManager {
     pub mode: ReachMode,
     client: Client,
     namespace: String,
+    postgres_namespace: String,
 }
 
 impl ReachManager {
-    pub fn new(mode: ReachMode, client: Client, namespace: impl Into<String>) -> Self {
-        Self { mode, client, namespace: namespace.into() }
+    pub fn new(
+        mode: ReachMode,
+        client: Client,
+        namespace: impl Into<String>,
+        postgres_namespace: impl Into<String>,
+    ) -> Self {
+        Self { mode, client, namespace: namespace.into(), postgres_namespace: postgres_namespace.into() }
     }
 
     /// Resolve the Temporal gRPC address (`host:port`).
@@ -44,7 +50,7 @@ impl ReachManager {
                 Ok((addr, None))
             }
             ReachMode::PortForward => {
-                let ep = self.forward_by_port(7233)
+                let ep = self.forward_by_port(7233, &self.namespace.clone())
                     .await
                     .context("port-forward for Temporal gRPC (port 7233)")?;
                 Ok((format!("localhost:{}", ep.local_port), Some(ep)))
@@ -59,12 +65,12 @@ impl ReachManager {
     pub async fn postgres_url(&self, base_url: &str) -> Result<(String, Option<ForwardedEndpoint>)> {
         match self.mode {
             ReachMode::InCluster => {
-                let host = format!("postgresql.{}.svc.cluster.local", self.namespace);
+                let host = format!("postgresql.{}.svc.cluster.local", self.postgres_namespace);
                 let url = replace_pg_host(base_url, &host, 5432)?;
                 Ok((url, None))
             }
             ReachMode::PortForward => {
-                let ep = self.forward_by_port(5432)
+                let ep = self.forward_by_port(5432, &self.postgres_namespace.clone())
                     .await
                     .context("port-forward for Postgres (port 5432)")?;
                 let url = replace_pg_host(base_url, "localhost", ep.local_port)?;
@@ -81,7 +87,7 @@ impl ReachManager {
                 Ok((url, None))
             }
             ReachMode::PortForward => {
-                let ep = self.forward_by_port(3100)
+                let ep = self.forward_by_port(3100, &self.namespace.clone())
                     .await
                     .context("port-forward for Loki (port 3100)")?;
                 Ok((format!("http://localhost:{}", ep.local_port), Some(ep)))
@@ -110,7 +116,7 @@ impl ReachManager {
                     endpoints.push((name, url));
                 }
                 ReachMode::PortForward => {
-                    match self.forward_service_port(&name, port).await {
+                    match self.forward_service_port(&name, port, &self.namespace.clone()).await {
                         Ok(ep) => {
                             let url = format!("http://localhost:{}", ep.local_port);
                             endpoints.push((name, url));
@@ -127,10 +133,9 @@ impl ReachManager {
         Ok((endpoints, guards))
     }
 
-    /// Find a service in the namespace that exposes `port`, then open a
-    /// port-forward for it.
-    async fn forward_by_port(&self, port: u16) -> Result<ForwardedEndpoint> {
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
+    /// Find a service in `namespace` that exposes `port`, then open a port-forward for it.
+    async fn forward_by_port(&self, port: u16, namespace: &str) -> Result<ForwardedEndpoint> {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let svc_list = services
             .list(&ListParams::default())
             .await
@@ -144,27 +149,24 @@ impl ReachManager {
                 .map(|ps| ps.iter().any(|p| p.port == port as i32))
                 .unwrap_or(false);
             if has_port {
-                return self.forward_service_port(svc_name, port).await;
+                return self.forward_service_port(svc_name, port, namespace).await;
             }
         }
 
-        anyhow::bail!(
-            "no service with port {port} found in namespace {}",
-            self.namespace
-        )
+        anyhow::bail!("no service with port {port} found in namespace {namespace}")
     }
 
-    async fn forward_service_port(&self, service_name: &str, port: u16) -> Result<ForwardedEndpoint> {
+    async fn forward_service_port(&self, service_name: &str, port: u16, namespace: &str) -> Result<ForwardedEndpoint> {
         let pod_name = self
-            .find_pod_for_service(service_name)
+            .find_pod_for_service(service_name, namespace)
             .await
             .with_context(|| format!("find pod for service {service_name}"))?;
-        open_port_forward(self.client.clone(), self.namespace.clone(), pod_name, port).await
+        open_port_forward(self.client.clone(), namespace.to_string(), pod_name, port).await
     }
 
     /// Resolve the pod selector of `service_name` and return a Running pod name.
-    async fn find_pod_for_service(&self, service_name: &str) -> Result<String> {
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
+    async fn find_pod_for_service(&self, service_name: &str, namespace: &str) -> Result<String> {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let svc = services
             .get(service_name)
             .await
@@ -182,7 +184,7 @@ impl ReachManager {
             .collect::<Vec<_>>()
             .join(",");
 
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let pod_list = pods
             .list(&ListParams::default().labels(&label_sel))
             .await

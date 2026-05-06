@@ -257,7 +257,7 @@ async fn main() {
     let kube_client_result = kube::Client::try_default().await;
 
     let reach_mgr: Option<ReachManager> = match kube_client_result.as_ref() {
-        Ok(c) => Some(ReachManager::new(reach_mode, c.clone(), config.cluster.namespace.clone())),
+        Ok(c) => Some(ReachManager::new(reach_mode, c.clone(), config.cluster.namespace.clone(), config.cluster.postgres_namespace.clone())),
         Err(_) => None,
     };
 

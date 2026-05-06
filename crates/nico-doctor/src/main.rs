@@ -225,7 +225,7 @@ async fn main() {
         match k8s_result {
             Ok(c) => {
                 let raw = c.raw_client().clone();
-                let mgr = ReachManager::new(reach_mode, raw.clone(), config.cluster.namespace.clone());
+                let mgr = ReachManager::new(reach_mode, raw.clone(), config.cluster.namespace.clone(), config.cluster.postgres_namespace.clone());
                 (Some(Arc::new(c) as Arc<dyn k8s::K8sClient>), Some(raw), Some(mgr))
             }
             Err(_) => (None, None, None),
