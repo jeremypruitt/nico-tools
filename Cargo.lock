@@ -1773,6 +1773,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "owo-colors",
+ "ratatui",
  "serde",
  "thiserror",
  "tokio",
