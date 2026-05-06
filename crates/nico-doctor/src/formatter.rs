@@ -71,10 +71,11 @@ pub fn format_report(report: &Report, mode: &OutputMode, verbose: bool) -> Strin
     out
 }
 
-pub fn format_json(report: &Report, namespace: &str) -> String {
+pub fn format_json(report: &Report, namespace: &str, preflight: serde_json::Value) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "version": 1,
         "namespace": namespace,
+        "preflight": preflight,
         "summary": {
             "ok": report.layers.iter().filter(|l| l.status == Status::Ok).count(),
             "warn": report.layers.iter().filter(|l| l.status == Status::Warn).count(),
@@ -207,7 +208,7 @@ mod tests {
             ok_check("recent_restarts", "0"),
             ok_check("warning_events", "0"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
         assert_eq!(json["version"], 1);
         assert_eq!(json["namespace"], "nico");
         assert_eq!(json["summary"]["ok"], 1);
@@ -269,7 +270,7 @@ mod tests {
             ok_check("error_lines", "0 errors"),
             ok_check("source", "loki"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "logs");
         assert_eq!(layer["status"], "ok");
@@ -321,7 +322,7 @@ mod tests {
             ok_check("stuck", "0 stuck"),
             ok_check("failed", "0 failed"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "workflows");
         assert_eq!(layer["status"], "ok");
@@ -368,7 +369,7 @@ mod tests {
         let report = Report { layers: vec![layer("health", vec![
             ok_check("endpoints", "2/2 healthy"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "health");
         assert_eq!(layer["status"], "ok");
@@ -417,7 +418,7 @@ mod tests {
             ok_check("services", "3 services"),
             ok_check("methods", "21 methods"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "grpc");
         assert_eq!(layer["status"], "ok");
@@ -467,7 +468,7 @@ mod tests {
             ok_check("pool", "pool 5/20 in-use"),
             ok_check("locks", "0 lock waits"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "postgres");
         assert_eq!(layer["status"], "ok");
@@ -506,7 +507,7 @@ mod tests {
     #[test]
     fn all_ok_json_snapshot() {
         let report = all_ok_report();
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
         assert_eq!(json["version"], 1);
         assert_eq!(json["namespace"], "nico");
         assert_eq!(json["summary"]["ok"], 6);
@@ -564,7 +565,7 @@ mod tests {
             skipped("logs"),
             skipped("grpc"),
         ]};
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
         assert_eq!(json["summary"]["ok"], 1);
         assert_eq!(json["summary"]["skipped"], 2);
         assert_eq!(json["layers"][1]["status"], "skipped");

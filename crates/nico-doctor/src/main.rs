@@ -16,6 +16,7 @@ mod layer;
 mod layers;
 mod loki;
 mod postgres;
+mod preflight;
 mod runner;
 mod temporal;
 mod tui;
@@ -204,15 +205,29 @@ async fn main() {
 
     // Build k8s client using context from Config (flag > env > file > default).
     let k8s_result = k8s::KubeRsK8sClient::try_new(config.cluster.context.as_deref()).await;
-    let (k8s_client, reach_mgr): (Option<Arc<dyn k8s::K8sClient>>, Option<ReachManager>) =
+    let (k8s_client, raw_k8s, reach_mgr): (Option<Arc<dyn k8s::K8sClient>>, Option<kube::Client>, Option<ReachManager>) =
         match k8s_result {
             Ok(c) => {
                 let raw = c.raw_client().clone();
-                let mgr = ReachManager::new(reach_mode, raw, config.cluster.namespace.clone());
-                (Some(Arc::new(c) as Arc<dyn k8s::K8sClient>), Some(mgr))
+                let mgr = ReachManager::new(reach_mode, raw.clone(), config.cluster.namespace.clone());
+                (Some(Arc::new(c) as Arc<dyn k8s::K8sClient>), Some(raw), Some(mgr))
             }
-            Err(_) => (None, None),
+            Err(_) => (None, None, None),
         };
+
+    // Pre-flight: serial auth chain before any layer runs. Exits 3 on first failure.
+    if let Some(raw) = raw_k8s.as_ref() {
+        let pf = preflight::KubePreflightClient::new(raw.clone());
+        if let preflight::Outcome::Failed(failure) = preflight::run(&pf, &config.cluster.namespace).await {
+            if matches!(config.output.format, OutputFormat::Json) {
+                println!("{}", preflight::format_failure_json(&failure, &config.cluster.namespace));
+            } else {
+                eprintln!("error: pre-flight check failed [{}]: {}", failure.step.as_str(), failure.message);
+                eprintln!("  → {}", failure.next_command);
+            }
+            process::exit(3);
+        }
+    }
 
     // Resolve service URLs via reach manager; keep port-forward guards alive until run completes.
     // Guards are collected here and dropped after runner::run() returns.
@@ -452,7 +467,7 @@ async fn main() {
     drop(_pf_guards);
 
     if matches!(config.output.format, OutputFormat::Json) {
-        println!("{}", formatter::format_json(&report, &config.cluster.namespace));
+        println!("{}", formatter::format_json(&report, &config.cluster.namespace, preflight::ok_section()));
     } else {
         print!("{}", formatter::format_report(&report, &mode, cli.verbose));
     }

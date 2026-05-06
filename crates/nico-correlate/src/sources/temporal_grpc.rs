@@ -53,7 +53,7 @@ fn history_event_to_raw(
             (None, None, false)
         };
 
-    let ts = e.event_time.clone().map(proto_ts_to_chrono).unwrap_or_else(Utc::now);
+    let ts = e.event_time.map(proto_ts_to_chrono).unwrap_or_else(Utc::now);
     let event_type = event_type_name(e.event_type);
     RawTemporalEvent { event_type, ts, activity_name, error_message, at_max_retries }
 }
