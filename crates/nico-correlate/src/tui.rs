@@ -929,6 +929,10 @@ mod tests {
             name: "redfish".into(),
             result: SourceResult::Unavailable(SourceUnavailable { name: "redfish", reason: "not configured".into() }),
         });
+        state.apply_update(TuiUpdate::SourceDone {
+            name: "rest".into(),
+            result: SourceResult::Unavailable(SourceUnavailable { name: "rest", reason: "not configured".into() }),
+        });
         state
     }
 
@@ -1443,7 +1447,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
         let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
-        let mut state = sample_state(&config); // all 5 sources resolved
+        let mut state = sample_state(&config); // all 6 sources resolved
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
 

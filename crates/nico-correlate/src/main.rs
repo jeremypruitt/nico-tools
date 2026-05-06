@@ -24,6 +24,7 @@ use crate::sources::postgres::{PostgresSource, SqlxPostgresClient};
 use crate::sources::k8s::{K8sSource, KubeRsK8sClient};
 use crate::sources::loki::{LokiSource, LokiClient, K8sLogStreamClient, RealLokiClient, RealK8sLogStreamClient};
 use crate::sources::redfish::{RedfishSource, RealRedfishClient};
+use crate::sources::rest::{RestSource, RealRestLogClient};
 use crate::timeline::filter_timeline;
 use crate::correlate::exit_code;
 use crate::diagnosis::{diagnose, DiagnosisConfig};
@@ -352,12 +353,22 @@ async fn main() {
         Err(_) => Box::new(UnavailableSource::new("redfish", "REDFISH_BMC_BASE_URL not set")),
     };
 
+    // Rest: uses k8s to stream logs from infra-controller-rest pods (app=rest).
+    let rest_source: Box<dyn Source> = match kube::Client::try_default().await {
+        Ok(c) => Box::new(RestSource::new(
+            Box::new(RealRestLogClient::new(c, config.cluster.namespace.clone())),
+            since,
+        )),
+        Err(e) => Box::new(UnavailableSource::new("rest", format!("kubeconfig unavailable: {e}"))),
+    };
+
     let all_sources: Vec<(&'static str, Box<dyn Source>)> = vec![
         ("temporal", Box::new(TemporalSource::new(temporal_client))),
         ("postgres", pg_source),
         ("k8s", k8s_source),
         ("loki", loki_source),
         ("redfish", redfish_source),
+        ("rest", rest_source),
     ];
 
     let named_sources: Vec<(&'static str, Box<dyn Source>)> = if use_all {

@@ -39,7 +39,7 @@ every output line points at where to dig deeper.
   _Avoid_: investigation, trace, report
 - **Diagnosis** — a conservative, pattern-matched hypothesis about root cause, always accompanied by the next commands a human should run to confirm it. Produced by `nico-correlate`. A suggestion, not a verdict.
   _Avoid_: conclusion, result, finding (Finding is nico-doctor's term)
-- **Source** — a system that can emit Events or State for a given Entity (e.g. Temporal, Loki, Postgres, k8s, Redfish). Each Source in `nico-correlate` is independently optional and reports unavailable rather than crashing the Correlation. Loki is the primary logs Source (serial console output lives there); k8s log streaming is the fallback. No Datadog.
+- **Source** — a system that can emit Events or State for a given Entity (e.g. Temporal, Loki, Postgres, k8s, Redfish, Rest). Each Source in `nico-correlate` is independently optional and reports unavailable rather than crashing the Correlation. Loki is the primary logs Source (serial console output lives there); k8s log streaming is the fallback. The `rest` Source streams JSON access logs from `infra-controller-rest` pods (labeled `app=rest`) and links `req-` IDs to the Temporal `workflow_id` they triggered. No Datadog.
   _Avoid_: data source, backend, plugin
 - **Stuck** — a Workflow that has been in Running status longer than `stuck_threshold` (default 30m, configurable globally in `[temporal]`). A Stuck workflow produces a Finding in the `workflows` Layer.
   _Avoid_: hung, frozen, stalled
@@ -68,7 +68,7 @@ Read-only. No remediation. Output is human-readable by default and JSON under
 
 ## Open questions
 
-- **REST access log structure**: does `infra-controller-rest` emit structured JSON access logs with `request_id` and `workflow_id` fields? If yes, build a thin `rest` Source to link `req-` IDs to workflow starts. If no, fall back to grepping Loki logs for `req-` patterns. Check with `kubectl logs -l app=rest | head -5` on a live cluster.
+(none)
 
 ## TUI mode (ADR-007)
 

@@ -12,6 +12,7 @@ pub enum SourceKind {
     K8s,
     Loki,
     Redfish,
+    Rest,
 }
 
 impl SourceKind {
@@ -21,6 +22,7 @@ impl SourceKind {
         SourceKind::K8s,
         SourceKind::Loki,
         SourceKind::Redfish,
+        SourceKind::Rest,
     ];
 
     pub fn name(self) -> &'static str {
@@ -30,6 +32,7 @@ impl SourceKind {
             SourceKind::K8s     => "k8s",
             SourceKind::Loki    => "loki",
             SourceKind::Redfish => "redfish",
+            SourceKind::Rest    => "rest",
         }
     }
 
@@ -40,6 +43,7 @@ impl SourceKind {
             "k8s"      => Some(SourceKind::K8s),
             "loki"     => Some(SourceKind::Loki),
             "redfish"  => Some(SourceKind::Redfish),
+            "rest"     => Some(SourceKind::Rest),
             _          => None,
         }
     }
