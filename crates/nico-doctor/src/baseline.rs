@@ -81,11 +81,11 @@ fn load_from(path: &std::path::Path) -> Option<Baseline> {
 }
 
 fn save_to(path: &std::path::Path, report: &Report) {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("nico: warn: could not create baseline directory: {e}");
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("nico: warn: could not create baseline directory: {e}");
+        return;
     }
     let map: Baseline = report.layers.iter()
         .map(|l| (l.name.to_string(), status_str(&l.status).to_string()))
