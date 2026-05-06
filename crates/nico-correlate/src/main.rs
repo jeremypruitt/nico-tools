@@ -13,6 +13,7 @@ use clap::Parser;
 use chrono::{Duration, Utc};
 use std::sync::Arc;
 use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, ReachMode};
+use nico_common::theme;
 use nico_common::output::{OutputMode, Status};
 use nico_common::reach::ReachManager;
 use crate::id::{IdType, detect_id_type};
@@ -71,6 +72,10 @@ struct Cli {
     #[arg(long)]
     no_color: bool,
 
+    /// Color theme: default, dracula, nord, gruvbox
+    #[arg(long, env = "NICO_THEME")]
+    theme: Option<String>,
+
     /// Config file path (default: ~/.config/nico-tools/config.toml)
     #[arg(long, value_name = "PATH")]
     config: Option<String>,
@@ -120,6 +125,14 @@ fn severity_to_status(s: &crate::event::Severity) -> Status {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    let resolved_theme = match theme::resolve_theme(cli.theme.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Guard: --tui and --json are mutually exclusive.
     if cli.tui && cli.json {
@@ -432,7 +445,7 @@ async fn main() {
             });
         }
         drop(tx);
-        let ctx = tui::TuiContext { mode };
+        let ctx = tui::TuiContext { mode, theme: resolved_theme };
         let tui_exit = tokio::task::block_in_place(|| {
             tui::run_tui_incremental(tui_config, rx, ctx)
         });

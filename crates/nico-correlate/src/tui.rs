@@ -17,6 +17,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use nico_common::output::OutputMode;
+use nico_common::theme::Theme;
 use crate::event::{Event as CorrelateEvent, Severity};
 use crate::source::{SourceKind, StateEntry, SourceResult};
 use crate::diagnosis::{diagnose, Diagnosis, DiagnosisConfig};
@@ -24,6 +25,7 @@ use crate::timeline::filter_timeline;
 
 pub struct TuiContext {
     pub mode: OutputMode,
+    pub theme: Theme,
 }
 
 /// Static configuration passed to the TUI at launch time.
@@ -465,14 +467,15 @@ fn event_loop<B: ratatui::backend::Backend>(
 
 // ─── Rendering ────────────────────────────────────────────────────────────────
 
-fn severity_style(severity: &Severity, use_color: bool) -> Style {
-    if !use_color {
+fn severity_style(severity: &Severity, ctx: &TuiContext) -> Style {
+    if !ctx.mode.color {
         return Style::default();
     }
+    let t = &ctx.theme;
     match severity {
-        Severity::Info => Style::default().fg(Color::Green),
-        Severity::Warning => Style::default().fg(Color::Yellow),
-        Severity::Error => Style::default().fg(Color::Red),
+        Severity::Info => Style::default().fg(t.ok),
+        Severity::Warning => Style::default().fg(t.warn),
+        Severity::Error => Style::default().fg(t.error),
     }
 }
 
@@ -580,7 +583,7 @@ fn render_timeline(
             let ts = e.ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let prefix = if selected_vis == Some(vis_idx) { selector } else { " " };
             let row = format!("{prefix} {}  {}  {}", ts, e.source, e.kind);
-            let mut style = severity_style(&e.severity, use_color);
+            let mut style = severity_style(&e.severity, ctx);
             if selected_vis == Some(vis_idx) {
                 style = style.add_modifier(Modifier::REVERSED);
             }
@@ -595,7 +598,7 @@ fn render_timeline(
         let cursor = if filter_active { "_" } else { "" };
         let bar_text = format!("/{}{}", filter_query, cursor);
         let style = if use_color {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(ctx.theme.warn)
         } else {
             Style::default()
         };
@@ -771,11 +774,12 @@ fn render_status_bar(
     let spans: Vec<Span> = SourceKind::ALL.iter().flat_map(|kind| {
         let src = kind.name();
         let ss = state.source_states.get(src);
+        let t = &ctx.theme;
         let (dot, color) = match ss {
-            Some(SourceState::Fetching)    => (fetch_dot, Color::Yellow),
-            Some(SourceState::Available)   => (avail_dot, Color::Green),
-            Some(SourceState::Errored)     => (err_dot,   Color::Red),
-            Some(SourceState::Unavailable) | None => (skip_dot, Color::DarkGray),
+            Some(SourceState::Fetching)    => (fetch_dot, t.warn),
+            Some(SourceState::Available)   => (avail_dot, t.ok),
+            Some(SourceState::Errored)     => (err_dot,   t.error),
+            Some(SourceState::Unavailable) | None => (skip_dot, t.muted),
         };
         let text = format!("{dot}{src} ");
         let s: Span = if use_color {
@@ -793,9 +797,9 @@ fn render_status_bar(
         Line::from("Esc:clear  q:quit")
     } else if state.tail_mode {
         let (indicator, color) = if state.follow {
-            ("FOLLOW", Color::Green)
+            ("FOLLOW", ctx.theme.ok)
         } else {
-            ("PAUSED", Color::Yellow)
+            ("PAUSED", ctx.theme.warn)
         };
         if use_color {
             Line::from(vec![
@@ -826,7 +830,7 @@ fn render_help_overlay(frame: &mut Frame, ctx: &TuiContext, area: Rect) {
 
     frame.render_widget(Clear, overlay_rect);
 
-    let bg = Style::default().bg(Color::DarkGray);
+    let bg = Style::default().bg(ctx.theme.overlay_bg);
     let block = make_block(" Keybindings  \u{2014}  ? or Esc to close ", ascii).style(bg);
     let inner = block.inner(overlay_rect);
     frame.render_widget(block, overlay_rect);
@@ -964,7 +968,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first();
 
@@ -991,7 +995,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         // No select_first() — no selection.
 
@@ -1010,7 +1014,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: true } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: true }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1026,7 +1030,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1042,7 +1046,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: true, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: true, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1067,7 +1071,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (config, mut state) = three_event_state();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         state.filter_active = true;
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1091,7 +1095,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = IncrementalState::new(&config); // no updates yet
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1109,7 +1113,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = IncrementalState::new(&config);
 
         // Send one source with an event.
@@ -1146,7 +1150,7 @@ mod tests {
             diagnosis: DiagnosisConfig::default(),
             tail: false,
         };
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: true } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: true }, theme: nico_common::theme::DEFAULT };
         let mut state = IncrementalState::new(&config); // temporal still fetching
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1168,7 +1172,7 @@ mod tests {
             diagnosis: DiagnosisConfig::default(),
             tail: false,
         };
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: true } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: true }, theme: nico_common::theme::DEFAULT };
         let mut state = IncrementalState::new(&config);
         state.apply_update(TuiUpdate::SourceDone {
             name: "temporal".into(),
@@ -1303,7 +1307,7 @@ mod tests {
             diagnosis: DiagnosisConfig::default(),
             tail: false,
         };
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = IncrementalState::new(&config);
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
     }
@@ -1321,7 +1325,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.help_open = true;
 
@@ -1357,7 +1361,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         // help_open defaults to false
 
@@ -1373,7 +1377,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config); // all 5 sources resolved
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1492,7 +1496,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (config, mut state) = three_event_state();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         state.filter_active = true;
         state.filter_query = "tem".into();
         state.sync_cursor();
@@ -1509,7 +1513,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (config, mut state) = three_event_state();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         state.filter_query = "temporal".into();
         state.filter_active = true;
         state.sync_cursor();
@@ -1526,7 +1530,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (config, mut state) = three_event_state();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
 
         // Apply filter then clear it.
         state.filter_query = "temporal".into();
@@ -1545,7 +1549,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (config, mut state) = three_event_state();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         state.filter_query = "xyzzy_no_such_source".into();
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1565,7 +1569,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first();
 
@@ -1583,7 +1587,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first();
 
@@ -1600,7 +1604,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first();
         state.detail_open = true;
@@ -1619,7 +1623,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first();
         state.detail_open = true;
@@ -1649,7 +1653,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first();
         // detail_open defaults to false
@@ -1668,7 +1672,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (config, mut state) = three_event_state();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         state.filter_query = "temporal".into();
         state.filter_active = true;
         state.sync_cursor();
@@ -1702,7 +1706,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let (config, mut state) = three_event_state();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         state.filter_active = true;
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1755,7 +1759,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = tail_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = tail_state(&config);
         assert!(state.follow, "follow should start true in tail mode");
 
@@ -1771,7 +1775,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = tail_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = tail_state(&config);
         state.follow = false;
 
@@ -1966,7 +1970,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config(); // tail: false
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -1983,7 +1987,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = tail_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = tail_state(&config);
         state.follow = false;
 
@@ -2009,7 +2013,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = IncrementalState::new(&config); // sources still fetching
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -2040,7 +2044,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = IncrementalState::new(&config);
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -2064,7 +2068,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config); // all sources done, selected == None
 
         terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
@@ -2088,7 +2092,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first(); // explicit ↓ / select
 
@@ -2113,7 +2117,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = sample_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT };
         let mut state = sample_state(&config);
         state.select_first(); // first row selected, second should be plain
 
@@ -2132,5 +2136,184 @@ mod tests {
             reversed_cells.is_empty(),
             "Non-selected second row has unexpected REVERSED at x={reversed_cells:?}"
         );
+    }
+
+    // ─── Issue #98: theme wiring ──────────────────────────────────────────────
+
+    #[test]
+    fn severity_style_info_uses_theme_ok_rgb() {
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::DRACULA,
+        };
+        let style = severity_style(&Severity::Info, &ctx);
+        assert_eq!(style, Style::default().fg(nico_common::theme::DRACULA.ok));
+    }
+
+    #[test]
+    fn severity_style_warning_uses_theme_warn_rgb() {
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::NORD,
+        };
+        let style = severity_style(&Severity::Warning, &ctx);
+        assert_eq!(style, Style::default().fg(nico_common::theme::NORD.warn));
+    }
+
+    #[test]
+    fn severity_style_error_uses_theme_error_rgb() {
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::GRUVBOX,
+        };
+        let style = severity_style(&Severity::Error, &ctx);
+        assert_eq!(style, Style::default().fg(nico_common::theme::GRUVBOX.error));
+    }
+
+    #[test]
+    fn severity_style_returns_default_when_color_disabled_regardless_of_theme() {
+        let ctx = TuiContext {
+            mode: OutputMode { color: false, ascii: false },
+            theme: nico_common::theme::DRACULA,
+        };
+        assert_eq!(severity_style(&Severity::Info,    &ctx), Style::default());
+        assert_eq!(severity_style(&Severity::Warning, &ctx), Style::default());
+        assert_eq!(severity_style(&Severity::Error,   &ctx), Style::default());
+    }
+
+    #[test]
+    fn source_state_available_uses_theme_ok_cell_color() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = TuiConfig {
+            id: "wf-1".into(),
+            source_names: vec!["temporal"],
+            restricted: vec![],
+            diagnosis: DiagnosisConfig::default(),
+            tail: false,
+        };
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::NORD,
+        };
+        let mut state = IncrementalState::new(&config);
+        state.apply_update(TuiUpdate::SourceDone {
+            name: "temporal".into(),
+            result: SourceResult::Output(SourceOutput { events: vec![], state: vec![] }),
+        });
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let bar_row = (0..120)
+            .filter_map(|x| buf.cell((x, 22)))
+            .find(|c| c.symbol() == "●")
+            .unwrap_or_else(|| panic!("available dot '●' not found in status bar"));
+        assert_eq!(
+            bar_row.fg,
+            nico_common::theme::NORD.ok,
+            "Available source indicator should use theme.ok color"
+        );
+    }
+
+    #[test]
+    fn source_state_errored_uses_theme_error_cell_color() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = TuiConfig {
+            id: "wf-1".into(),
+            source_names: vec!["temporal"],
+            restricted: vec![],
+            diagnosis: DiagnosisConfig::default(),
+            tail: false,
+        };
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::NORD,
+        };
+        let mut state = IncrementalState::new(&config);
+        state.apply_update(TuiUpdate::SourceDone {
+            name: "temporal".into(),
+            result: SourceResult::Unavailable(SourceUnavailable {
+                name: "temporal",
+                reason: "connection refused".into(),
+            }),
+        });
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let err_cell = (0..120)
+            .filter_map(|x| buf.cell((x, 22)))
+            .find(|c| c.symbol() == "✗")
+            .unwrap_or_else(|| panic!("error dot '✗' not found in status bar"));
+        assert_eq!(
+            err_cell.fg,
+            nico_common::theme::NORD.error,
+            "Errored source indicator should use theme.error color"
+        );
+    }
+
+    #[test]
+    fn follow_indicator_uses_theme_ok_color() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = tail_config();
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::DRACULA,
+        };
+        let mut state = tail_state(&config);
+        assert!(state.follow);
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let f_cell = (0..120)
+            .filter_map(|x| buf.cell((x, 22)))
+            .find(|c| c.symbol() == "F")
+            .unwrap_or_else(|| panic!("'F' from FOLLOW not found in status bar"));
+        assert_eq!(
+            f_cell.fg,
+            nico_common::theme::DRACULA.ok,
+            "FOLLOW indicator should use theme.ok"
+        );
+    }
+
+    #[test]
+    fn paused_indicator_uses_theme_warn_color() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = tail_config();
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::DRACULA,
+        };
+        let mut state = tail_state(&config);
+        state.follow = false;
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let p_cell = (0..120)
+            .filter_map(|x| buf.cell((x, 22)))
+            .find(|c| c.symbol() == "P")
+            .unwrap_or_else(|| panic!("'P' from PAUSED not found in status bar"));
+        assert_eq!(
+            p_cell.fg,
+            nico_common::theme::DRACULA.warn,
+            "PAUSED indicator should use theme.warn"
+        );
+    }
+
+    #[test]
+    fn no_color_ignores_theme_severity_styles() {
+        let ctx_color = TuiContext {
+            mode: OutputMode { color: false, ascii: false },
+            theme: nico_common::theme::NORD,
+        };
+        assert_eq!(severity_style(&Severity::Info,    &ctx_color), Style::default());
+        assert_eq!(severity_style(&Severity::Warning, &ctx_color), Style::default());
+        assert_eq!(severity_style(&Severity::Error,   &ctx_color), Style::default());
     }
 }
