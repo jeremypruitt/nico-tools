@@ -29,6 +29,7 @@ pub struct TemporalConfig {
 pub struct OutputConfig {
     pub color: ColorMode,
     pub format: OutputFormat,
+    pub tui_refresh: Duration,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -77,6 +78,7 @@ pub struct ConfigOverrides {
     pub color: Option<ColorMode>,
     pub format: Option<OutputFormat>,
     pub reach_mode: Option<ReachMode>,
+    pub tui_refresh: Option<Duration>,
 }
 
 /// Intermediate deserialization shape — all fields optional so missing fields fall back to defaults.
@@ -111,6 +113,7 @@ struct FileTemporalConfig {
 struct FileOutputConfig {
     color: Option<String>,
     format: Option<String>,
+    tui_refresh: Option<String>,
 }
 
 impl Config {
@@ -163,6 +166,13 @@ impl Config {
             _ => OutputFormat::Human,
         };
 
+        let tui_refresh_str = env.get("NICO_TUI_REFRESH").cloned().or(output.tui_refresh);
+        let tui_refresh = match tui_refresh_str.as_deref() {
+            Some(s) => humantime::parse_duration(s)
+                .context(format!("invalid tui_refresh {:?}", s))?,
+            None => Duration::from_secs(30),
+        };
+
         let reach_mode_str = env.get("NICO_REACH_MODE").cloned()
             .or(cluster.reach_mode);
         let reach_mode = match reach_mode_str.as_deref() {
@@ -184,6 +194,7 @@ impl Config {
         let color = overrides.color.unwrap_or(color);
         let format = overrides.format.unwrap_or(format);
         let reach_mode = overrides.reach_mode.unwrap_or(reach_mode);
+        let tui_refresh = overrides.tui_refresh.unwrap_or(tui_refresh);
 
         Ok(Config {
             cluster: ClusterConfig { context, namespace, reach_mode },
@@ -193,7 +204,7 @@ impl Config {
                 namespace: temporal_namespace,
                 stuck_threshold,
             },
-            output: OutputConfig { color, format },
+            output: OutputConfig { color, format, tui_refresh },
         })
     }
 }
@@ -262,6 +273,7 @@ url = "postgres://prod:secret@db:5432/prod"
         assert_eq!(config.temporal.stuck_threshold, Duration::from_secs(30 * 60));
         assert_eq!(config.output.color, ColorMode::Auto);
         assert_eq!(config.output.format, OutputFormat::Human);
+        assert_eq!(config.output.tui_refresh, Duration::from_secs(30));
         // no KUBERNETES_SERVICE_HOST in test env → PortForward
         assert_eq!(config.cluster.reach_mode, ReachMode::PortForward);
     }

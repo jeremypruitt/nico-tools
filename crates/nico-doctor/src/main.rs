@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +18,7 @@ mod loki;
 mod postgres;
 mod runner;
 mod temporal;
+mod tui;
 
 use layer::RunOpts;
 
@@ -39,6 +41,12 @@ struct Cli {
 
     #[arg(long, default_value = "5s", help = "Per-check timeout")]
     timeout: String,
+
+    #[arg(long, help = "Launch interactive TUI dashboard (requires a TTY; mutually exclusive with --json)")]
+    tui: bool,
+
+    #[arg(long, value_name = "DURATION", help = "TUI refresh interval (default: 30s, or [output] tui_refresh in config)")]
+    interval: Option<String>,
 
     #[arg(short, long, help = "Output JSON")]
     json: bool,
@@ -101,6 +109,22 @@ fn exit_code(report: &runner::Report) -> i32 {
 async fn main() {
     let cli = Cli::parse();
 
+    // Guard: --tui and --json are mutually exclusive.
+    if cli.tui && cli.json {
+        eprintln!("error: --tui and --json are mutually exclusive");
+        process::exit(3);
+    }
+
+    // Guard: --tui requires an interactive terminal.
+    if cli.tui && !std::io::stdout().is_terminal() {
+        eprintln!("`--tui` requires an interactive terminal (stdout is not a TTY)");
+        process::exit(3);
+    }
+
+    if cli.tui {
+        tui::install_panic_hook();
+    }
+
     // Load config file from --config or the default path.
     let config_path = cli.config.as_deref()
         .map(std::path::PathBuf::from)
@@ -121,6 +145,18 @@ async fn main() {
         None => None,
     };
 
+    // Parse --interval flag into a Duration override.
+    let interval_override = match cli.interval.as_deref() {
+        Some(s) => match humantime::parse_duration(s) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("error: invalid --interval {s:?}: {e}");
+                process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     // CLI flags are highest precedence; env and file layers are handled by Config::load.
     let overrides = ConfigOverrides {
         namespace: cli.namespace.clone(),
@@ -129,6 +165,7 @@ async fn main() {
         color: if cli.no_color { Some(ColorMode::Never) } else { None },
         format: if cli.json { Some(OutputFormat::Json) } else { None },
         reach_mode: mode_override,
+        tui_refresh: interval_override,
         ..Default::default()
     };
 
@@ -373,6 +410,42 @@ async fn main() {
         }
     }
 
+    if cli.tui {
+        let layers: std::sync::Arc<Vec<Box<dyn layer::Layer>>> = std::sync::Arc::new(layers);
+        let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<tui::TuiUpdate>();
+
+        let namespace = config.cluster.namespace.clone();
+
+        tokio::spawn({
+            let layers = layers.clone();
+            let result_tx = result_tx.clone();
+            async move {
+                run_layers_tui(layers.clone(), namespace.clone(), since, timeout, result_tx.clone()).await;
+                while refresh_rx.recv().await.is_some() {
+                    run_layers_tui(layers.clone(), namespace.clone(), since, timeout, result_tx.clone()).await;
+                }
+            }
+        });
+
+        let tui_cfg = tui::TuiConfig {
+            refresh_interval: config.output.tui_refresh,
+            layer_names: LAYER_ORDER.to_vec(),
+        };
+        let ctx = tui::TuiContext { mode };
+
+        let trigger_refresh: Box<dyn Fn() + Send> = Box::new(move || {
+            let _ = refresh_tx.try_send(());
+        });
+
+        let tui_exit = tokio::task::block_in_place(|| {
+            tui::run_tui(tui_cfg, result_rx, ctx, trigger_refresh)
+        });
+
+        drop(_pf_guards);
+        process::exit(tui_exit);
+    }
+
     let report = runner::run(&layers, &opts).await;
 
     // Port-forward guards are dropped here, cleanly closing all forwards.
@@ -385,4 +458,20 @@ async fn main() {
     }
 
     process::exit(exit_code(&report));
+}
+
+async fn run_layers_tui(
+    layers: std::sync::Arc<Vec<Box<dyn layer::Layer>>>,
+    namespace: String,
+    since: Duration,
+    timeout: Duration,
+    tx: std::sync::mpsc::Sender<tui::TuiUpdate>,
+) {
+    let opts = layer::RunOpts { namespace, since, timeout };
+    let report = runner::run(&layers, &opts).await;
+    for result in report.layers {
+        let name = result.name.to_string();
+        let _ = tx.send(tui::TuiUpdate::LayerDone { name, result });
+    }
+    let _ = tx.send(tui::TuiUpdate::RunComplete);
 }
