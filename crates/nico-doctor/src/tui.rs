@@ -6,7 +6,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -491,8 +491,11 @@ fn render_bottom_bar(frame: &mut Frame, ctx: &TuiContext, state: &DashState, are
     let ascii = ctx.mode.ascii;
     let use_color = ctx.mode.color;
 
+    let bar_bg = if use_color { ctx.theme.overlay_bg } else { Color::Reset };
+    let bar_style = Style::default().bg(bar_bg);
+
     let border_block = {
-        let b = Block::default().borders(Borders::ALL);
+        let b = Block::default().borders(Borders::ALL).style(bar_style);
         if ascii { b.border_set(ASCII_BORDER) } else { b }
     };
     let inner = border_block.inner(area);
@@ -515,7 +518,7 @@ fn render_bottom_bar(frame: &mut Frame, ctx: &TuiContext, state: &DashState, are
     } else {
         String::new()
     };
-    frame.render_widget(Paragraph::new(left), cols[0]);
+    frame.render_widget(Paragraph::new(left).style(bar_style), cols[0]);
 
     // Centre: next-refresh countdown
     let center_text = if state.running {
@@ -527,14 +530,14 @@ fn render_bottom_bar(frame: &mut Frame, ctx: &TuiContext, state: &DashState, are
         }
     };
     frame.render_widget(
-        Paragraph::new(center_text).alignment(Alignment::Center),
+        Paragraph::new(center_text).alignment(Alignment::Center).style(bar_style),
         cols[1],
     );
 
     // Right: key hints; running indicator when checks are in-flight
     let hint_line: Line = if state.running {
         let running_style = if use_color {
-            Style::default().fg(ctx.theme.warn).add_modifier(Modifier::BOLD)
+            Style::default().bg(bar_bg).fg(ctx.theme.warn).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -546,7 +549,7 @@ fn render_bottom_bar(frame: &mut Frame, ctx: &TuiContext, state: &DashState, are
         Line::from("?:help  r:refresh  R:refresh-layer  q:quit")
     };
     frame.render_widget(
-        Paragraph::new(hint_line).alignment(Alignment::Right),
+        Paragraph::new(hint_line).alignment(Alignment::Right).style(bar_style),
         cols[2],
     );
 }
@@ -706,6 +709,31 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
         let body: String = (1..21).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join(" ");
         assert!(body.contains("pods_ready"), "Check name missing: {body}");
+    }
+
+    #[test]
+    fn bottom_bar_background_uses_theme_overlay_bg() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = test_config();
+        let ctx = TuiContext { mode: OutputMode { color: true, ascii: false }, theme: nico_common::theme::DEFAULT };
+        let mut state = DashState::new(&config);
+
+        terminal.draw(|f| render(f, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        // Row 22 is the inner bottom bar (borders at 21 and 23). All inner cells must use theme overlay_bg.
+        let wrong_bg: Vec<u16> = (1..119)
+            .filter(|&x| {
+                buf.cell((x, 22))
+                    .map(|c| c.bg != ctx.theme.overlay_bg)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            wrong_bg.is_empty(),
+            "Bottom bar cells should use theme overlay_bg at x positions: {wrong_bg:?}"
+        );
     }
 
     #[test]

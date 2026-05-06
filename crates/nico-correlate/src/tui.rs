@@ -745,7 +745,7 @@ fn render_status_bar(
     let ascii = ctx.mode.ascii;
     let use_color = ctx.mode.color;
 
-    let bar_bg = if use_color { Color::DarkGray } else { Color::Reset };
+    let bar_bg = if use_color { ctx.theme.overlay_bg } else { Color::Reset };
     let bar_style = Style::default().bg(bar_bg);
 
     let border_block = {
@@ -1071,6 +1071,31 @@ mod tests {
         assert!(
             cells_with_reset_bg.is_empty(),
             "Status bar inner cells have transparent background at x positions: {cells_with_reset_bg:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_background_uses_theme_overlay_bg() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: true, ascii: false }, theme: nico_common::theme::DEFAULT };
+        let mut state = sample_state(&config);
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        // Row 22 is the inner status bar. All inner cells must use the theme's overlay_bg.
+        let wrong_bg: Vec<u16> = (1..119)
+            .filter(|&x| {
+                buf.cell((x, 22))
+                    .map(|c| c.bg != ctx.theme.overlay_bg)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            wrong_bg.is_empty(),
+            "Status bar cells should use theme overlay_bg at x positions: {wrong_bg:?}"
         );
     }
 
