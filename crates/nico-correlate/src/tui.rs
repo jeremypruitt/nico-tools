@@ -389,6 +389,8 @@ fn event_loop<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|f| render(f, config, ctx, state)).expect("draw");
 
+        let was_overlay = state.help_open || state.detail_open;
+
         // Poll crossterm events with a short timeout so source updates feel
         // nearly instantaneous without burning the CPU.
         if event::poll(std::time::Duration::from_millis(50)).expect("poll")
@@ -455,6 +457,12 @@ fn event_loop<B: ratatui::backend::Backend>(
                     _ => {}
                 }
             }
+        }
+
+        // When an overlay closes, force a full repaint so no border or text
+        // characters linger over the panes on the next frame.
+        if was_overlay && !(state.help_open || state.detail_open) {
+            terminal.clear().expect("clear");
         }
 
         // Drain all pending source updates before the next frame.
@@ -1373,6 +1381,38 @@ mod tests {
     }
 
     #[test]
+    fn help_overlay_dismiss_leaves_no_artifacts() {
+        // Two-draw test: frame 1 has the overlay open, then it is dismissed
+        // (state.help_open = false + terminal.clear() as the event loop does).
+        // Frame 2 must show only pane content — no overlay border or keybinding
+        // text may survive in the backend buffer.
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.select_first();
+
+        // Frame 1 — overlay visible.
+        state.help_open = true;
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        // Dismiss (mirrors what event_loop does: state change + full-repaint clear).
+        state.help_open = false;
+        terminal.clear().unwrap();
+
+        // Frame 2 — normal two-pane layout.
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+        assert!(!all_rows.contains("Keybindings"), "Overlay title persisted after dismiss: {all_rows}");
+        assert!(!all_rows.contains("Move selection"), "Overlay keybinding text persisted after dismiss: {all_rows}");
+        assert!(all_rows.contains("Timeline"), "Timeline pane not restored after overlay dismiss: {all_rows}");
+        assert!(all_rows.contains("temporal"), "Event data not visible after overlay dismiss: {all_rows}");
+    }
+
+    #[test]
     fn timeline_title_shows_correct_count_after_all_sources_done() {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1665,6 +1705,38 @@ mod tests {
         // In narrow mode, row 0 should show Timeline, not the overlay title
         assert!(row0.contains("Timeline"), "Timeline should show when detail overlay is closed: {row0}");
         assert!(!row0.contains("q / Esc"), "Overlay should not be visible by default: {row0}");
+    }
+
+    #[test]
+    fn detail_overlay_dismiss_leaves_no_artifacts() {
+        // Two-draw test: frame 1 has the full-screen detail overlay, then it is
+        // dismissed. Frame 2 must show the normal two-pane layout with no
+        // full-screen overlay title or close hint remaining.
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.select_first();
+
+        // Frame 1 — detail overlay (full-screen).
+        state.detail_open = true;
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        // Dismiss.
+        state.detail_open = false;
+        terminal.clear().unwrap();
+
+        // Frame 2 — normal two-pane layout.
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let row0 = row_str(&buf, 0, 120);
+        // Normal layout: both pane titles appear in row 0.
+        assert!(row0.contains("Timeline"), "Timeline not restored after detail dismiss: {row0}");
+        assert!(row0.contains("Event detail"), "Detail pane not restored after detail dismiss: {row0}");
+        // Full-screen close hint must be gone (only present in the overlay title).
+        assert!(!row0.contains("q / Esc to close"), "Overlay close hint persisted after dismiss: {row0}");
     }
 
     #[test]
