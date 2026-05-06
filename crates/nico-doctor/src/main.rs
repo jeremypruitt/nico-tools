@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, ReachMode};
 use nico_common::output::{OutputMode, Status};
+use nico_common::theme;
 use nico_common::reach::ReachManager;
 
 mod baseline;
@@ -77,6 +78,9 @@ struct Cli {
         help = "Reach mode: port-forward or in-cluster (default: auto-detect from KUBERNETES_SERVICE_HOST)"
     )]
     mode: Option<String>,
+
+    #[arg(long, env = "NICO_THEME", value_name = "NAME", help = "Color theme: default, dracula, nord, gruvbox")]
+    theme: Option<String>,
 }
 
 struct Unavailable { reason: &'static str }
@@ -113,6 +117,14 @@ fn exit_code(report: &runner::Report) -> i32 {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    let resolved_theme = match theme::resolve_theme(cli.theme.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
 
     // Guard: --tui and --json are mutually exclusive.
     if cli.tui && cli.json {
@@ -466,7 +478,7 @@ async fn main() {
             refresh_interval: config.output.tui_refresh,
             layer_names: LAYER_ORDER.to_vec(),
         };
-        let ctx = tui::TuiContext { mode };
+        let ctx = tui::TuiContext { mode, theme: resolved_theme };
 
         let trigger_refresh: Box<dyn Fn() + Send> = Box::new(move || {
             let _ = refresh_tx.try_send(());

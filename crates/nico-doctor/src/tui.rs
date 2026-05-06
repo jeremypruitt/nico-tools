@@ -6,7 +6,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     symbols,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -17,10 +17,12 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use nico_common::output::{OutputMode, Status};
+use nico_common::theme::Theme;
 use crate::layer::LayerResult;
 
 pub struct TuiContext {
     pub mode: OutputMode,
+    pub theme: Theme,
 }
 
 pub struct TuiConfig {
@@ -226,12 +228,12 @@ fn event_loop<B: ratatui::backend::Backend>(
                         trigger_refresh();
                     }
                     KeyCode::Char('R') => {
-                        if let Some(row) = state.selected_layer() {
-                            if !row.fetching {
-                                let name = row.name.clone();
-                                if state.start_layer_run(&name) {
-                                    trigger_layer_refresh(name);
-                                }
+                        if let Some(row) = state.selected_layer()
+                            && !row.fetching
+                        {
+                            let name = row.name.clone();
+                            if state.start_layer_run(&name) {
+                                trigger_layer_refresh(name);
                             }
                         }
                     }
@@ -274,13 +276,14 @@ fn make_block(title: &str, ascii: bool) -> Block<'_> {
     if ascii { b.border_set(ASCII_BORDER) } else { b }
 }
 
-fn status_color(status: &Status, use_color: bool) -> Style {
-    if !use_color { return Style::default(); }
+fn status_color(status: &Status, ctx: &TuiContext) -> Style {
+    if !ctx.mode.color { return Style::default(); }
+    let t = &ctx.theme;
     match status {
-        Status::Ok => Style::default().fg(Color::Green),
-        Status::Warn => Style::default().fg(Color::Yellow),
-        Status::Fail => Style::default().fg(Color::Red),
-        Status::Unknown | Status::Skipped => Style::default().fg(Color::DarkGray),
+        Status::Ok => Style::default().fg(t.ok),
+        Status::Warn => Style::default().fg(t.warn),
+        Status::Fail => Style::default().fg(t.error),
+        Status::Unknown | Status::Skipped => Style::default().fg(t.muted),
     }
 }
 
@@ -338,7 +341,7 @@ fn render_layers(
         let (icon, style) = if row.fetching {
             let fetch = if ascii { "~" } else { "⟳" };
             let s = if use_color {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(ctx.theme.warn)
             } else {
                 Style::default()
             };
@@ -347,12 +350,13 @@ fn render_layers(
             match &row.result {
                 Some(r) => {
                     let icon_str = r.status.icon(mode).to_string();
-                    let s = status_color(&r.status, use_color);
+                    let s = status_color(&r.status, ctx);
                     (icon_str, s)
                 }
                 None => {
                     let skip = if ascii { "." } else { "·" };
-                    (skip.to_string(), Style::default().fg(Color::DarkGray))
+                    let s = if use_color { Style::default().fg(ctx.theme.muted) } else { Style::default() };
+                    (skip.to_string(), s)
                 }
             }
         };
@@ -372,7 +376,6 @@ fn render_layers(
 
 fn render_findings(frame: &mut Frame, ctx: &TuiContext, state: &DashState, area: Rect) {
     let ascii = ctx.mode.ascii;
-    let use_color = ctx.mode.color;
     let mode = &ctx.mode;
 
     let block = make_block(" Findings ", ascii);
@@ -406,7 +409,7 @@ fn render_findings(frame: &mut Frame, ctx: &TuiContext, state: &DashState, area:
                 Some(result) => {
                     let lines: Vec<Line> = result.checks.iter().map(|check| {
                         let icon = check.status.icon(mode);
-                        let style = status_color(&check.status, use_color);
+                        let style = status_color(&check.status, ctx);
                         Line::from(vec![
                             Span::styled(format!("{icon} "), style),
                             Span::raw(format!("{}: {}", check.name, check.value)),
@@ -422,7 +425,6 @@ fn render_findings(frame: &mut Frame, ctx: &TuiContext, state: &DashState, area:
 
 fn render_detail_overlay(frame: &mut Frame, ctx: &TuiContext, state: &DashState, area: Rect) {
     let ascii = ctx.mode.ascii;
-    let use_color = ctx.mode.color;
     let mode = &ctx.mode;
 
     let title = " Findings  \u{2014}  q / Esc to close ";
@@ -458,14 +460,14 @@ fn render_detail_overlay(frame: &mut Frame, ctx: &TuiContext, state: &DashState,
                             Span::styled("status: ", dim),
                             Span::styled(
                                 result.status.icon(mode).to_string(),
-                                status_color(&result.status, use_color),
+                                status_color(&result.status, ctx),
                             ),
                         ]),
                         Line::from(""),
                     ];
                     for check in &result.checks {
                         let icon = check.status.icon(mode);
-                        let style = status_color(&check.status, use_color);
+                        let style = status_color(&check.status, ctx);
                         lines.push(Line::from(vec![
                             Span::styled(format!("{icon} "), style),
                             Span::raw(format!("{}: {}", check.name, check.value)),
@@ -532,7 +534,7 @@ fn render_bottom_bar(frame: &mut Frame, ctx: &TuiContext, state: &DashState, are
     // Right: key hints; running indicator when checks are in-flight
     let hint_line: Line = if state.running {
         let running_style = if use_color {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default().fg(ctx.theme.warn).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -601,7 +603,7 @@ mod tests {
     }
 
     fn test_ctx() -> TuiContext {
-        TuiContext { mode: OutputMode { color: false, ascii: false } }
+        TuiContext { mode: OutputMode { color: false, ascii: false }, theme: nico_common::theme::DEFAULT }
     }
 
     fn ok_result(name: &'static str) -> LayerResult {
@@ -744,7 +746,7 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = test_config();
-        let ctx = TuiContext { mode: OutputMode { color: false, ascii: true } };
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: true }, theme: nico_common::theme::DEFAULT };
         let mut state = DashState::new(&config);
 
         terminal.draw(|f| render(f, &ctx, &mut state)).unwrap();
@@ -925,5 +927,58 @@ mod tests {
         assert!(!state.layers.iter().find(|r| r.name == "logs").unwrap().fetching,
             "logs should stop fetching after LayerDone");
         assert!(!state.running, "full running flag should remain false");
+    }
+
+    // ─── Issue #97: theme wiring ──────────────────────────────────────────────
+
+    #[test]
+    fn status_color_ok_uses_theme_ok_rgb() {
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::DRACULA,
+        };
+        let style = status_color(&Status::Ok, &ctx);
+        assert_eq!(style, Style::default().fg(nico_common::theme::DRACULA.ok));
+    }
+
+    #[test]
+    fn status_color_fail_uses_theme_error_rgb() {
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::DRACULA,
+        };
+        let style = status_color(&Status::Fail, &ctx);
+        assert_eq!(style, Style::default().fg(nico_common::theme::DRACULA.error));
+    }
+
+    #[test]
+    fn status_color_warn_uses_theme_warn_rgb() {
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::NORD,
+        };
+        let style = status_color(&Status::Warn, &ctx);
+        assert_eq!(style, Style::default().fg(nico_common::theme::NORD.warn));
+    }
+
+    #[test]
+    fn status_color_skipped_uses_theme_muted_rgb() {
+        let ctx = TuiContext {
+            mode: OutputMode { color: true, ascii: false },
+            theme: nico_common::theme::NORD,
+        };
+        let style = status_color(&Status::Skipped, &ctx);
+        assert_eq!(style, Style::default().fg(nico_common::theme::NORD.muted));
+    }
+
+    #[test]
+    fn status_color_returns_default_when_color_disabled_regardless_of_theme() {
+        let ctx = TuiContext {
+            mode: OutputMode { color: false, ascii: false },
+            theme: nico_common::theme::DRACULA,
+        };
+        assert_eq!(status_color(&Status::Ok, &ctx), Style::default());
+        assert_eq!(status_color(&Status::Fail, &ctx), Style::default());
+        assert_eq!(status_color(&Status::Warn, &ctx), Style::default());
     }
 }
