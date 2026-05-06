@@ -435,6 +435,7 @@ async fn main() {
     if cli.tui {
         let layers: std::sync::Arc<Vec<Box<dyn layer::Layer>>> = std::sync::Arc::new(layers);
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (layer_refresh_tx, mut layer_refresh_rx) = tokio::sync::mpsc::channel::<String>(4);
         let (result_tx, result_rx) = std::sync::mpsc::channel::<tui::TuiUpdate>();
 
         let namespace = config.cluster.namespace.clone();
@@ -442,10 +443,21 @@ async fn main() {
         tokio::spawn({
             let layers = layers.clone();
             let result_tx = result_tx.clone();
+            let namespace = namespace.clone();
             async move {
                 run_layers_tui(layers.clone(), namespace.clone(), since, timeout, result_tx.clone()).await;
                 while refresh_rx.recv().await.is_some() {
                     run_layers_tui(layers.clone(), namespace.clone(), since, timeout, result_tx.clone()).await;
+                }
+            }
+        });
+
+        tokio::spawn({
+            let layers = layers.clone();
+            let result_tx = result_tx.clone();
+            async move {
+                while let Some(name) = layer_refresh_rx.recv().await {
+                    run_single_layer_tui(&name, layers.clone(), namespace.clone(), since, timeout, result_tx.clone()).await;
                 }
             }
         });
@@ -459,9 +471,12 @@ async fn main() {
         let trigger_refresh: Box<dyn Fn() + Send> = Box::new(move || {
             let _ = refresh_tx.try_send(());
         });
+        let trigger_layer_refresh: Box<dyn Fn(String) + Send> = Box::new(move |name| {
+            let _ = layer_refresh_tx.try_send(name);
+        });
 
         let tui_exit = tokio::task::block_in_place(|| {
-            tui::run_tui(tui_cfg, result_rx, ctx, trigger_refresh)
+            tui::run_tui(tui_cfg, result_rx, ctx, trigger_refresh, trigger_layer_refresh)
         });
 
         drop(_pf_guards);
@@ -491,6 +506,31 @@ async fn main() {
     }
 
     process::exit(code);
+}
+
+async fn run_single_layer_tui(
+    name: &str,
+    layers: std::sync::Arc<Vec<Box<dyn layer::Layer>>>,
+    namespace: String,
+    since: Duration,
+    timeout: Duration,
+    tx: std::sync::mpsc::Sender<tui::TuiUpdate>,
+) {
+    use nico_common::output::Status;
+    let opts = layer::RunOpts { namespace, since, timeout };
+    if let Some(layer) = layers.iter().find(|l| l.name() == name) {
+        let result = match tokio::time::timeout(opts.timeout, layer.run(&opts)).await {
+            Ok(r) => r,
+            Err(_) => layer::LayerResult {
+                name: layer.name(),
+                status: Status::Unknown,
+                checks: vec![],
+                duration_ms: opts.timeout.as_millis() as u64,
+            },
+        };
+        let layer_name = result.name.to_string();
+        let _ = tx.send(tui::TuiUpdate::LayerDone { name: layer_name, result });
+    }
 }
 
 async fn run_layers_tui(

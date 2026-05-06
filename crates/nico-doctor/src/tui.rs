@@ -105,6 +105,16 @@ impl DashState {
         }
     }
 
+    /// Mark a single layer as fetching without affecting the full-run state.
+    /// Returns `true` if the refresh was started, `false` if it was a noop
+    /// (layer not found or already fetching).
+    fn start_layer_run(&mut self, name: &str) -> bool {
+        match self.layers.iter_mut().find(|r| r.name == name) {
+            Some(row) if !row.fetching => { row.fetching = true; true }
+            _ => false,
+        }
+    }
+
     fn selected_layer(&self) -> Option<&LayerRow> {
         self.list_state.selected().and_then(|i| self.layers.get(i))
     }
@@ -149,6 +159,7 @@ pub fn run_tui(
     rx: mpsc::Receiver<TuiUpdate>,
     ctx: TuiContext,
     trigger_refresh: Box<dyn Fn() + Send>,
+    trigger_layer_refresh: Box<dyn Fn(String) + Send>,
 ) -> i32 {
     let mut stdout = io::stdout();
     enable_raw_mode().expect("enable raw mode");
@@ -158,7 +169,7 @@ pub fn run_tui(
     let mut terminal = Terminal::new(backend).expect("create terminal");
     let mut state = DashState::new(&config);
 
-    let code = event_loop(&mut terminal, &ctx, &mut state, rx, &trigger_refresh);
+    let code = event_loop(&mut terminal, &ctx, &mut state, rx, &trigger_refresh, &trigger_layer_refresh);
 
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
@@ -173,6 +184,7 @@ fn event_loop<B: ratatui::backend::Backend>(
     state: &mut DashState,
     rx: mpsc::Receiver<TuiUpdate>,
     trigger_refresh: &dyn Fn(),
+    trigger_layer_refresh: &dyn Fn(String),
 ) -> i32 {
     loop {
         terminal.draw(|f| render(f, ctx, state)).expect("draw");
@@ -212,6 +224,16 @@ fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::Char('r') if !state.running => {
                         state.start_new_run();
                         trigger_refresh();
+                    }
+                    KeyCode::Char('R') => {
+                        if let Some(row) = state.selected_layer() {
+                            if !row.fetching {
+                                let name = row.name.clone();
+                                if state.start_layer_run(&name) {
+                                    trigger_layer_refresh(name);
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -479,7 +501,7 @@ fn render_bottom_bar(frame: &mut Frame, ctx: &TuiContext, state: &DashState, are
         .constraints([
             Constraint::Fill(1),
             Constraint::Fill(1),
-            Constraint::Length(22),
+            Constraint::Length(46),
         ])
         .split(inner);
 
@@ -519,7 +541,7 @@ fn render_bottom_bar(frame: &mut Frame, ctx: &TuiContext, state: &DashState, are
             Span::raw("  q:quit"),
         ])
     } else {
-        Line::from("?:help  r:refresh  q:quit")
+        Line::from("?:help  r:refresh  R:refresh-layer  q:quit")
     };
     frame.render_widget(
         Paragraph::new(hint_line).alignment(Alignment::Right),
@@ -535,7 +557,7 @@ fn center_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 fn render_help_overlay(frame: &mut Frame, ctx: &TuiContext, area: Rect) {
     let ascii = ctx.mode.ascii;
-    let overlay_rect = center_rect(62, 14, area);
+    let overlay_rect = center_rect(62, 15, area);
 
     frame.render_widget(Clear, overlay_rect);
 
@@ -548,6 +570,7 @@ fn render_help_overlay(frame: &mut Frame, ctx: &TuiContext, area: Rect) {
         ("\u{2191} / \u{2193}", "Move layer selection"),
         ("Enter",        "Open full-screen Findings overlay"),
         ("r",            "Force immediate refresh"),
+        ("R",            "Re-run focused layer only"),
         ("?",            "Toggle this help overlay"),
         ("Escape",       "Dismiss overlay"),
         ("q / Ctrl-C",   "Exit"),
@@ -810,5 +833,97 @@ mod tests {
         state.start_new_run();
         assert!(state.running);
         assert!(state.layers.iter().all(|r| r.fetching));
+    }
+
+    // ─── Issue #85: single-layer refresh (R key) ─────────────────────────────
+
+    #[test]
+    fn start_layer_run_marks_only_that_layer_fetching() {
+        let config = test_config();
+        let mut state = DashState::new(&config);
+        // complete the full run so all rows are idle
+        for name in &["cluster", "logs", "workflows", "health", "grpc", "postgres"] {
+            state.apply_layer_done(name, ok_result(name));
+        }
+        state.apply_run_complete();
+
+        state.start_layer_run("logs");
+
+        assert!(state.layers.iter().find(|r| r.name == "logs").unwrap().fetching,
+            "logs should be fetching after start_layer_run");
+        assert!(!state.layers.iter().find(|r| r.name == "cluster").unwrap().fetching,
+            "cluster should remain idle");
+        assert!(!state.running, "full running flag must stay false for single-layer refresh");
+    }
+
+    #[test]
+    fn start_layer_run_while_already_fetching_is_noop() {
+        let config = test_config();
+        let mut state = DashState::new(&config);
+        state.apply_run_complete();
+        // mark logs as already fetching
+        state.layers.iter_mut().find(|r| r.name == "logs").unwrap().fetching = true;
+
+        let noop_called = state.start_layer_run("logs");
+        assert!(!noop_called, "should return false (noop) when layer is already fetching");
+    }
+
+    #[test]
+    fn start_layer_run_unknown_name_is_noop() {
+        let config = test_config();
+        let mut state = DashState::new(&config);
+        state.apply_run_complete();
+
+        let noop_called = state.start_layer_run("nonexistent");
+        assert!(!noop_called, "should return false (noop) for unknown layer name");
+    }
+
+    #[test]
+    fn bottom_bar_shows_refresh_layer_hint_when_idle() {
+        let backend = TestBackend::new(160, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = test_config();
+        let ctx = test_ctx();
+        let mut state = DashState::new(&config);
+        state.apply_run_complete();
+
+        terminal.draw(|f| render(f, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let bar: String = (21..24).map(|y| row_str(&buf, y, 160)).collect::<Vec<_>>().join(" ");
+        assert!(bar.contains("R:refresh-layer"), "R:refresh-layer hint missing: {bar}");
+    }
+
+    #[test]
+    fn help_overlay_shows_r_refresh_layer_binding() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = test_config();
+        let ctx = test_ctx();
+        let mut state = DashState::new(&config);
+        state.help_open = true;
+
+        terminal.draw(|f| render(f, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let body: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("refresh-layer") || body.contains("Re-run focused"),
+            "R:refresh-layer binding missing from help overlay: {body}");
+    }
+
+    #[test]
+    fn layer_done_during_single_layer_refresh_clears_fetching() {
+        let config = test_config();
+        let mut state = DashState::new(&config);
+        state.apply_run_complete();
+        state.start_layer_run("logs");
+
+        assert!(state.layers.iter().find(|r| r.name == "logs").unwrap().fetching);
+
+        state.apply_layer_done("logs", ok_result("logs"));
+
+        assert!(!state.layers.iter().find(|r| r.name == "logs").unwrap().fetching,
+            "logs should stop fetching after LayerDone");
+        assert!(!state.running, "full running flag should remain false");
     }
 }
