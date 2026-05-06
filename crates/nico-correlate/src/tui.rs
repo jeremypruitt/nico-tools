@@ -826,11 +826,12 @@ fn render_help_overlay(frame: &mut Frame, ctx: &TuiContext, area: Rect) {
 
     frame.render_widget(Clear, overlay_rect);
 
-    let block = make_block(" Keybindings  \u{2014}  ? or Esc to close ", ascii);
+    let bg = Style::default().bg(Color::DarkGray);
+    let block = make_block(" Keybindings  \u{2014}  ? or Esc to close ", ascii).style(bg);
     let inner = block.inner(overlay_rect);
     frame.render_widget(block, overlay_rect);
 
-    let dim = Style::default().add_modifier(Modifier::DIM);
+    let dim = bg.add_modifier(Modifier::DIM);
     let rows: &[(&str, &str)] = &[
         ("\u{2191} / \u{2193}",      "Move selection"),
         ("PgUp / PgDn", "Fast scroll"),
@@ -850,7 +851,7 @@ fn render_help_overlay(frame: &mut Frame, ctx: &TuiContext, area: Rect) {
         ])
     }).collect();
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).style(bg), inner);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
