@@ -317,4 +317,33 @@ url = "postgres://prod:secret@db:5432/prod"
         env.insert("NICO_REACH_MODE".to_string(), "bogus".to_string());
         assert!(Config::load(None, &env, &ConfigOverrides::default()).is_err());
     }
+
+    #[test]
+    fn tui_refresh_from_file() {
+        let toml = "[output]\ntui_refresh = \"10s\"";
+        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.output.tui_refresh, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn tui_refresh_env_overrides_file() {
+        let toml = "[output]\ntui_refresh = \"10s\"";
+        let mut env = HashMap::new();
+        env.insert("NICO_TUI_REFRESH".to_string(), "20s".to_string());
+        let config = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.output.tui_refresh, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn tui_refresh_flag_overrides_env_and_file() {
+        let toml = "[output]\ntui_refresh = \"10s\"";
+        let mut env = HashMap::new();
+        env.insert("NICO_TUI_REFRESH".to_string(), "20s".to_string());
+        let overrides = ConfigOverrides {
+            tui_refresh: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let config = Config::load(Some(toml), &env, &overrides).unwrap();
+        assert_eq!(config.output.tui_refresh, Duration::from_secs(5));
+    }
 }
