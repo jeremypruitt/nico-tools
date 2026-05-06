@@ -1,5 +1,7 @@
 # nico-tools
 
+Repository: https://github.com/jeremypruitt/nico-tools
+
 ## Agent skills
 
 ### Issue tracker
