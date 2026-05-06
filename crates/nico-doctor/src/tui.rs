@@ -762,4 +762,53 @@ mod tests {
         state.next_refresh = Some(Instant::now() - Duration::from_secs(1));
         assert!(state.should_refresh());
     }
+
+    #[test]
+    fn help_overlay_shows_keybindings() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = test_config();
+        let ctx = test_ctx();
+        let mut state = DashState::new(&config);
+        state.help_open = true;
+
+        terminal.draw(|f| render(f, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let body: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("Keybindings"), "Keybindings header missing: {body}");
+        assert!(body.contains("r:refresh") || body.contains("Force immediate refresh"), "refresh hint missing: {body}");
+        assert!(body.contains("q / Ctrl-C") || body.contains("q:quit"), "quit hint missing: {body}");
+    }
+
+    #[test]
+    fn detail_overlay_renders_findings() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = test_config();
+        let ctx = test_ctx();
+        let mut state = DashState::new(&config);
+        state.apply_layer_done("cluster", ok_result("cluster"));
+        state.list_state.select(Some(0));
+        state.detail_open = true;
+
+        terminal.draw(|f| render(f, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let body: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("pods_ready"), "pods_ready check missing in detail overlay: {body}");
+        assert!(body.contains("Findings"), "Findings title missing in detail overlay: {body}");
+    }
+
+    #[test]
+    fn start_new_run_resets_fetching_state() {
+        let config = test_config();
+        let mut state = DashState::new(&config);
+        state.apply_layer_done("cluster", ok_result("cluster"));
+        state.apply_run_complete();
+        assert!(!state.running);
+        state.start_new_run();
+        assert!(state.running);
+        assert!(state.layers.iter().all(|r| r.fetching));
+    }
 }
