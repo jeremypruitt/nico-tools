@@ -31,7 +31,7 @@ impl Layer for LogsLayer {
     async fn run(&self, opts: &RunOpts) -> LayerResult {
         let start = Instant::now();
 
-        let (pod_errors, source_value, source_ok) =
+        let (pod_errors, source_label, source_ok) =
             match self.loki.query_errors(&opts.namespace, opts.since, LOG_LINE_LIMIT).await {
                 Ok(LokiQueryResult::Lines(lines)) => {
                     let errors: Vec<(String, String)> = lines.into_iter()
@@ -56,36 +56,7 @@ impl Layer for LogsLayer {
                 }
             };
 
-        let error_count = pod_errors.len();
-        let mut checks = vec![
-            Check {
-                name: "error_lines",
-                status: if error_count == 0 { Status::Ok } else { Status::Warn },
-                value: format!("{error_count} errors"),
-                next_command: None,
-            },
-            Check {
-                name: "source",
-                status: if source_ok { Status::Ok } else { Status::Warn },
-                value: source_value,
-                next_command: None,
-            },
-        ];
-
-        for (pod, line) in pod_errors {
-            let excerpt = if line.len() > 80 {
-                format!("{}…", &line[..79])
-            } else {
-                line.clone()
-            };
-            checks.push(Check {
-                name: "pod_error",
-                status: Status::Warn,
-                value: format!("{pod}: {excerpt}"),
-                next_command: Some(format!("kubectl logs {pod} -n {}", opts.namespace)),
-            });
-        }
-
+        let checks = checks_from(&pod_errors, &source_label, source_ok, &opts.namespace);
         let overall = aggregate_status(&checks);
 
         LayerResult {
@@ -95,6 +66,45 @@ impl Layer for LogsLayer {
             duration_ms: start.elapsed().as_millis() as u64,
         }
     }
+}
+
+fn checks_from(
+    pod_errors: &[(String, String)],
+    source_label: &str,
+    source_ok: bool,
+    namespace: &str,
+) -> Vec<Check> {
+    let error_count = pod_errors.len();
+    let mut checks = vec![
+        Check {
+            name: "error_lines",
+            status: if error_count == 0 { Status::Ok } else { Status::Warn },
+            value: format!("{error_count} errors"),
+            next_command: None,
+        },
+        Check {
+            name: "source",
+            status: if source_ok { Status::Ok } else { Status::Warn },
+            value: source_label.to_string(),
+            next_command: None,
+        },
+    ];
+
+    for (pod, line) in pod_errors {
+        let excerpt = if line.len() > 80 {
+            format!("{}…", &line[..79])
+        } else {
+            line.clone()
+        };
+        checks.push(Check {
+            name: "pod_error",
+            status: Status::Warn,
+            value: format!("{pod}: {excerpt}"),
+            next_command: Some(format!("kubectl logs {pod} -n {namespace}")),
+        });
+    }
+
+    checks
 }
 
 #[cfg(test)]
@@ -206,6 +216,35 @@ mod tests {
         let pod_errors: Vec<_> = result.checks.iter().filter(|c| c.name == "pod_error").collect();
         assert_eq!(pod_errors.len(), 1);
         assert!(pod_errors[0].value.contains("PANIC"));
+    }
+
+    #[test]
+    fn checks_from_no_errors_reports_ok() {
+        let checks = checks_from(&[], "loki", true, "nico");
+        assert_eq!(aggregate_status(&checks), Status::Ok);
+        assert_eq!(checks.iter().filter(|c| c.name == "pod_error").count(), 0);
+    }
+
+    #[test]
+    fn checks_from_errors_present_reports_warn_with_one_pod_error_per_entry() {
+        let pod_errors = vec![
+            ("core-abc".to_string(), "ERROR: disk full".to_string()),
+            ("rest-xyz".to_string(), "FATAL: oom".to_string()),
+        ];
+        let checks = checks_from(&pod_errors, "loki", true, "nico");
+
+        assert_eq!(aggregate_status(&checks), Status::Warn);
+        assert_eq!(checks.iter().filter(|c| c.name == "pod_error").count(), 2);
+        let err_check = checks.iter().find(|c| c.name == "error_lines").unwrap();
+        assert_eq!(err_check.status, Status::Warn);
+    }
+
+    #[test]
+    fn checks_from_source_unavailable_marks_source_warn() {
+        let checks = checks_from(&[], "k8s (loki unavailable)", false, "nico");
+        let src = checks.iter().find(|c| c.name == "source").unwrap();
+        assert_eq!(src.status, Status::Warn);
+        assert_eq!(checks.iter().filter(|c| c.name == "source").count(), 1);
     }
 
     #[tokio::test]
