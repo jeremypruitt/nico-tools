@@ -26,8 +26,8 @@ Introduce a `Theme` struct in nico-common with 7 semantic color roles, each defi
 | `warn` | warning, fetching, PAUSED indicator |
 | `error` | failure, errored source |
 | `muted` | unknown, skipped, unavailable, dimmed hint text |
-| `overlay_bg` | background of help and detail popups |
-| `overlay_fg` | primary text inside popups |
+| `overlay_bg` | background of help and detail popups, and of TUI chrome surfaces (header/footer) |
+| `overlay_fg` | primary text inside popups, and on TUI chrome surfaces |
 | `overlay_key` | keybinding labels in help popup |
 
 ### Built-in themes
@@ -85,3 +85,5 @@ Invalid theme name → hard fail at startup with an error message listing all va
 
 - ADR-004: Color semantics (plain-text output color roles)
 - ADR-007: Optional TUI (ratatui decision)
+- ADR-009: TUI visual chrome — clarifies that `overlay_bg`/`overlay_fg`
+  are the chrome-surface roles, in addition to popup roles.
