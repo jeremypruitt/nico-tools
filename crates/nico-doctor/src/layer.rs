@@ -28,6 +28,58 @@ pub trait Layer: Send + Sync {
     async fn run(&self, opts: &RunOpts) -> LayerResult;
 }
 
+/// Returns the worst-case status across a slice of checks.
+/// Priority order: Fail > Warn > Unknown > Ok. Empty slice returns Ok.
+pub fn aggregate_status(checks: &[Check]) -> Status {
+    if checks.iter().any(|c| c.status == Status::Fail) {
+        Status::Fail
+    } else if checks.iter().any(|c| c.status == Status::Warn) {
+        Status::Warn
+    } else if checks.iter().any(|c| c.status == Status::Unknown) {
+        Status::Unknown
+    } else {
+        Status::Ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(status: Status) -> Check {
+        Check { name: "x", status, value: String::new(), next_command: None }
+    }
+
+    #[test]
+    fn empty_slice_is_ok() {
+        assert_eq!(aggregate_status(&[]), Status::Ok);
+    }
+
+    #[test]
+    fn all_green_is_ok() {
+        let checks = vec![check(Status::Ok), check(Status::Ok)];
+        assert_eq!(aggregate_status(&checks), Status::Ok);
+    }
+
+    #[test]
+    fn one_warning_is_warning() {
+        let checks = vec![check(Status::Ok), check(Status::Warn)];
+        assert_eq!(aggregate_status(&checks), Status::Warn);
+    }
+
+    #[test]
+    fn one_critical_is_critical() {
+        let checks = vec![check(Status::Ok), check(Status::Warn), check(Status::Fail)];
+        assert_eq!(aggregate_status(&checks), Status::Fail);
+    }
+
+    #[test]
+    fn unknown_beats_ok_but_not_warn() {
+        assert_eq!(aggregate_status(&[check(Status::Unknown)]), Status::Unknown);
+        assert_eq!(aggregate_status(&[check(Status::Warn), check(Status::Unknown)]), Status::Warn);
+    }
+}
+
 pub struct SkippedLayer {
     name: &'static str,
 }

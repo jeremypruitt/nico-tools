@@ -3,7 +3,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::k8s::K8sClient;
-use crate::layer::{Check, Layer, LayerResult, RunOpts};
+use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
 
 pub struct ClusterLayer {
     k8s: Arc<dyn K8sClient>,
@@ -75,13 +75,7 @@ impl Layer for ClusterLayer {
             },
         ];
 
-        let overall = if checks.iter().any(|c| c.status == Status::Fail) {
-            Status::Fail
-        } else if checks.iter().any(|c| c.status == Status::Warn) {
-            Status::Warn
-        } else {
-            Status::Ok
-        };
+        let overall = aggregate_status(&checks);
 
         LayerResult {
             name: "cluster",

@@ -3,7 +3,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::http::{HttpClient, ServiceEndpoint};
-use crate::layer::{Check, Layer, LayerResult, RunOpts};
+use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
 
 pub struct HealthLayer {
     client: Arc<dyn HttpClient>,
@@ -87,13 +87,7 @@ impl Layer for HealthLayer {
         }];
         checks.extend(findings);
 
-        let overall = if checks.iter().any(|c| c.status == Status::Fail) {
-            Status::Fail
-        } else if checks.iter().any(|c| c.status == Status::Warn) {
-            Status::Warn
-        } else {
-            Status::Ok
-        };
+        let overall = aggregate_status(&checks);
 
         LayerResult {
             name: "health",
