@@ -735,19 +735,23 @@ fn render_status_bar(
     let ascii = ctx.mode.ascii;
     let use_color = ctx.mode.color;
 
+    let bar_bg = if use_color { Color::DarkGray } else { Color::Reset };
+    let bar_style = Style::default().bg(bar_bg);
+
     let border_block = {
-        let b = Block::default().borders(Borders::ALL);
+        let b = Block::default().borders(Borders::ALL).style(bar_style);
         if ascii { b.border_set(ASCII_BORDER) } else { b }
     };
     let inner = border_block.inner(area);
     frame.render_widget(border_block, area);
 
+    // "Esc:clear  q:quit" is 17 chars — the longest hint string.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Fill(1),
             Constraint::Fill(2),
-            Constraint::Length(14),
+            Constraint::Length(18),
         ])
         .split(inner);
 
@@ -757,7 +761,7 @@ fn render_status_bar(
     } else {
         config.id.clone()
     };
-    frame.render_widget(Paragraph::new(left), cols[0]);
+    frame.render_widget(Paragraph::new(left).style(bar_style), cols[0]);
 
     // Centre: per-source state indicators
     let fetch_dot = if ascii { "~" } else { "\u{27F3}" };
@@ -776,13 +780,13 @@ fn render_status_bar(
         };
         let text = format!("{dot}{src} ");
         let s: Span = if use_color {
-            Span::styled(text, Style::default().fg(color))
+            Span::styled(text, Style::default().fg(color).bg(bar_bg))
         } else {
             Span::raw(text)
         };
         std::iter::once(s)
     }).collect();
-    frame.render_widget(Paragraph::new(Line::from(spans)), cols[1]);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), cols[1]);
 
     // Right: FOLLOW/PAUSED indicator in tail mode, otherwise standard quit hint.
     // Filter-active hint always wins over tail indicator.
@@ -796,7 +800,7 @@ fn render_status_bar(
         };
         if use_color {
             Line::from(vec![
-                Span::styled(indicator, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(indicator, Style::default().fg(color).bg(bar_bg).add_modifier(Modifier::BOLD)),
                 Span::raw("  q:quit"),
             ])
         } else {
@@ -806,7 +810,7 @@ fn render_status_bar(
         Line::from("?:help  q:quit")
     };
     frame.render_widget(
-        Paragraph::new(hint_line).alignment(Alignment::Right),
+        Paragraph::new(hint_line).style(bar_style).alignment(Alignment::Right),
         cols[2],
     );
 }
@@ -1032,6 +1036,53 @@ mod tests {
         let bar = row_str(&buf, 22, 120);
         assert!(bar.contains("temporal"), "Expected 'temporal' in status bar: {bar}");
         assert!(bar.contains("postgres"), "Expected 'postgres' in status bar: {bar}");
+    }
+
+    #[test]
+    fn status_bar_has_uniform_background_in_color_mode() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: true, ascii: false } };
+        let mut state = sample_state(&config);
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        // Row 22 is the inner status bar (borders at 21 and 23). x=0 and x=119 are border cells.
+        let cells_with_reset_bg: Vec<u16> = (1..119)
+            .filter(|&x| {
+                buf.cell((x, 22))
+                    .map(|c| c.bg == Color::Reset)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            cells_with_reset_bg.is_empty(),
+            "Status bar inner cells have transparent background at x positions: {cells_with_reset_bg:?}"
+        );
+    }
+
+    #[test]
+    fn status_bar_filter_hint_not_truncated_on_80_col() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (config, mut state) = three_event_state();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        state.filter_active = true;
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 80)).collect::<Vec<_>>().join("\n");
+        assert!(
+            all_rows.contains("Esc:clear"),
+            "Esc:clear hint should be visible on 80-col terminal: {all_rows}"
+        );
+        assert!(
+            all_rows.contains("q:quit"),
+            "q:quit should be visible on 80-col terminal: {all_rows}"
+        );
     }
 
     // ─── Incremental loading / placeholder ───────────────────────────────────
