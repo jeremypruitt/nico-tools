@@ -38,3 +38,6 @@ explicitly rather than silently overriding.
 | [0004](0004-color-semantics.md) | Color is semantic, not decorative | Accepted |
 | [0005](0005-reach-mode-autodetect.md) | Reach mode — auto-detect port-forward vs. in-cluster | Accepted |
 | [0006](0006-concurrency-discipline.md) | Concurrency — bounded parallelism, layered timeouts | Accepted |
+| [0007](0007-optional-tui.md) | Optional TUI — ratatui-based interactive timeline view | Accepted |
+| [0008](0008-tui-theme-system.md) | TUI theme system | Accepted |
+| [0009](0009-tui-visual-chrome.md) | TUI visual chrome — exception to the semantic-only color rule | Accepted |

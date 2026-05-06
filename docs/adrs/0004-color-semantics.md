@@ -68,3 +68,7 @@ Status icons (Unicode, with ASCII fallback under `--ascii`):
 ## Related
 
 - ADR-003 (output format) — color is part of the human format only.
+- ADR-009 (TUI visual chrome) — carves out a narrow TUI-only exception
+  permitting chrome surfaces, logomarks, functional animation, and
+  structural iconography. The semantic-color rule above remains in force
+  for CLI output and for data rows everywhere.
