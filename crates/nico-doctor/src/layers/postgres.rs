@@ -3,7 +3,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::postgres::PostgresClient;
-use crate::layer::{Check, Layer, LayerResult, RunOpts};
+use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
 
 const POOL_WARN_RATIO: f64 = 0.90;
 const LOCK_WARN_SECS: f64 = 5.0;
@@ -106,15 +106,7 @@ impl Layer for PostgresLayer {
             }
         }
 
-        let overall = if checks.iter().any(|c| c.status == Status::Fail) {
-            Status::Fail
-        } else if checks.iter().any(|c| c.status == Status::Warn) {
-            Status::Warn
-        } else if checks.iter().any(|c| c.status == Status::Unknown) {
-            Status::Unknown
-        } else {
-            Status::Ok
-        };
+        let overall = aggregate_status(&checks);
 
         LayerResult {
             name: "postgres",
