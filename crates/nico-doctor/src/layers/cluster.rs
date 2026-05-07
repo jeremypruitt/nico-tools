@@ -112,6 +112,21 @@ fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) 
         });
     }
 
+    for p in pods.iter().filter(|p| !p.ready && !p.succeeded) {
+        let phase = p.phase.as_deref().unwrap_or("Unknown");
+        let mut value = format!("{}: {}", p.name, phase);
+        if p.crash_loop {
+            value.push_str(" (CrashLoopBackOff)");
+        }
+        checks.push(Check {
+            name: "pod_not_ready",
+            status: Status::Warn,
+            value,
+            next_command: Some(format!("kubectl describe pod {} -n {namespace}", p.name)),
+            kind: CheckKind::Detail,
+        });
+    }
+
     checks
 }
 
@@ -132,6 +147,18 @@ mod tests {
             restart_count,
             succeeded,
             crash_loop: false,
+        }
+    }
+
+    fn pod_with_phase(name: &str, ready: bool, phase: &str, crash_loop: bool) -> RawPod {
+        RawPod {
+            name: name.into(),
+            namespace: "nico".into(),
+            phase: Some(phase.into()),
+            ready,
+            restart_count: 0,
+            succeeded: false,
+            crash_loop,
         }
     }
 
@@ -334,6 +361,103 @@ mod tests {
             pr.next_command.as_deref(),
             Some("kubectl describe pod core-abc -n nico"),
         );
+    }
+
+    #[test]
+    fn checks_from_single_not_ready_pod_emits_one_pod_not_ready_detail() {
+        let p1 = pod_with_phase("core-abc", false, "Pending", false);
+        let pods = vec![&p1];
+        let events: Vec<&RawEvent> = vec![];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let details: Vec<_> = checks.iter().filter(|c| c.name == "pod_not_ready").collect();
+        assert_eq!(details.len(), 1);
+        let pnr = details[0];
+        assert_eq!(pnr.kind, CheckKind::Detail);
+        assert_eq!(pnr.status, Status::Warn);
+        assert_eq!(pnr.value, "core-abc: Pending");
+        assert_eq!(
+            pnr.next_command.as_deref(),
+            Some("kubectl describe pod core-abc -n nico"),
+        );
+    }
+
+    #[test]
+    fn checks_from_crash_loop_pod_appends_crashloopbackoff_suffix() {
+        let p1 = pod_with_phase("core-abc", false, "Running", true);
+        let pods = vec![&p1];
+        let events: Vec<&RawEvent> = vec![];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let pnr = checks
+            .iter()
+            .find(|c| c.name == "pod_not_ready")
+            .expect("pod_not_ready check");
+        assert_eq!(pnr.value, "core-abc: Running (CrashLoopBackOff)");
+    }
+
+    #[test]
+    fn checks_from_succeeded_pod_emits_no_pod_not_ready_check() {
+        let p1 = RawPod {
+            name: "migrate-job-xyz".into(),
+            namespace: "nico".into(),
+            phase: Some("Succeeded".into()),
+            ready: false,
+            restart_count: 0,
+            succeeded: true,
+            crash_loop: false,
+        };
+        let pods = vec![&p1];
+        let events: Vec<&RawEvent> = vec![];
+        let checks = checks_from(&pods, &events, "nico");
+
+        assert_eq!(checks.iter().filter(|c| c.name == "pod_not_ready").count(), 0);
+    }
+
+    #[test]
+    fn checks_from_all_ready_cluster_emits_no_pod_not_ready_checks() {
+        let p1 = pod("core-abc", true, 0, false);
+        let p2 = pod("rest-xyz", true, 0, false);
+        let pods = vec![&p1, &p2];
+        let events: Vec<&RawEvent> = vec![];
+        let checks = checks_from(&pods, &events, "nico");
+
+        assert_eq!(checks.iter().filter(|c| c.name == "pod_not_ready").count(), 0);
+        let pods_ready = checks
+            .iter()
+            .find(|c| c.name == "pods_ready")
+            .expect("pods_ready");
+        assert_eq!(pods_ready.value, "2/2");
+        assert_eq!(pods_ready.kind, CheckKind::Headline);
+    }
+
+    #[test]
+    fn checks_from_mixed_cluster_emits_one_pod_not_ready_per_non_ready_pod() {
+        let p1 = pod_with_phase("core-abc", true, "Running", false);
+        let p2 = pod_with_phase("rest-xyz", false, "Pending", false);
+        let p3 = pod_with_phase("workflow-svc", false, "Running", true);
+        let pods = vec![&p1, &p2, &p3];
+        let events: Vec<&RawEvent> = vec![];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let details: Vec<_> = checks.iter().filter(|c| c.name == "pod_not_ready").collect();
+        assert_eq!(details.len(), 2);
+        assert!(details.iter().all(|c| c.kind == CheckKind::Detail));
+        assert!(details.iter().all(|c| c.status == Status::Warn));
+
+        let values: Vec<_> = details.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"rest-xyz: Pending"));
+        assert!(values.contains(&"workflow-svc: Running (CrashLoopBackOff)"));
+
+        let cmds: Vec<_> = details.iter().filter_map(|c| c.next_command.as_deref()).collect();
+        assert!(cmds.contains(&"kubectl describe pod rest-xyz -n nico"));
+        assert!(cmds.contains(&"kubectl describe pod workflow-svc -n nico"));
+
+        let pods_ready = checks
+            .iter()
+            .find(|c| c.name == "pods_ready")
+            .expect("pods_ready");
+        assert_eq!(pods_ready.value, "1/3");
     }
 
     #[tokio::test]
