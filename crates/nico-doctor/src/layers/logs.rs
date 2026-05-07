@@ -53,21 +53,34 @@ fn checks_from(
         },
     ];
 
-    for (pod, line) in pod_errors {
-        let excerpt = if line.len() > 80 {
-            format!("{}…", &line[..79])
+    for (pod, count, recent) in group_by_pod(pod_errors) {
+        let excerpt = if recent.len() > 80 {
+            format!("{}…", &recent[..79])
         } else {
-            line.clone()
+            recent.to_string()
         };
         checks.push(Check {
             name: "pod_error",
             status: Status::Warn,
-            value: format!("{pod}: {excerpt}"),
+            value: format!("{pod}: {count} errors — {excerpt}"),
             next_command: Some(format!("kubectl logs {pod} -n {namespace}")),
         });
     }
 
     checks
+}
+
+fn group_by_pod(pod_errors: &[(String, String)]) -> Vec<(&str, usize, &str)> {
+    let mut grouped: Vec<(&str, usize, &str)> = Vec::new();
+    for (pod, line) in pod_errors {
+        if let Some(slot) = grouped.iter_mut().find(|(p, _, _)| *p == pod.as_str()) {
+            slot.1 += 1;
+            slot.2 = line.as_str();
+        } else {
+            grouped.push((pod.as_str(), 1, line.as_str()));
+        }
+    }
+    grouped
 }
 
 #[cfg(test)]
@@ -131,6 +144,72 @@ mod tests {
         assert_eq!(checks.iter().filter(|c| c.name == "pod_error").count(), 2);
         let err_check = checks.iter().find(|c| c.name == "error_lines").unwrap();
         assert_eq!(err_check.status, Status::Warn);
+    }
+
+    #[test]
+    fn error_lines_headline_counts_raw_entries_not_collapsed_pods() {
+        let pod_errors: Vec<(String, String)> = (0..7)
+            .map(|i| ("noisy-pod".to_string(), format!("ERROR {i}")))
+            .collect();
+        let checks = checks_from(&pod_errors, "loki", true, "nico");
+
+        let err_check = checks.iter().find(|c| c.name == "error_lines").unwrap();
+        assert_eq!(err_check.value, "7 errors");
+        assert_eq!(checks.iter().filter(|c| c.name == "pod_error").count(), 1);
+    }
+
+    #[test]
+    fn checks_from_truncates_sample_line_to_80_chars_with_ellipsis() {
+        let long_line = format!("ERROR: {}", "x".repeat(200));
+        let pod_errors = vec![("noisy-pod".to_string(), long_line)];
+        let checks = checks_from(&pod_errors, "loki", true, "nico");
+
+        let pe = checks.iter().find(|c| c.name == "pod_error").unwrap();
+        let sample = pe.value.split(" — ").nth(1).expect("value has sample after em-dash");
+        assert!(sample.ends_with('…'), "sample should be ellipsised: {sample}");
+        assert_eq!(sample.chars().count(), 80, "sample should cap at 80 chars: {sample}");
+    }
+
+    #[test]
+    fn checks_from_multiple_pods_each_get_their_own_pod_error() {
+        let pod_errors = vec![
+            ("carbide-api-abc".to_string(), "ERROR: vault expired".to_string()),
+            ("carbide-api-abc".to_string(), "ERROR: vault expired".to_string()),
+            ("rest-xyz".to_string(), "FATAL: oom".to_string()),
+            ("workflow-svc".to_string(), "panic: nil pointer".to_string()),
+            ("rest-xyz".to_string(), "FATAL: oom retry".to_string()),
+        ];
+        let checks = checks_from(&pod_errors, "loki", true, "nico");
+
+        let pod_error_checks: Vec<_> = checks.iter().filter(|c| c.name == "pod_error").collect();
+        assert_eq!(pod_error_checks.len(), 3);
+
+        let next_cmds: Vec<_> = pod_error_checks
+            .iter()
+            .map(|c| c.next_command.clone().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<_> = next_cmds.iter().collect();
+        assert_eq!(unique.len(), 3, "next_commands should be unique per pod: {next_cmds:?}");
+    }
+
+    #[test]
+    fn checks_from_single_pod_multiple_errors_collapses_to_one_pod_error() {
+        let pod_errors = vec![
+            ("carbide-api-abc".to_string(), "ERROR: vault credential expired".to_string()),
+            ("carbide-api-abc".to_string(), "ERROR: vault credential expired".to_string()),
+            ("carbide-api-abc".to_string(), "ERROR: vault sealed".to_string()),
+        ];
+        let checks = checks_from(&pod_errors, "loki", true, "nico");
+
+        let pod_error_checks: Vec<_> = checks.iter().filter(|c| c.name == "pod_error").collect();
+        assert_eq!(pod_error_checks.len(), 1);
+        let pe = pod_error_checks[0];
+        assert!(pe.value.starts_with("carbide-api-abc: 3 errors"), "got value: {}", pe.value);
+        assert!(pe.value.contains("vault sealed"), "expected most-recent line in value, got: {}", pe.value);
+        assert_eq!(
+            pe.next_command.as_deref(),
+            Some("kubectl logs carbide-api-abc -n nico"),
+        );
     }
 
     #[test]
