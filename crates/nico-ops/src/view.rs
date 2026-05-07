@@ -1,0 +1,570 @@
+use chrono::{DateTime, Local};
+use nico_common::output::Status;
+use nico_common::theme::Theme;
+use ratatui::{
+    Frame,
+    layout::{Constraint, Direction, Layout, Margin, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+
+use crate::app::App;
+use crate::events::Overlay;
+use crate::model::{Finding, LayerSnapshot, overall_verdict};
+
+pub const HELP_LINES: &[&str] = &[
+    "R         refresh",
+    "↑↓←→/hjkl move focus",
+    "Enter     open detail",
+    "Esc       close overlay",
+    "?         this help",
+    "q / ^C    quit",
+];
+
+/// Top-level render. The host loop calls this once per dirty frame.
+pub fn render(app: &App, theme: &Theme, frame: &mut Frame) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // header
+            Constraint::Min(7),    // body grid
+            Constraint::Min(5),    // drill panel
+            Constraint::Length(1), // hint bar
+        ])
+        .split(area);
+
+    render_header(app, theme, frame, chunks[0]);
+    render_grid(app, theme, frame, chunks[1]);
+    render_drill(app, theme, frame, chunks[2]);
+    render_hint_bar(theme, frame, chunks[3]);
+
+    match app.overlay() {
+        Overlay::Detail => render_detail_overlay(app, theme, frame, area),
+        Overlay::Help => render_help_overlay(theme, frame, area),
+        Overlay::None => {}
+    }
+}
+
+fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let snapshots = app.snapshots();
+    let verdict = overall_verdict(snapshots);
+
+    let mut spans: Vec<Span> = Vec::new();
+    if snapshots.is_empty() {
+        spans.push(Span::styled(
+            "loading…",
+            Style::default().fg(theme.muted),
+        ));
+    } else {
+        for s in snapshots {
+            spans.push(Span::styled(
+                pip_glyph(&s.status).to_string(),
+                Style::default().fg(theme_color(theme, &s.status)),
+            ));
+            spans.push(Span::raw(" "));
+        }
+    }
+    spans.push(Span::raw("    "));
+    spans.push(Span::styled(
+        verdict_word(&verdict).to_string(),
+        Style::default()
+            .fg(theme_color(theme, &verdict))
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let timestamp = match (app.last_refreshed(), app.refreshing()) {
+        (_, true) => "refreshing…".to_string(),
+        (Some(t), false) => format!("refreshed {}", format_time(&t)),
+        (None, false) => "—".to_string(),
+    };
+
+    let title = Line::from(vec![
+        Span::raw(" nico ops "),
+        Span::styled(
+            format!(" {timestamp}"),
+            Style::default().fg(theme.muted),
+        ),
+    ]);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+}
+
+fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let snapshots = app.snapshots();
+    if snapshots.is_empty() {
+        let block = Block::default().borders(Borders::ALL).title(" layers ");
+        frame.render_widget(block, area);
+        return;
+    }
+
+    let cols = grid_cols_for_width(area.width);
+    let rows = snapshots.len().div_ceil(cols);
+
+    let row_constraints: Vec<Constraint> =
+        std::iter::repeat_n(Constraint::Length(4), rows).collect();
+    let row_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(row_constraints)
+        .split(area);
+
+    for r in 0..rows {
+        let col_constraints: Vec<Constraint> =
+            std::iter::repeat_n(Constraint::Ratio(1, cols as u32), cols).collect();
+        let col_areas = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(col_constraints)
+            .split(row_areas[r]);
+        for c in 0..cols {
+            let idx = r * 3 + c;
+            if idx >= snapshots.len() {
+                break;
+            }
+            let cell = if c < col_areas.len() {
+                col_areas[c]
+            } else {
+                continue;
+            };
+            render_scorecard(snapshots, idx, app.focus(), theme, frame, cell);
+        }
+    }
+}
+
+fn render_scorecard(
+    snapshots: &[LayerSnapshot],
+    idx: usize,
+    focus: usize,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let snap = &snapshots[idx];
+    let focused = idx == focus;
+    let title = if focused {
+        format!("▶ {} ", snap.name)
+    } else {
+        format!(" {} ", snap.name)
+    };
+    let mut block = Block::default().borders(Borders::ALL).title(title);
+    if focused {
+        block = block.border_style(
+            Style::default()
+                .fg(theme.overlay_key)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!("{} ", pip_glyph(&snap.status)),
+            Style::default().fg(theme_color(theme, &snap.status)),
+        ),
+        Span::raw(snap.evidence.clone()),
+    ]);
+    frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), inner);
+}
+
+fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let title = match app.focused() {
+        Some(s) => format!(" findings — {} ", s.name),
+        None => " findings ".to_string(),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = match app.focused() {
+        Some(s) if !s.findings.is_empty() => finding_lines(&s.findings, theme, false),
+        Some(_) => vec![Line::from(Span::styled(
+            "no findings",
+            Style::default().fg(theme.muted),
+        ))],
+        None => vec![Line::from(Span::styled(
+            "(no layer focused)",
+            Style::default().fg(theme.muted),
+        ))],
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_hint_bar(theme: &Theme, frame: &mut Frame, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled(
+            " R:refresh  hjkl/arrows:focus  Enter:detail  ?:help  q:quit ",
+            Style::default().fg(theme.muted),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let inner_area = centered(area, 80, 80);
+    let title = match app.focused() {
+        Some(s) => format!(" detail — {} ", s.name),
+        None => " detail ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().bg(theme.overlay_bg).fg(theme.overlay_fg));
+    let inner = block.inner(inner_area);
+    frame.render_widget(Clear, inner_area);
+    frame.render_widget(block, inner_area);
+
+    let lines = match app.focused() {
+        Some(s) if !s.findings.is_empty() => finding_lines(&s.findings, theme, true),
+        Some(_) => vec![Line::from(Span::styled(
+            "no findings",
+            Style::default().fg(theme.muted),
+        ))],
+        None => vec![],
+    };
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner.inner(Margin { horizontal: 1, vertical: 0 }),
+    );
+}
+
+fn render_help_overlay(theme: &Theme, frame: &mut Frame, area: Rect) {
+    let inner_area = centered(area, 60, 50);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" keybinds ")
+        .style(Style::default().bg(theme.overlay_bg).fg(theme.overlay_fg));
+    let inner = block.inner(inner_area);
+    frame.render_widget(Clear, inner_area);
+    frame.render_widget(block, inner_area);
+
+    let lines: Vec<Line> = HELP_LINES
+        .iter()
+        .map(|l| {
+            let (key, rest) = split_help_line(l);
+            Line::from(vec![
+                Span::styled(
+                    format!("{key:<10}"),
+                    Style::default().fg(theme.overlay_key),
+                ),
+                Span::raw(rest.to_string()),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines),
+        inner.inner(Margin { horizontal: 2, vertical: 1 }),
+    );
+}
+
+fn finding_lines(findings: &[Finding], theme: &Theme, full: bool) -> Vec<Line<'static>> {
+    let limit = if full { findings.len() } else { 3 };
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for f in findings.iter().take(limit) {
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", pip_glyph(&f.status)),
+                Style::default().fg(theme_color(theme, &f.status)),
+            ),
+            Span::raw(f.message.clone()),
+        ]));
+        if let Some(cmd) = &f.next_command {
+            out.push(Line::from(Span::styled(
+                format!("    next: {cmd}"),
+                Style::default().fg(theme.muted),
+            )));
+        }
+    }
+    if !full && findings.len() > limit {
+        out.push(Line::from(Span::styled(
+            format!("    +{} more — Enter for full detail", findings.len() - limit),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    out
+}
+
+pub fn pip_glyph(status: &Status) -> &'static str {
+    match status {
+        Status::Ok => "●",
+        Status::Warn => "▲",
+        Status::Fail => "✖",
+        Status::Unknown | Status::Skipped => "○",
+    }
+}
+
+pub fn verdict_word(status: &Status) -> &'static str {
+    match status {
+        Status::Ok => "OK",
+        Status::Warn => "WARN",
+        Status::Fail => "FAIL",
+        Status::Unknown => "UNKNOWN",
+        Status::Skipped => "SKIPPED",
+    }
+}
+
+fn theme_color(theme: &Theme, status: &Status) -> ratatui::style::Color {
+    match status {
+        Status::Ok => theme.ok,
+        Status::Warn => theme.warn,
+        Status::Fail => theme.error,
+        Status::Unknown | Status::Skipped => theme.muted,
+    }
+}
+
+fn format_time(t: &DateTime<Local>) -> String {
+    t.format("%H:%M:%S").to_string()
+}
+
+fn split_help_line(line: &str) -> (&str, &str) {
+    match line.find(' ') {
+        Some(i) => {
+            let key = &line[..i];
+            let rest = line[i..].trim_start();
+            (key, rest)
+        }
+        None => (line, ""),
+    }
+}
+
+/// 3-up grid is the design (see ADR-010); reflows to 2-up below 90 cols
+/// and 1-up below 60.
+pub fn grid_cols_for_width(width: u16) -> usize {
+    if width < 60 {
+        1
+    } else if width < 90 {
+        2
+    } else {
+        3
+    }
+}
+
+fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let h = (area.width * pct_x) / 100;
+    let v = (area.height * pct_y) / 100;
+    let x = area.x + (area.width.saturating_sub(h)) / 2;
+    let y = area.y + (area.height.saturating_sub(v)) / 2;
+    Rect { x, y, width: h, height: v }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::action::{Action, Dir};
+    use nico_common::theme::DEFAULT;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn six_layers() -> Vec<LayerSnapshot> {
+        vec![
+            LayerSnapshot {
+                name: "cluster".into(),
+                status: Status::Ok,
+                evidence: "3 nodes ready".into(),
+                findings: vec![],
+            },
+            LayerSnapshot {
+                name: "logs".into(),
+                status: Status::Warn,
+                evidence: "12 errors".into(),
+                findings: vec![Finding {
+                    status: Status::Warn,
+                    message: "12 ERROR lines in carbide-controller".into(),
+                    next_command: Some("kubectl logs -n nico carbide-controller".into()),
+                }],
+            },
+            LayerSnapshot {
+                name: "workflows".into(),
+                status: Status::Ok,
+                evidence: "no stuck wf".into(),
+                findings: vec![],
+            },
+            LayerSnapshot {
+                name: "health".into(),
+                status: Status::Ok,
+                evidence: "4/4 healthy".into(),
+                findings: vec![],
+            },
+            LayerSnapshot {
+                name: "grpc".into(),
+                status: Status::Ok,
+                evidence: "reachable".into(),
+                findings: vec![],
+            },
+            LayerSnapshot {
+                name: "postgres".into(),
+                status: Status::Ok,
+                evidence: "12ms ping".into(),
+                findings: vec![],
+            },
+        ]
+    }
+
+    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(app, &DEFAULT, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf.cell((x, y)).unwrap().symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn pip_glyphs_are_distinct_per_status() {
+        assert_ne!(pip_glyph(&Status::Ok), pip_glyph(&Status::Warn));
+        assert_ne!(pip_glyph(&Status::Warn), pip_glyph(&Status::Fail));
+        assert_ne!(pip_glyph(&Status::Fail), pip_glyph(&Status::Ok));
+    }
+
+    #[test]
+    fn verdict_word_renders_each_status() {
+        assert_eq!(verdict_word(&Status::Ok), "OK");
+        assert_eq!(verdict_word(&Status::Warn), "WARN");
+        assert_eq!(verdict_word(&Status::Fail), "FAIL");
+    }
+
+    #[test]
+    fn grid_cols_reflows_with_width() {
+        assert_eq!(grid_cols_for_width(40), 1);
+        assert_eq!(grid_cols_for_width(70), 2);
+        assert_eq!(grid_cols_for_width(120), 3);
+    }
+
+    #[test]
+    fn render_shows_title_and_all_layer_names() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let s = render_to_string(&app, 120, 20);
+        assert!(s.contains("nico ops"), "title missing:\n{s}");
+        for name in ["cluster", "logs", "workflows", "health", "grpc", "postgres"] {
+            assert!(s.contains(name), "layer {name} missing:\n{s}");
+        }
+    }
+
+    #[test]
+    fn render_shows_overall_verdict_word() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let s = render_to_string(&app, 120, 20);
+        assert!(s.contains("WARN"), "verdict missing:\n{s}");
+    }
+
+    #[test]
+    fn render_marks_focused_scorecard() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right));
+        let s = render_to_string(&app, 120, 20);
+        // Focus marker is rendered as part of the focused scorecard's title.
+        // We expect "▶ logs" but not "▶ cluster".
+        assert!(
+            s.contains("▶ logs"),
+            "expected '▶ logs' in render:\n{s}"
+        );
+        assert!(
+            !s.contains("▶ cluster"),
+            "did not expect '▶ cluster' (cluster is not focused):\n{s}"
+        );
+    }
+
+    #[test]
+    fn render_drill_shows_findings_for_focused_layer() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right));
+        let s = render_to_string(&app, 120, 24);
+        assert!(s.contains("findings — logs"), "drill title missing:\n{s}");
+        assert!(s.contains("ERROR lines"), "finding text missing:\n{s}");
+        assert!(s.contains("next:"), "next-cmd hint missing:\n{s}");
+    }
+
+    #[test]
+    fn render_hint_bar_lists_keybinds() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let s = render_to_string(&app, 120, 24);
+        assert!(s.contains("R:refresh"), "hint missing:\n{s}");
+        assert!(s.contains("?:help"), "hint missing:\n{s}");
+        assert!(s.contains("q:quit"), "hint missing:\n{s}");
+    }
+
+    #[test]
+    fn render_help_overlay_shows_keybinds() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::OpenHelp);
+        let s = render_to_string(&app, 120, 24);
+        assert!(s.contains("keybinds"), "overlay title missing:\n{s}");
+        assert!(s.contains("refresh"), "overlay body missing:\n{s}");
+    }
+
+    #[test]
+    fn render_detail_overlay_shows_focused_findings() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right));
+        app.handle(Action::OpenDetail);
+        let s = render_to_string(&app, 120, 24);
+        assert!(s.contains("detail — logs"), "overlay title missing:\n{s}");
+    }
+
+    #[test]
+    fn loading_header_when_no_snapshots() {
+        let app = App::new();
+        let s = render_to_string(&app, 120, 20);
+        assert!(s.contains("loading"), "loading hint missing:\n{s}");
+    }
+
+    fn pip_color_for(theme: &Theme, status: Status) -> ratatui::style::Color {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "x".into(),
+            status: status.clone(),
+            evidence: String::new(),
+            findings: vec![],
+        }]));
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&app, theme, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let pip = pip_glyph(&status);
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                if cell.symbol() == pip {
+                    return cell.fg;
+                }
+            }
+        }
+        panic!("pip not found");
+    }
+
+    #[test]
+    fn dracula_theme_paints_pips_with_dracula_palette() {
+        use nico_common::theme::DRACULA;
+        let color = pip_color_for(&DRACULA, Status::Warn);
+        assert_eq!(color, DRACULA.warn);
+    }
+
+    #[test]
+    fn nord_theme_paints_pips_with_nord_palette() {
+        use nico_common::theme::NORD;
+        let color = pip_color_for(&NORD, Status::Fail);
+        assert_eq!(color, NORD.error);
+    }
+
+    #[test]
+    fn gruvbox_theme_paints_pips_with_gruvbox_palette() {
+        use nico_common::theme::GRUVBOX;
+        let color = pip_color_for(&GRUVBOX, Status::Ok);
+        assert_eq!(color, GRUVBOX.ok);
+    }
+}
