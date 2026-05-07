@@ -41,5 +41,6 @@ explicitly rather than silently overriding.
 | [0007](0007-optional-tui.md) | Optional `--tui` mode (now scoped to `nico ops`) | Accepted |
 | [0008](0008-tui-theme-system.md) | TUI theme system | Accepted |
 | [0009](0009-umbrella-binary.md) | Umbrella binary `nico` with clap subcommand dispatch | Accepted |
+| [0010](0010-nico-ops-dashboard-architecture.md) | `nico-ops` dashboard architecture (Layout A) | Accepted |
 | [0011](0011-strip-tui-from-text-subcommands.md) | Strip TUI from text-only subcommands | Accepted |
 | [0012](0012-async-component-tui-event-loop.md) | Async Component-style TUI event loop for `nico ops` | Proposed |
