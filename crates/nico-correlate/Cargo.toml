@@ -3,10 +3,6 @@ name = "nico-correlate"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "nico-correlate"
-path = "src/main.rs"
-
 [dependencies]
 nico-common = { path = "../nico-common" }
 clap = { version = "4", features = ["derive", "env"] }
@@ -23,8 +19,6 @@ temporal-sdk-core-protos = "0.1"
 tonic = { version = "0.13", default-features = false, features = ["channel", "codegen"] }
 prost-wkt-types = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-ratatui = "0.29"
-crossterm = "0.28"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

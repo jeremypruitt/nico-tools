@@ -7,6 +7,21 @@ every output line points at where to dig deeper.
 
 ## Ubiquitous language
 
+- **nico** (the binary) — single umbrella CLI that dispatches subcommands:
+  `nico ops` (live dashboard, see `nico-ops`), `nico doctor` (read-only
+  health check), `nico correlate <id>` (entity-scoped event correlation).
+  Replaces the historic `nico-doctor` and `nico-correlate` standalone
+  binaries. The dispatcher is a thin clap shell — all bootstrap and flow
+  logic lives in the library crates (`nico_doctor::run_doctor`,
+  `nico_correlate::run_correlate`, `nico_ops::run_ops`). See ADR-009.
+- **nico-ops** — the live operational dashboard crate. Currently a
+  placeholder (`run_ops()` prints "not yet" and exits 3). Will host the
+  forward-looking async Component-style TUI event loop (ADR-012) and
+  compose the doctor and correlate library APIs (`prepare_layers`,
+  `run_streaming`, `prepare_sources`, `collect_all`) into a single
+  multi-pane operator view. The subcommand and crate exist now so the
+  workspace builds cleanly while the dashboard is built in subsequent
+  slices.
 - **NICo** — NVIDIA Infrastructure Controller. gRPC service. Source of truth
   for desired host state. This is the external/marketing name for carbide.
 - **Carbide** — This is the internal name for NICO
@@ -59,6 +74,26 @@ every output line points at where to dig deeper.
   _Avoid_: entry, record, log line
 - **Timeline** — the chronologically sorted sequence of Events in a Correlation, normalized across all Sources. The default human output format for `nico-correlate`.
   _Avoid_: log, history, trace
+
+## Umbrella binary layout
+
+- `crates/nico` — thin clap dispatcher binary; the only user-visible
+  executable. Subcommands embed `nico_doctor::DoctorArgs` and
+  `nico_correlate::CorrelateArgs` directly via clap's `Args` derive.
+- `crates/nico-doctor` — library only. Public API: `DoctorArgs`,
+  `bootstrap`, `prepare_layers`, `run_once`, `run_streaming`, `run_doctor`.
+  No `[[bin]]` section, no `ratatui`/`crossterm` deps. (ADR-011)
+- `crates/nico-correlate` — library only. Public API: `CorrelateArgs`,
+  `resolve_config`, `prepare_sources`, `collect_all`, `run_correlate`.
+  No `[[bin]]` section, no `ratatui`/`crossterm` deps. (ADR-011)
+- `crates/nico-ops` — placeholder lib crate, exposes `run_ops()`. The new
+  TUI architecture (async Component event loop, ADR-012) will land here.
+- `crates/nico-common` — shared config, theme, output, k8s, temporal,
+  reach-manager primitives. Unchanged by the umbrella restructure.
+
+`nico ops` is the default subcommand: bare `nico` invokes it. `nico doctor`
+and `nico correlate <id>` produce output identical to the historic
+`nico-doctor` and `nico-correlate` binaries.
 
 ## What "diagnostic" means here
 Read-only. No remediation. Output is human-readable by default and JSON under

@@ -1,7 +1,9 @@
 [workspace]
 members = [
+    "crates/nico",
     "crates/nico-common",
     "crates/nico-doctor",
     "crates/nico-correlate",
+    "crates/nico-ops",
 ]
 resolver = "2"
