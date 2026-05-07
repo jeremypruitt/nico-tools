@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-05-03
+- **Amended:** 2026-05-07 (headline vs. detail checks; per-layer detail cap)
 
 ## Context
 
@@ -30,6 +31,31 @@ format is a stability contract.
 
 A documented JSON schema lives at `docs/json-schema.md`. There is a snapshot
 test that round-trips a recorded fixture to detect accidental schema drift.
+
+### Headline vs. detail checks (2026-05-07 amendment)
+
+A single noisy layer (e.g. `logs` with hundreds of pod-error lines) can blow
+past the ≤20-line target because every `Check` is rendered as a row. The
+≤20-line target is real — the fix is to recognize that not all checks belong
+in the summary line.
+
+Each `Check` is one of two kinds:
+
+- **Headline** — summarizes the layer at a glance (e.g. `error_lines`,
+  `source`, `pods_ready`). Headline check values are the only values joined
+  into a layer's summary line. Bounded in count by layer design.
+- **Detail** — one-per-finding evidence (e.g. `pod_error`, `stuck_workflow`).
+  Never appears in the summary line. Appears in the findings block, capped.
+
+Default human mode caps the findings block at **N detail bullets per layer**
+(initial value: 5), with a trailing `… +M more · --verbose for full list`
+elision line when truncated. `--verbose` always shows every detail bullet.
+`--json` is unaffected — it remains machine-complete regardless of cap, so
+downstream consumers (`nico-correlate`, CI gates) keep getting every finding.
+
+Layers that produce per-finding evidence SHOULD also collapse near-duplicate
+findings at their source (e.g. group log errors by pod with a count and a
+sample) rather than relying solely on the formatter cap.
 
 ## Consequences
 
