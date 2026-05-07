@@ -9,6 +9,7 @@ pub mod diagnosis;
 pub mod event;
 pub mod formatter;
 pub mod id;
+pub mod namespace;
 pub mod source;
 pub mod sources;
 pub mod tail;
@@ -16,10 +17,11 @@ pub mod timeline;
 
 pub use bootstrap::{collect_all, prepare_sources, resolve_config, BootstrapErr, CorrelateConfig, PreparedSources};
 pub use cli::CorrelateArgs;
+pub use event::{Event, Severity};
+pub use namespace::{recent_namespace_events, RECENT_EVENT_CAP};
 
 use crate::correlate::exit_code;
 use crate::diagnosis::{diagnose, DiagnosisConfig};
-use crate::event::{Event, Severity};
 use crate::source::{Source, SourceResult, StateEntry};
 use crate::timeline::filter_timeline;
 

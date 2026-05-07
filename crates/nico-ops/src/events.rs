@@ -66,6 +66,7 @@ fn translate_key(key: &KeyEvent, _mode: Mode, layout: Layout, overlay: Overlay) 
         (_, Overlay::Detail | Overlay::Help) => translate_overlay(key, overlay),
         (_, Overlay::Correlate) => translate_correlate_overlay(key),
         (Layout::A, Overlay::None) => translate_normal(key),
+        (Layout::B, Overlay::None) => translate_layout_b(key),
         (Layout::Spotlight, Overlay::None) => translate_spotlight(key),
     }
 }
@@ -75,7 +76,11 @@ fn translate_normal(key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::Refresh),
         KeyCode::Char(' ') => Some(Action::TogglePause),
-        KeyCode::Char('m') | KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
+        // `m` toggles to Layout B (Mission Control). `M` (Shift+m) is
+        // reserved for terminal mouse-capture toggling so the operator
+        // can fall back to native scrollback if needed.
+        KeyCode::Char('m') => Some(Action::ToggleLayout),
+        KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
         KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::ShowSpotlight),
         KeyCode::Char('?') => Some(Action::OpenHelp),
         // `c` from Layout A targets the focused workflow Finding (issue
@@ -91,12 +96,31 @@ fn translate_normal(key: &KeyEvent) -> Option<Action> {
     }
 }
 
+fn translate_layout_b(key: &KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
+        KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::Refresh),
+        KeyCode::Char(' ') => Some(Action::TogglePause),
+        // `m` toggles back to Layout A; `M` is mouse-capture (mirrors A).
+        KeyCode::Char('m') => Some(Action::ToggleLayout),
+        KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
+        KeyCode::Esc => Some(Action::CloseOverlay),
+        KeyCode::Char('?') => Some(Action::OpenHelp),
+        KeyCode::Enter => Some(Action::ZoomQuadrant),
+        KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
+        KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::Focus(Dir::Up)),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
+        _ => None,
+    }
+}
+
 fn translate_spotlight(key: &KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::Refresh),
         KeyCode::Char(' ') => Some(Action::TogglePause),
-        KeyCode::Char('m') | KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
+        KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
         KeyCode::Char('?') => Some(Action::OpenHelp),
         // s, a, Esc all return to the show-all Layout A.
         KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -375,10 +399,12 @@ mod tests {
     }
 
     #[test]
-    fn lower_m_toggles_mouse_capture_in_normal() {
+    fn lower_m_toggles_layout_in_normal() {
+        // Issue #155 reserves lowercase `m` for Layout A↔B toggle.
+        // Mouse capture toggle moved to Shift+M (`M`).
         assert_eq!(
             tr(&k(KeyCode::Char('m')), Overlay::None),
-            Some(Action::ToggleMouseCapture)
+            Some(Action::ToggleLayout)
         );
     }
 
@@ -386,6 +412,7 @@ mod tests {
     fn m_inert_inside_overlay() {
         for ov in [Overlay::Detail, Overlay::Help] {
             assert_eq!(tr(&k(KeyCode::Char('M')), ov), None);
+            assert_eq!(tr(&k(KeyCode::Char('m')), ov), None);
         }
     }
 
@@ -519,6 +546,43 @@ mod tests {
                 Overlay::Help
             ),
             None
+        );
+    }
+
+    #[test]
+    fn m_toggles_layout_in_normal() {
+        assert_eq!(
+            translate(&k(KeyCode::Char('m')), Mode::Normal, Layout::A, Overlay::None),
+            Some(Action::ToggleLayout)
+        );
+        assert_eq!(
+            translate(&k(KeyCode::Char('m')), Mode::Normal, Layout::B, Overlay::None),
+            Some(Action::ToggleLayout)
+        );
+    }
+
+    #[test]
+    fn enter_zooms_quadrant_in_layout_b() {
+        assert_eq!(
+            translate(&k(KeyCode::Enter), Mode::Normal, Layout::B, Overlay::None),
+            Some(Action::ZoomQuadrant)
+        );
+    }
+
+    #[test]
+    fn enter_opens_detail_only_in_layout_a() {
+        assert_eq!(
+            translate(&k(KeyCode::Enter), Mode::Normal, Layout::A, Overlay::None),
+            Some(Action::OpenDetail)
+        );
+    }
+
+    #[test]
+    fn esc_in_layout_b_normal_dispatches_close_overlay() {
+        // The reducer interprets CloseOverlay-with-no-overlay as "back to A".
+        assert_eq!(
+            translate(&k(KeyCode::Esc), Mode::Normal, Layout::B, Overlay::None),
+            Some(Action::CloseOverlay)
         );
     }
 }

@@ -9,6 +9,8 @@ use crossterm::{
 };
 use futures::StreamExt;
 use nico_common::config::OutputFormat;
+use nico_common::k8s::K8sClient;
+use nico_common::temporal::{GrpcTemporalClient, TemporalClient};
 use nico_common::theme::{self, Theme};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -154,16 +156,37 @@ async fn run_event_loop<C: Clock>(
     let nico_doctor::Bootstrapped {
         layers,
         opts,
+        temporal_address,
+        temporal_namespace,
+        k8s_client,
         _pf_guards,
         ..
     } = bootstrapped;
     let layers = Arc::new(layers);
+    let temporal_client: Arc<dyn TemporalClient> =
+        Arc::new(GrpcTemporalClient::new(temporal_address));
+    let activity_since = chrono::Duration::from_std(opts.since)
+        .unwrap_or_else(|_| chrono::Duration::minutes(10));
 
     let mut app = App::with_interval(interval);
     app.set_baseline(nico_doctor::baseline::load());
     let (tx, mut rx) = mpsc::channel::<Action>(64);
 
+    let activity_ctx = ActivityCtx {
+        temporal: temporal_client.clone(),
+        k8s: k8s_client.clone(),
+        namespace: temporal_namespace.clone(),
+        since: activity_since,
+    };
+
     spawn_refresh(layers.clone(), opts.clone(), tx.clone());
+    spawn_activity_refresh(
+        temporal_client.clone(),
+        k8s_client.clone(),
+        temporal_namespace.clone(),
+        activity_since,
+        tx.clone(),
+    );
     let _ = app.handle(Action::Refresh);
 
     let mut events = EventStream::new();
@@ -181,7 +204,7 @@ async fn run_event_loop<C: Clock>(
                 match maybe_event {
                     Some(Ok(ev)) => {
                         if let Some(action) = translate(&ev, Mode::Normal, app.layout(), app.overlay())
-                            && dispatch(&mut app, action, &layers, &opts, &tx, terminal) {
+                            && dispatch(&mut app, action, &layers, &opts, &activity_ctx, &tx, terminal) {
                             break;
                         }
                     }
@@ -190,12 +213,12 @@ async fn run_event_loop<C: Clock>(
             }
             maybe_action = rx.recv() => {
                 if let Some(action) = maybe_action
-                    && dispatch(&mut app, action, &layers, &opts, &tx, terminal) {
+                    && dispatch(&mut app, action, &layers, &opts, &activity_ctx, &tx, terminal) {
                     break;
                 }
             }
             _ = tick.tick() => {
-                if dispatch(&mut app, Action::Tick(clock.now()), &layers, &opts, &tx, terminal) {
+                if dispatch(&mut app, Action::Tick(clock.now()), &layers, &opts, &activity_ctx, &tx, terminal) {
                     break;
                 }
             }
@@ -222,11 +245,22 @@ pub fn resolve_interval(
     }
 }
 
+/// Bundle of dependencies the activity refresh spawner needs. Carried
+/// alongside layer refresh so a single `StartRefresh` effect kicks both
+/// off in lockstep.
+struct ActivityCtx {
+    temporal: Arc<dyn TemporalClient>,
+    k8s: Option<Arc<dyn K8sClient>>,
+    namespace: String,
+    since: chrono::Duration,
+}
+
 fn dispatch(
     app: &mut App,
     action: Action,
     layers: &Arc<Vec<Box<dyn nico_doctor::layer::Layer>>>,
     opts: &nico_doctor::layer::RunOpts,
+    activity: &ActivityCtx,
     tx: &mpsc::Sender<Action>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> bool {
@@ -234,6 +268,13 @@ fn dispatch(
         Some(Effect::Quit) => true,
         Some(Effect::StartRefresh) => {
             spawn_refresh(layers.clone(), opts.clone(), tx.clone());
+            spawn_activity_refresh(
+                activity.temporal.clone(),
+                activity.k8s.clone(),
+                activity.namespace.clone(),
+                activity.since,
+                tx.clone(),
+            );
             false
         }
         Some(Effect::EnableMouseCapture) => {
@@ -403,6 +444,23 @@ fn spawn_refresh(
     tokio::spawn(async move {
         let snapshots: Vec<LayerSnapshot> = data::collect(layers, opts).await;
         let _ = tx.send(Action::Snapshots(snapshots)).await;
+    });
+}
+
+fn spawn_activity_refresh(
+    temporal: Arc<dyn TemporalClient>,
+    k8s: Option<Arc<dyn K8sClient>>,
+    namespace: String,
+    since: chrono::Duration,
+    tx: mpsc::Sender<Action>,
+) {
+    let Some(k8s) = k8s else {
+        // No reachable kubeconfig — leave the Activity feed empty.
+        return;
+    };
+    tokio::spawn(async move {
+        let events = nico_correlate::recent_namespace_events(temporal, k8s, &namespace, since).await;
+        let _ = tx.send(Action::NamespaceEvents(events)).await;
     });
 }
 

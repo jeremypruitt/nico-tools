@@ -46,6 +46,16 @@ pub enum Action {
     /// `Effect::StartRefresh`. Throbber animation is also driven by
     /// the timestamp on this action.
     Tick(Instant),
+    /// `m` — toggle between Layout A (6-up scorecard) and Layout B
+    /// (Mission Control 2×3 grid). Issue #155.
+    ToggleLayout,
+    /// `Enter` while in Layout B — zoom the focused quadrant
+    /// full-screen. (In Layout A, `Enter` opens the detail overlay
+    /// instead — see [`Action::OpenDetail`].)
+    ZoomQuadrant,
+    /// New namespace-scoped events for Layout B's Activity quadrant.
+    /// Sourced from `nico_correlate::recent_namespace_events`.
+    NamespaceEvents(Vec<nico_correlate::Event>),
     /// Left-click at terminal cell `(col, row)`. The reducer hit-tests
     /// against the scorecard regions captured during the last render.
     Click { col: u16, row: u16 },

@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 
 use crate::action::{Action, Dir, ScrollDir};
 use crate::events::Overlay;
-use crate::model::{CorrelateState, CorrelateStatus, LayerSnapshot, workflow_id_from_finding};
+use crate::model::{CorrelateState, CorrelateStatus, LayerSnapshot, Quadrant, workflow_id_from_finding};
 use crate::pulse::PulseTimer;
 use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
 
@@ -18,13 +18,17 @@ use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
 pub const TOAST_TTL: Duration = Duration::from_millis(2500);
 
 /// Which top-level layout the dashboard is rendering. The reducer flips
-/// between these in response to `Action::ShowSpotlight` /
-/// `Action::ShowAll`; the renderer branches on the value.
+/// between these in response to `Action::ToggleLayout` (A↔B),
+/// `Action::ShowSpotlight` (A→C), and `Action::ShowAll` (any→A); the
+/// renderer branches on the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
     /// Layout A — the scorecard grid with drill panel (ADR-010).
     #[default]
     A,
+    /// Layout B — Mission Control 2×3 quadrant grid with `tui-big-text`
+    /// verdict header (issue #155).
+    B,
     /// Layout C — the "3am page" Spotlight view: tui-big-text headline
     /// over incident cards for non-green Layers, green Layers compressed
     /// to a single footer line.
@@ -97,6 +101,9 @@ pub struct App {
     spotlight_focus: usize,
     toast: Option<Toast>,
     correlate: Option<CorrelateState>,
+    b_focus: usize,
+    b_zoomed: bool,
+    namespace_events: Vec<nico_correlate::Event>,
 }
 
 /// A transient bottom-bar message and its expiry timestamp. Cleared by
@@ -138,6 +145,9 @@ impl App {
             spotlight_focus: 0,
             toast: None,
             correlate: None,
+            b_focus: 0,
+            b_zoomed: false,
+            namespace_events: Vec::new(),
         }
     }
 
@@ -251,6 +261,22 @@ impl App {
         &self.history
     }
 
+    pub fn b_focus(&self) -> usize {
+        self.b_focus
+    }
+
+    pub fn focused_quadrant(&self) -> Quadrant {
+        Quadrant::ALL[self.b_focus.min(Quadrant::ALL.len() - 1)]
+    }
+
+    pub fn b_zoomed(&self) -> bool {
+        self.b_zoomed
+    }
+
+    pub fn namespace_events(&self) -> &[nico_correlate::Event] {
+        &self.namespace_events
+    }
+
     /// Throbber glyph for the current frame: an animated braille spinner
     /// while a refresh is in flight, frozen `✓` once the latest refresh
     /// has completed, or empty when no run has happened yet.
@@ -288,14 +314,55 @@ impl App {
                 if self.overlay != Overlay::None {
                     return None;
                 }
-                if self.move_focus(dir) {
+                let moved = match self.layout {
+                    Layout::A => self.move_focus(dir),
+                    Layout::B => {
+                        if self.b_zoomed {
+                            false
+                        } else {
+                            move_b_focus(&mut self.b_focus, dir)
+                        }
+                    }
+                    Layout::Spotlight => self.move_focus(dir),
+                };
+                if moved {
                     self.dirty = true;
                 }
                 None
             }
             Action::OpenDetail => {
+                if matches!(self.layout, Layout::B) {
+                    return None;
+                }
                 if !self.snapshots.is_empty() && self.overlay == Overlay::None {
                     self.overlay = Overlay::Detail;
+                    self.dirty = true;
+                }
+                None
+            }
+            Action::ToggleLayout => {
+                if self.overlay != Overlay::None {
+                    return None;
+                }
+                self.layout = match self.layout {
+                    Layout::A => Layout::B,
+                    Layout::B => Layout::A,
+                    Layout::Spotlight => Layout::A,
+                };
+                self.b_zoomed = false;
+                self.dirty = true;
+                None
+            }
+            Action::ZoomQuadrant => {
+                if matches!(self.layout, Layout::B) && !self.b_zoomed {
+                    self.b_zoomed = true;
+                    self.dirty = true;
+                }
+                None
+            }
+            Action::NamespaceEvents(events) => {
+                self.namespace_events = events;
+                if matches!(self.layout, Layout::B) {
                     self.dirty = true;
                 }
                 None
@@ -311,6 +378,13 @@ impl App {
                 if self.overlay != Overlay::None {
                     self.overlay = Overlay::None;
                     self.correlate = None;
+                    self.dirty = true;
+                } else if matches!(self.layout, Layout::B) {
+                    if self.b_zoomed {
+                        self.b_zoomed = false;
+                    } else {
+                        self.layout = Layout::A;
+                    }
                     self.dirty = true;
                 }
                 None
@@ -517,6 +591,9 @@ impl App {
                 .get(self.spotlight_focus)
                 .copied(),
             Layout::A => self.snapshots.get(self.focus),
+            // Layout B doesn't expose the workflows-Finding focus model,
+            // so `[c]` is a no-op there.
+            Layout::B => None,
         }
     }
 
@@ -649,6 +726,45 @@ impl Default for App {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Layout-B is a fixed 2×3 grid: 3 columns × 2 rows. Returns whether
+/// `focus` actually moved.
+fn move_b_focus(focus: &mut usize, dir: Dir) -> bool {
+    const COLS: usize = 3;
+    const N: usize = 6;
+    let cur = (*focus).min(N - 1);
+    let next = match dir {
+        Dir::Left => {
+            if cur.is_multiple_of(COLS) {
+                return false;
+            }
+            cur - 1
+        }
+        Dir::Right => {
+            if cur + 1 >= N || (cur + 1).is_multiple_of(COLS) {
+                return false;
+            }
+            cur + 1
+        }
+        Dir::Up => {
+            if cur < COLS {
+                return false;
+            }
+            cur - COLS
+        }
+        Dir::Down => {
+            if cur + COLS >= N {
+                return false;
+            }
+            cur + COLS
+        }
+    };
+    if next == cur {
+        return false;
+    }
+    *focus = next;
+    true
 }
 
 /// Layout-A grid column count. The grid is 3-up always at the model
@@ -1114,6 +1230,139 @@ mod tests {
         let f3 = app.throbber_glyph();
         assert_ne!(f0, f3, "throbber should cycle frames over time");
         assert_ne!(f0, THROBBER_DONE);
+    }
+
+    // ── Layout B (Mission Control, issue #155) ──────────────────────────
+
+    #[test]
+    fn fresh_app_starts_in_layout_a() {
+        let app = App::new();
+        assert_eq!(app.layout(), Layout::A);
+        assert_eq!(app.b_focus(), 0);
+        assert!(!app.b_zoomed());
+    }
+
+    #[test]
+    fn toggle_layout_flips_between_a_and_b() {
+        let mut app = App::new();
+        app.handle(Action::ToggleLayout);
+        assert_eq!(app.layout(), Layout::B);
+        app.handle(Action::ToggleLayout);
+        assert_eq!(app.layout(), Layout::A);
+    }
+
+    #[test]
+    fn esc_in_layout_b_returns_to_layout_a() {
+        let mut app = App::new();
+        app.handle(Action::ToggleLayout);
+        assert_eq!(app.layout(), Layout::B);
+        app.handle(Action::CloseOverlay);
+        assert_eq!(app.layout(), Layout::A);
+    }
+
+    #[test]
+    fn enter_zooms_focused_quadrant_in_layout_b() {
+        let mut app = App::new();
+        app.handle(Action::ToggleLayout);
+        app.handle(Action::ZoomQuadrant);
+        assert!(app.b_zoomed());
+    }
+
+    #[test]
+    fn esc_in_zoomed_layout_b_unzooms_first_then_returns() {
+        let mut app = App::new();
+        app.handle(Action::ToggleLayout);
+        app.handle(Action::ZoomQuadrant);
+        // First Esc: unzoom but stay in Layout B.
+        app.handle(Action::CloseOverlay);
+        assert!(!app.b_zoomed());
+        assert_eq!(app.layout(), Layout::B);
+        // Second Esc: returns to Layout A.
+        app.handle(Action::CloseOverlay);
+        assert_eq!(app.layout(), Layout::A);
+    }
+
+    #[test]
+    fn focus_in_layout_b_moves_in_two_by_three_grid() {
+        let mut app = App::new();
+        app.handle(Action::ToggleLayout);
+        // 0 1 2
+        // 3 4 5
+        app.handle(Action::Focus(Dir::Right));
+        assert_eq!(app.b_focus(), 1);
+        app.handle(Action::Focus(Dir::Down));
+        assert_eq!(app.b_focus(), 4);
+        app.handle(Action::Focus(Dir::Left));
+        assert_eq!(app.b_focus(), 3);
+        app.handle(Action::Focus(Dir::Up));
+        assert_eq!(app.b_focus(), 0);
+    }
+
+    #[test]
+    fn focused_quadrant_matches_b_focus() {
+        let mut app = App::new();
+        app.handle(Action::ToggleLayout);
+        assert_eq!(app.focused_quadrant(), Quadrant::Cluster);
+        for _ in 0..5 {
+            app.handle(Action::Focus(Dir::Right));
+            // Right walks until it hits column boundaries; we want all six.
+        }
+        // Walk the full grid to make sure we can land on Activity.
+        let mut app = App::new();
+        app.handle(Action::ToggleLayout);
+        app.handle(Action::Focus(Dir::Right)); // Workflows
+        app.handle(Action::Focus(Dir::Right)); // Services
+        app.handle(Action::Focus(Dir::Down)); // Logs (idx 4)
+        app.handle(Action::Focus(Dir::Right)); // Activity (idx 5)
+        assert_eq!(app.focused_quadrant(), Quadrant::Activity);
+    }
+
+    #[test]
+    fn focus_does_not_escape_b_grid() {
+        let mut app = App::new();
+        app.handle(Action::ToggleLayout);
+        // From 0, Up/Left are no-ops.
+        app.handle(Action::Focus(Dir::Up));
+        assert_eq!(app.b_focus(), 0);
+        app.handle(Action::Focus(Dir::Left));
+        assert_eq!(app.b_focus(), 0);
+        // Walk to end (idx 5) and try Down/Right.
+        for _ in 0..2 {
+            app.handle(Action::Focus(Dir::Right));
+        }
+        app.handle(Action::Focus(Dir::Down));
+        app.handle(Action::Focus(Dir::Right));
+        assert_eq!(app.b_focus(), 5);
+        app.handle(Action::Focus(Dir::Down));
+        app.handle(Action::Focus(Dir::Right));
+        assert_eq!(app.b_focus(), 5);
+    }
+
+    #[test]
+    fn focus_inert_when_zoomed_in_layout_b() {
+        let mut app = App::new();
+        app.handle(Action::ToggleLayout);
+        app.handle(Action::Focus(Dir::Right));
+        let before = app.b_focus();
+        app.handle(Action::ZoomQuadrant);
+        app.handle(Action::Focus(Dir::Right));
+        assert_eq!(app.b_focus(), before, "focus should not move while zoomed");
+    }
+
+    #[test]
+    fn namespace_events_action_replaces_feed() {
+        let mut app = App::new();
+        let now = chrono::Utc::now();
+        let ev = nico_correlate::Event {
+            ts: now,
+            source: "k8s".into(),
+            kind: "Crash".into(),
+            message: "boom".into(),
+            severity: nico_correlate::Severity::Warning,
+            tags: Default::default(),
+        };
+        app.handle(Action::NamespaceEvents(vec![ev]));
+        assert_eq!(app.namespace_events().len(), 1);
     }
 
     fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {

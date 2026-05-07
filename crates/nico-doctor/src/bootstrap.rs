@@ -55,6 +55,17 @@ pub struct Bootstrapped {
     /// the dashboard's auto-refresh cadence; ignored by `nico-doctor`'s
     /// one-shot path.
     pub tui_refresh: Duration,
+    /// Resolved Temporal frontend address (after port-forward fallback).
+    /// Consumed by `nico-ops` Layout B Activity quadrant
+    /// (`recent_namespace_events`); irrelevant to one-shot doctor runs.
+    pub temporal_address: String,
+    /// Temporal namespace from config — paired with `temporal_address` so
+    /// the Activity quadrant can list workflow executions.
+    pub temporal_namespace: String,
+    /// K8s client built from kubeconfig — reused by Layout B Activity.
+    /// `None` when no kubeconfig is reachable; the Activity quadrant just
+    /// reports an empty feed in that case.
+    pub k8s_client: Option<Arc<dyn nico_common::k8s::K8sClient>>,
     /// Kept alive until the caller is done running layers; dropping closes port-forwards.
     pub _pf_guards: Vec<nico_common::reach::ForwardedEndpoint>,
 }
@@ -394,11 +405,13 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         }
     };
 
+    let bootstrap_k8s = k8s_client.clone();
+
     let inputs = LayerInputs {
         k8s_client,
         loki_url,
         loki_client,
-        temporal_address,
+        temporal_address: temporal_address.clone(),
         temporal_namespace: config.temporal.namespace.clone(),
         stuck_threshold: config.temporal.stuck_threshold,
         http_endpoints,
@@ -419,6 +432,9 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         verbose: args.verbose,
         spotlight: args.spotlight,
         tui_refresh: config.output.tui_refresh,
+        temporal_address,
+        temporal_namespace: config.temporal.namespace.clone(),
+        k8s_client: bootstrap_k8s,
         _pf_guards: pf_guards,
     })
 }
