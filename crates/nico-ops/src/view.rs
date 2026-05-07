@@ -9,6 +9,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
+use nico_doctor::baseline::Delta;
+
 use crate::app::App;
 use crate::events::Overlay;
 use crate::model::{Finding, overall_verdict};
@@ -69,10 +71,7 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 
     let mut spans: Vec<Span> = Vec::new();
     if snapshots.is_empty() {
-        spans.push(Span::styled(
-            "loading…",
-            Style::default().fg(theme.muted),
-        ));
+        spans.push(Span::styled("loading…", Style::default().fg(theme.muted)));
     } else {
         for s in snapshots {
             spans.push(Span::styled(
@@ -168,22 +167,30 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 /// evidence block; the renderer reserves the bottom row for it.
 const SCORECARD_ROW_HEIGHT: u16 = 5;
 
-fn render_scorecard(
-    app: &App,
-    idx: usize,
-    theme: &Theme,
-    frame: &mut Frame,
-    area: Rect,
-) {
+fn render_scorecard(app: &App, idx: usize, theme: &Theme, frame: &mut Frame, area: Rect) {
     let snapshots = app.snapshots();
     let snap = &snapshots[idx];
     let focused = idx == app.focus();
-    let title = if focused {
+    let badge = delta_badge(app.deltas().get(&snap.name));
+    let mut title_spans: Vec<Span> = Vec::with_capacity(4);
+    title_spans.push(Span::raw(if focused {
         format!("▶ {} ", snap.name)
     } else {
         format!(" {} ", snap.name)
-    };
-    let mut block = Block::default().borders(Borders::ALL).title(title);
+    }));
+    if let Some((label, palette)) = badge {
+        title_spans.push(Span::raw(" "));
+        title_spans.push(Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .fg(theme_color(theme, &palette))
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ));
+        title_spans.push(Span::raw(" "));
+    }
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(title_spans));
     if focused {
         block = block.border_style(
             Style::default()
@@ -203,11 +210,12 @@ fn render_scorecard(
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
+    let mut pip_style = Style::default().fg(theme_color(theme, &snap.status));
+    if app.pulse_active(&snap.name) {
+        pip_style = pip_style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    }
     let line = Line::from(vec![
-        Span::styled(
-            format!("{} ", pip_glyph(&snap.status)),
-            Style::default().fg(theme_color(theme, &snap.status)),
-        ),
+        Span::styled(format!("{} ", pip_glyph(&snap.status)), pip_style),
         Span::raw(snap.evidence.clone()),
     ]);
     frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), chunks[0]);
@@ -288,7 +296,10 @@ fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect
     };
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
-        inner.inner(Margin { horizontal: 1, vertical: 0 }),
+        inner.inner(Margin {
+            horizontal: 1,
+            vertical: 0,
+        }),
     );
 }
 
@@ -307,17 +318,17 @@ fn render_help_overlay(theme: &Theme, frame: &mut Frame, area: Rect) {
         .map(|l| {
             let (key, rest) = split_help_line(l);
             Line::from(vec![
-                Span::styled(
-                    format!("{key:<10}"),
-                    Style::default().fg(theme.overlay_key),
-                ),
+                Span::styled(format!("{key:<10}"), Style::default().fg(theme.overlay_key)),
                 Span::raw(rest.to_string()),
             ])
         })
         .collect();
     frame.render_widget(
         Paragraph::new(lines),
-        inner.inner(Margin { horizontal: 2, vertical: 1 }),
+        inner.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        }),
     );
 }
 
@@ -341,11 +352,25 @@ fn finding_lines(findings: &[Finding], theme: &Theme, full: bool) -> Vec<Line<'s
     }
     if !full && findings.len() > limit {
         out.push(Line::from(Span::styled(
-            format!("    +{} more — Enter for full detail", findings.len() - limit),
+            format!(
+                "    +{} more — Enter for full detail",
+                findings.len() - limit
+            ),
             Style::default().fg(theme.muted),
         )));
     }
     out
+}
+
+/// Map a delta to a (label, palette-key) pair the scorecard title can paint.
+/// Returns `None` when no badge should be rendered (i.e. `Delta::Unchanged`
+/// or absent baseline).
+fn delta_badge(delta: Option<&Delta>) -> Option<(&'static str, Status)> {
+    match delta {
+        Some(Delta::New) => Some(("NEW", Status::Fail)),
+        Some(Delta::Fixed) => Some(("FIXED", Status::Ok)),
+        _ => None,
+    }
 }
 
 pub fn pip_glyph(status: &Status) -> &'static str {
@@ -408,7 +433,12 @@ fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
     let v = (area.height * pct_y) / 100;
     let x = area.x + (area.width.saturating_sub(h)) / 2;
     let y = area.y + (area.height.saturating_sub(v)) / 2;
-    Rect { x, y, width: h, height: v }
+    Rect {
+        x,
+        y,
+        width: h,
+        height: v,
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +516,181 @@ mod tests {
         out
     }
 
+    fn baseline_with(pairs: &[(&str, &str)]) -> nico_doctor::baseline::Baseline {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn scorecard_renders_new_badge_when_layer_regressed_vs_baseline() {
+        let mut app = App::new();
+        app.set_baseline(Some(baseline_with(&[("logs", "ok")])));
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: "12 errors".into(),
+            findings: vec![],
+            duration_ms: 0,
+        }]));
+        let s = render_to_string(&app, 120, 24);
+        assert!(s.contains("NEW"), "NEW badge missing:\n{s}");
+    }
+
+    #[test]
+    fn scorecard_renders_fixed_badge_when_layer_recovered_vs_baseline() {
+        let mut app = App::new();
+        app.set_baseline(Some(baseline_with(&[("logs", "fail")])));
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Ok,
+            evidence: "all clear".into(),
+            findings: vec![],
+            duration_ms: 0,
+        }]));
+        let s = render_to_string(&app, 120, 24);
+        assert!(s.contains("FIXED"), "FIXED badge missing:\n{s}");
+    }
+
+    #[test]
+    fn missing_baseline_renders_no_delta_badges() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let s = render_to_string(&app, 120, 24);
+        assert!(
+            !s.contains("NEW"),
+            "NEW unexpectedly present without baseline:\n{s}"
+        );
+        assert!(
+            !s.contains("FIXED"),
+            "FIXED unexpectedly present without baseline:\n{s}"
+        );
+    }
+
+    #[test]
+    fn unchanged_delta_renders_no_badge() {
+        let mut app = App::new();
+        app.set_baseline(Some(baseline_with(&[("logs", "warn")])));
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: "still warn".into(),
+            findings: vec![],
+            duration_ms: 0,
+        }]));
+        let s = render_to_string(&app, 120, 24);
+        assert!(
+            !s.contains("NEW"),
+            "NEW unexpectedly shown for unchanged layer:\n{s}"
+        );
+        assert!(
+            !s.contains("FIXED"),
+            "FIXED unexpectedly shown for unchanged layer:\n{s}"
+        );
+    }
+
+    #[test]
+    fn pulsing_layer_pip_uses_reversed_modifier() {
+        use std::time::{Duration, Instant};
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle(Action::Tick(t0));
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Ok,
+            evidence: String::new(),
+            findings: vec![],
+            duration_ms: 0,
+        }]));
+        app.handle(Action::Tick(t0 + Duration::from_millis(50)));
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: String::new(),
+            findings: vec![],
+            duration_ms: 0,
+        }]));
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&app, &DEFAULT, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let pip = pip_glyph(&Status::Warn);
+        let mut found_reversed = false;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                if cell.symbol() == pip && cell.modifier.contains(Modifier::REVERSED) {
+                    found_reversed = true;
+                    break;
+                }
+            }
+            if found_reversed {
+                break;
+            }
+        }
+        assert!(found_reversed, "expected REVERSED modifier on pulsing pip");
+    }
+
+    #[test]
+    fn settled_layer_pip_does_not_use_reversed_modifier() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: String::new(),
+            findings: vec![],
+            duration_ms: 0,
+        }]));
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&app, &DEFAULT, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let pip = pip_glyph(&Status::Warn);
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                if cell.symbol() == pip {
+                    assert!(
+                        !cell.modifier.contains(Modifier::REVERSED),
+                        "non-pulsing pip must not have REVERSED set",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_badge_paints_in_error_palette() {
+        let mut app = App::new();
+        app.set_baseline(Some(baseline_with(&[("logs", "ok")])));
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: String::new(),
+            findings: vec![],
+            duration_ms: 0,
+        }]));
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&app, &DEFAULT, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Find the 'N' of "NEW" and check fg is theme.error.
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width.saturating_sub(2) {
+                let n = buf.cell((x, y)).unwrap();
+                let e = buf.cell((x + 1, y)).unwrap();
+                let w = buf.cell((x + 2, y)).unwrap();
+                if n.symbol() == "N" && e.symbol() == "E" && w.symbol() == "W" {
+                    assert_eq!(n.fg, DEFAULT.error, "NEW badge fg must use theme.error");
+                    return;
+                }
+            }
+        }
+        panic!("NEW badge not found in rendered output");
+    }
+
     #[test]
     fn pip_glyphs_are_distinct_per_status() {
         assert_ne!(pip_glyph(&Status::Ok), pip_glyph(&Status::Warn));
@@ -534,10 +739,7 @@ mod tests {
         let s = render_to_string(&app, 120, 20);
         // Focus marker is rendered as part of the focused scorecard's title.
         // We expect "▶ logs" but not "▶ cluster".
-        assert!(
-            s.contains("▶ logs"),
-            "expected '▶ logs' in render:\n{s}"
-        );
+        assert!(s.contains("▶ logs"), "expected '▶ logs' in render:\n{s}");
         assert!(
             !s.contains("▶ cluster"),
             "did not expect '▶ cluster' (cluster is not focused):\n{s}"
@@ -646,7 +848,9 @@ mod tests {
         let mut app = App::new();
         drive_runs(&mut app, &[0, 4, 8]);
         let s = render_to_string(&app, 120, 24);
-        let has_spark = s.chars().any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
+        let has_spark = s
+            .chars()
+            .any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
         assert!(has_spark, "expected sparkline glyph in render:\n{s}");
     }
 
@@ -655,7 +859,9 @@ mod tests {
         let mut app = App::new();
         drive_runs(&mut app, &[3]);
         let s = render_to_string(&app, 120, 24);
-        let has_spark = s.chars().any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
+        let has_spark = s
+            .chars()
+            .any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
         assert!(!has_spark, "no sparkline expected for <2 runs:\n{s}");
     }
 
@@ -677,7 +883,9 @@ mod tests {
         drive_runs(&mut app, &[0, 4, 8, 2, 6]);
         let s = render_to_string(&app, 120, 24);
         assert!(s.contains('■'), "breadcrumb missing:\n{s}");
-        let has_spark = s.chars().any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
+        let has_spark = s
+            .chars()
+            .any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
         assert!(has_spark, "sparkline missing:\n{s}");
     }
 
@@ -695,7 +903,10 @@ mod tests {
         }
         let s = render_to_string(&app, 120, 20);
         let count = s.chars().filter(|c| *c == '■').count();
-        assert!(count >= 3, "expected ≥3 breadcrumb squares, found {count}:\n{s}");
+        assert!(
+            count >= 3,
+            "expected ≥3 breadcrumb squares, found {count}:\n{s}"
+        );
     }
 
     #[test]
@@ -722,7 +933,10 @@ mod tests {
         }
         let s = render_to_string(&app, 120, 20);
         let count = s.chars().filter(|c| *c == '■').count();
-        assert_eq!(count, BREADCRUMB_CAP, "breadcrumb must cap at BREADCRUMB_CAP:\n{s}");
+        assert_eq!(
+            count, BREADCRUMB_CAP,
+            "breadcrumb must cap at BREADCRUMB_CAP:\n{s}"
+        );
     }
 
     #[test]

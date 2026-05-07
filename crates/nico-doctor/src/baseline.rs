@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use nico_common::output::Status;
 use crate::runner::Report;
+use nico_common::output::Status;
+use std::collections::HashMap;
 
 pub type Baseline = HashMap<String, String>;
 
@@ -12,31 +12,39 @@ pub enum Delta {
 }
 
 pub fn compute_deltas(report: &Report, baseline: Option<&Baseline>) -> HashMap<String, Delta> {
-    let Some(baseline) = baseline else {
-        return report.layers.iter()
-            .map(|l| (l.name.to_string(), Delta::Unchanged))
-            .collect();
-    };
+    compute_deltas_for(report.layers.iter().map(|l| (l.name, &l.status)), baseline)
+}
 
-    report.layers.iter().map(|l| {
-        let delta = match baseline.get(l.name) {
-            None => Delta::Unchanged,
-            Some(prev) => {
-                let prev_bad = matches!(prev.as_str(), "warn" | "fail");
-                let now_bad = matches!(l.status, Status::Warn | Status::Fail);
-                let prev_ok = matches!(prev.as_str(), "ok" | "skipped");
-                let now_ok = matches!(l.status, Status::Ok | Status::Skipped);
-                if prev_ok && now_bad {
-                    Delta::New
-                } else if prev_bad && now_ok {
-                    Delta::Fixed
-                } else {
-                    Delta::Unchanged
+/// Same delta logic as [`compute_deltas`], but reads `(name, status)` pairs
+/// directly so callers that don't have a [`Report`] (for example the nico-ops
+/// dashboard, whose snapshots own their layer names as `String`) can reuse the
+/// baseline comparison without synthesising a fake report.
+pub fn compute_deltas_for<'a, I>(layers: I, baseline: Option<&Baseline>) -> HashMap<String, Delta>
+where
+    I: IntoIterator<Item = (&'a str, &'a Status)>,
+{
+    layers
+        .into_iter()
+        .map(|(name, status)| {
+            let delta = match baseline.and_then(|b| b.get(name)) {
+                None => Delta::Unchanged,
+                Some(prev) => {
+                    let prev_bad = matches!(prev.as_str(), "warn" | "fail");
+                    let now_bad = matches!(status, Status::Warn | Status::Fail);
+                    let prev_ok = matches!(prev.as_str(), "ok" | "skipped");
+                    let now_ok = matches!(status, Status::Ok | Status::Skipped);
+                    if prev_ok && now_bad {
+                        Delta::New
+                    } else if prev_bad && now_ok {
+                        Delta::Fixed
+                    } else {
+                        Delta::Unchanged
+                    }
                 }
-            }
-        };
-        (l.name.to_string(), delta)
-    }).collect()
+            };
+            (name.to_string(), delta)
+        })
+        .collect()
 }
 
 fn status_str(status: &Status) -> &'static str {
@@ -67,14 +75,19 @@ fn load_from(path: &std::path::Path) -> Option<Baseline> {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            eprintln!("nico: warn: could not read baseline {}: {e}", path.display());
+            eprintln!(
+                "nico: warn: could not read baseline {}: {e}",
+                path.display()
+            );
             return None;
         }
     };
     match serde_json::from_str::<Baseline>(&data) {
         Ok(b) => Some(b),
         Err(e) => {
-            eprintln!("nico: warn: baseline file is corrupt ({e}); proceeding without prior baseline");
+            eprintln!(
+                "nico: warn: baseline file is corrupt ({e}); proceeding without prior baseline"
+            );
             None
         }
     }
@@ -87,7 +100,9 @@ fn save_to(path: &std::path::Path, report: &Report) {
         eprintln!("nico: warn: could not create baseline directory: {e}");
         return;
     }
-    let map: Baseline = report.layers.iter()
+    let map: Baseline = report
+        .layers
+        .iter()
         .map(|l| (l.name.to_string(), status_str(&l.status).to_string()))
         .collect();
     let json = match serde_json::to_string_pretty(&map) {
@@ -110,12 +125,15 @@ mod tests {
 
     fn make_report(layers: &[(&'static str, Status)]) -> Report {
         Report {
-            layers: layers.iter().map(|(name, status)| LayerResult {
-                name,
-                status: status.clone(),
-                checks: vec![],
-                duration_ms: 0,
-            }).collect(),
+            layers: layers
+                .iter()
+                .map(|(name, status)| LayerResult {
+                    name,
+                    status: status.clone(),
+                    checks: vec![],
+                    duration_ms: 0,
+                })
+                .collect(),
         }
     }
 
@@ -165,10 +183,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let path = tmp_path("round-trip");
-        let report = make_report(&[
-            ("cluster", Status::Ok),
-            ("logs", Status::Warn),
-        ]);
+        let report = make_report(&[("cluster", Status::Ok), ("logs", Status::Warn)]);
         save_to(&path, &report);
         let baseline = load_from(&path).expect("should load saved baseline");
         assert_eq!(baseline["cluster"], "ok");
@@ -207,14 +222,22 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // Simulate: main.rs calls save() only when code != 3.
         let report = make_report(&[("cluster", Status::Unknown)]);
-        let code = if report.layers.iter().any(|l| l.status == Status::Fail) { 2 }
-            else if report.layers.iter().any(|l| l.status == Status::Warn) { 1 }
-            else if report.layers.iter().any(|l| l.status == Status::Unknown) { 3 }
-            else { 0 };
+        let code = if report.layers.iter().any(|l| l.status == Status::Fail) {
+            2
+        } else if report.layers.iter().any(|l| l.status == Status::Warn) {
+            1
+        } else if report.layers.iter().any(|l| l.status == Status::Unknown) {
+            3
+        } else {
+            0
+        };
         if code != 3 {
             save_to(&path, &report);
         }
-        assert!(!path.exists(), "baseline must not be written on exit code 3");
+        assert!(
+            !path.exists(),
+            "baseline must not be written on exit code 3"
+        );
     }
 
     // ── delta computation tests ───────────────────────────────────────────────
@@ -291,16 +314,15 @@ mod tests {
 
     #[test]
     fn exit_0_1_2_write_baseline() {
-        for (status, expected_code) in [
-            (Status::Ok, 0),
-            (Status::Warn, 1),
-            (Status::Fail, 2),
-        ] {
+        for (status, expected_code) in [(Status::Ok, 0), (Status::Warn, 1), (Status::Fail, 2)] {
             let path = tmp_path(&format!("exit-{expected_code}"));
             let _ = std::fs::remove_file(&path);
             let report = make_report(&[("cluster", status)]);
             save_to(&path, &report);
-            assert!(path.exists(), "baseline must be written for exit code {expected_code}");
+            assert!(
+                path.exists(),
+                "baseline must be written for exit code {expected_code}"
+            );
             let _ = std::fs::remove_file(&path);
         }
     }

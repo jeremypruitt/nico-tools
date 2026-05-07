@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
+use nico_common::output::Status;
+use nico_doctor::baseline::{Baseline, Delta, compute_deltas_for};
 
 use crate::action::{Action, Dir};
 use crate::events::Overlay;
 use crate::model::LayerSnapshot;
+use crate::pulse::PulseTimer;
 use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
 
 /// Default auto-refresh cadence when no flag/env/config override is set.
@@ -44,6 +48,10 @@ pub struct App {
     boot: Option<Instant>,
     now: Option<Instant>,
     history: RingBuffer,
+    baseline: Option<Baseline>,
+    deltas: HashMap<String, Delta>,
+    prev_status: HashMap<String, Status>,
+    pulses: HashMap<String, PulseTimer>,
 }
 
 impl App {
@@ -65,6 +73,31 @@ impl App {
             boot: None,
             now: None,
             history: RingBuffer::new(),
+            baseline: None,
+            deltas: HashMap::new(),
+            prev_status: HashMap::new(),
+            pulses: HashMap::new(),
+        }
+    }
+
+    /// Seed the baseline used for `NEW` / `FIXED` delta badges. Pass
+    /// `None` to clear (e.g. when the baseline file is missing).
+    pub fn set_baseline(&mut self, baseline: Option<Baseline>) {
+        self.baseline = baseline;
+        self.recompute_deltas();
+    }
+
+    /// Per-layer `NEW` / `FIXED` / `Unchanged` map computed against the
+    /// baseline most recently seeded with [`set_baseline`].
+    pub fn deltas(&self) -> &HashMap<String, Delta> {
+        &self.deltas
+    }
+
+    /// Whether the named layer's pip is currently mid-pulse.
+    pub fn pulse_active(&self, layer_name: &str) -> bool {
+        match (self.pulses.get(layer_name), self.now) {
+            (Some(t), Some(now)) => t.is_active(now),
+            _ => false,
         }
     }
 
@@ -183,6 +216,8 @@ impl App {
                 if self.focus >= snaps.len() && !snaps.is_empty() {
                     self.focus = snaps.len() - 1;
                 }
+                self.update_pulses(&snaps);
+                self.update_prev_status(&snaps);
                 self.history.push(run_snapshot_from(&snaps));
                 self.snapshots = snaps;
                 self.refreshing = false;
@@ -190,6 +225,7 @@ impl App {
                 if let Some(now) = self.now {
                     self.next_refresh_at = Some(now + self.interval);
                 }
+                self.recompute_deltas();
                 self.dirty = true;
                 None
             }
@@ -207,11 +243,7 @@ impl App {
                     self.dirty = true;
                     return None;
                 }
-                if !self.paused
-                    && self
-                        .next_refresh_at
-                        .is_some_and(|deadline| now >= deadline)
-                {
+                if !self.paused && self.next_refresh_at.is_some_and(|deadline| now >= deadline) {
                     self.refreshing = true;
                     self.next_refresh_at = None;
                     self.dirty = true;
@@ -229,6 +261,31 @@ impl App {
     fn force_now(&mut self, boot: Instant, now: Instant) {
         self.boot = Some(boot);
         self.now = Some(now);
+    }
+
+    fn update_pulses(&mut self, snaps: &[LayerSnapshot]) {
+        let Some(now) = self.now else { return };
+        for s in snaps {
+            if let Some(prev) = self.prev_status.get(&s.name)
+                && *prev != s.status
+            {
+                self.pulses.entry(s.name.clone()).or_default().start(now);
+            }
+        }
+    }
+
+    fn update_prev_status(&mut self, snaps: &[LayerSnapshot]) {
+        for s in snaps {
+            self.prev_status.insert(s.name.clone(), s.status.clone());
+        }
+    }
+
+    fn recompute_deltas(&mut self) {
+        let baseline_ref = self.baseline.as_ref();
+        self.deltas = compute_deltas_for(
+            self.snapshots.iter().map(|s| (s.name.as_str(), &s.status)),
+            baseline_ref,
+        );
     }
 
     fn move_focus(&mut self, dir: Dir) -> bool {
@@ -371,7 +428,10 @@ mod tests {
     fn focus_right_at_end_of_row_is_inert() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        drive(&mut app, &[Action::Focus(Dir::Right), Action::Focus(Dir::Right)]);
+        drive(
+            &mut app,
+            &[Action::Focus(Dir::Right), Action::Focus(Dir::Right)],
+        );
         assert_eq!(app.focus(), 2);
         app.clear_dirty();
         app.handle(Action::Focus(Dir::Right));
@@ -391,7 +451,10 @@ mod tests {
     fn focus_up_moves_to_previous_row() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        drive(&mut app, &[Action::Focus(Dir::Down), Action::Focus(Dir::Up)]);
+        drive(
+            &mut app,
+            &[Action::Focus(Dir::Down), Action::Focus(Dir::Up)],
+        );
         assert_eq!(app.focus(), 0);
     }
 
@@ -452,7 +515,10 @@ mod tests {
     fn snapshots_clamps_focus_when_layer_count_drops() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        drive(&mut app, &[Action::Focus(Dir::Right), Action::Focus(Dir::Right)]);
+        drive(
+            &mut app,
+            &[Action::Focus(Dir::Right), Action::Focus(Dir::Right)],
+        );
         assert_eq!(app.focus(), 2);
         let smaller = vec![snap("cluster", Status::Ok), snap("logs", Status::Ok)];
         app.handle(Action::Snapshots(smaller));
@@ -615,6 +681,101 @@ mod tests {
         assert_eq!(app.throbber_glyph(), THROBBER_DONE);
     }
 
+    // ── delta + pulse integration ────────────────────────────────────────
+
+    fn baseline_of(pairs: &[(&str, &str)]) -> Baseline {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn snapshots_with_baseline_marks_new_delta() {
+        let mut app = App::new();
+        app.set_baseline(Some(baseline_of(&[("logs", "ok")])));
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Warn)]));
+        assert_eq!(app.deltas().get("logs"), Some(&Delta::New));
+    }
+
+    #[test]
+    fn snapshots_with_baseline_marks_fixed_delta() {
+        let mut app = App::new();
+        app.set_baseline(Some(baseline_of(&[("logs", "fail")])));
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Ok)]));
+        assert_eq!(app.deltas().get("logs"), Some(&Delta::Fixed));
+    }
+
+    #[test]
+    fn snapshots_without_baseline_yield_unchanged_only() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Warn)]));
+        assert_eq!(app.deltas().get("logs"), Some(&Delta::Unchanged));
+    }
+
+    #[test]
+    fn first_snapshot_does_not_pulse_any_layer() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle(Action::Tick(t0));
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Ok)]));
+        assert!(!app.pulse_active("logs"));
+    }
+
+    #[test]
+    fn second_snapshot_with_status_flip_starts_pulse() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle(Action::Tick(t0));
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Ok)]));
+        app.handle(Action::Tick(t0 + Duration::from_millis(100)));
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Warn)]));
+        assert!(app.pulse_active("logs"));
+    }
+
+    #[test]
+    fn second_snapshot_without_flip_does_not_pulse() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle(Action::Tick(t0));
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Warn)]));
+        app.handle(Action::Tick(t0 + Duration::from_millis(100)));
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Warn)]));
+        assert!(!app.pulse_active("logs"));
+    }
+
+    #[test]
+    fn pulse_decays_after_pulse_duration() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle(Action::Tick(t0));
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Ok)]));
+        app.handle(Action::Tick(t0 + Duration::from_millis(50)));
+        app.handle(Action::Snapshots(vec![snap("logs", Status::Warn)]));
+        assert!(app.pulse_active("logs"));
+        // Pulse window starts at t0+50ms; ends at t0+650ms.
+        app.handle(Action::Tick(t0 + Duration::from_millis(700)));
+        assert!(!app.pulse_active("logs"));
+    }
+
+    #[test]
+    fn pulse_fires_only_for_the_layer_that_flipped() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle(Action::Tick(t0));
+        app.handle(Action::Snapshots(vec![
+            snap("cluster", Status::Ok),
+            snap("logs", Status::Ok),
+        ]));
+        app.handle(Action::Tick(t0 + Duration::from_millis(100)));
+        app.handle(Action::Snapshots(vec![
+            snap("cluster", Status::Ok),
+            snap("logs", Status::Warn),
+        ]));
+        assert!(app.pulse_active("logs"));
+        assert!(!app.pulse_active("cluster"));
+    }
+
     #[test]
     fn throbber_glyph_animates_while_refreshing() {
         let mut app = App::new();
@@ -629,5 +790,4 @@ mod tests {
         assert_ne!(f0, f3, "throbber should cycle frames over time");
         assert_ne!(f0, THROBBER_DONE);
     }
-
 }

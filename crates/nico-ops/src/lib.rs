@@ -21,6 +21,7 @@ pub mod clock;
 pub mod data;
 pub mod events;
 pub mod model;
+pub mod pulse;
 pub mod ringbuffer;
 pub mod view;
 pub mod widgets;
@@ -37,8 +38,7 @@ pub use cli::OpsArgs;
 /// auto-refresh deadline checks and throbber animation.
 const TICK: Duration = Duration::from_millis(100);
 
-const NON_TTY_MESSAGE: &str =
-    "nico ops requires an interactive terminal (stdout is not a TTY)";
+const NON_TTY_MESSAGE: &str = "nico ops requires an interactive terminal (stdout is not a TTY)";
 
 /// Top-level entry point. Runs the dashboard against a live cluster.
 /// Returns a process exit code (0 = clean exit, 3 = preflight failure or
@@ -160,6 +160,7 @@ async fn run_event_loop<C: Clock>(
     let layers = Arc::new(layers);
 
     let mut app = App::with_interval(interval);
+    app.set_baseline(nico_doctor::baseline::load());
     let (tx, mut rx) = mpsc::channel::<Action>(64);
 
     spawn_refresh(layers.clone(), opts.clone(), tx.clone());
@@ -214,8 +215,9 @@ pub fn resolve_interval(
     bootstrap_default: Duration,
 ) -> Result<Duration, String> {
     match interval_flag {
-        Some(s) => humantime::parse_duration(s)
-            .map_err(|e| format!("invalid --interval {s:?}: {e}")),
+        Some(s) => {
+            humantime::parse_duration(s).map_err(|e| format!("invalid --interval {s:?}: {e}"))
+        }
         None => Ok(bootstrap_default),
     }
 }
