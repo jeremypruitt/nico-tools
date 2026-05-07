@@ -1989,6 +1989,7 @@ dependencies = [
  "futures",
  "humantime",
  "nico-common",
+ "nico-correlate",
  "nico-doctor",
  "ratatui",
  "tokio",

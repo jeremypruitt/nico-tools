@@ -13,6 +13,10 @@ pub enum Overlay {
     None,
     Detail,
     Help,
+    /// Quick-correlate popover (issue #157). Holds no payload itself;
+    /// the workflow ID, loading state, events, and source errors live
+    /// on `App::correlate_state` so the overlay marker can stay `Copy`.
+    Correlate,
 }
 
 /// Reserved for future input modes (filter bar, etc.). Today only `Normal`
@@ -60,6 +64,7 @@ fn translate_key(key: &KeyEvent, _mode: Mode, layout: Layout, overlay: Overlay) 
 
     match (layout, overlay) {
         (_, Overlay::Detail | Overlay::Help) => translate_overlay(key, overlay),
+        (_, Overlay::Correlate) => translate_correlate_overlay(key),
         (Layout::A, Overlay::None) => translate_normal(key),
         (Layout::Spotlight, Overlay::None) => translate_spotlight(key),
     }
@@ -73,6 +78,10 @@ fn translate_normal(key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('m') | KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
         KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::ShowSpotlight),
         KeyCode::Char('?') => Some(Action::OpenHelp),
+        // `c` from Layout A targets the focused workflow Finding (issue
+        // #157). Reducer turns it into a no-op when the focused Layer is
+        // not `workflows`.
+        KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::Correlate),
         KeyCode::Enter => Some(Action::OpenDetail),
         KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
         KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
@@ -111,6 +120,16 @@ fn translate_overlay(key: &KeyEvent, overlay: Overlay) -> Option<Action> {
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('?') if matches!(overlay, Overlay::Help) => Some(Action::CloseOverlay),
         KeyCode::Enter if matches!(overlay, Overlay::Detail) => Some(Action::CloseOverlay),
+        _ => None,
+    }
+}
+
+/// Quick-correlate popover (issue #157). Both `Esc` and `q` dismiss; the
+/// usual quit-on-`q` is locally overridden so the operator can return to
+/// the dashboard without exiting the process.
+fn translate_correlate_overlay(key: &KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::CloseOverlay),
         _ => None,
     }
 }
@@ -417,12 +436,60 @@ mod tests {
     }
 
     #[test]
-    fn yoc_in_layout_a_do_not_emit_spotlight_actions() {
+    fn y_and_o_in_layout_a_do_not_emit_spotlight_actions() {
+        // y and o are Spotlight-only; they have no Layout A binding.
         assert_eq!(tr(&k(KeyCode::Char('y')), Overlay::None), None);
         assert_eq!(tr(&k(KeyCode::Char('o')), Overlay::None), None);
-        // 'c' lowercase is not bound in Layout A; only Ctrl-C is, and that's
-        // handled separately.
-        assert_eq!(tr(&k(KeyCode::Char('c')), Overlay::None), None);
+    }
+
+    #[test]
+    fn c_in_layout_a_emits_correlate_too() {
+        // Issue #157: `c` is bound in Layout A as well so the operator
+        // can pop the quick-correlate overlay from the scorecard grid
+        // without first switching to Spotlight.
+        assert_eq!(
+            tr(&k(KeyCode::Char('c')), Overlay::None),
+            Some(Action::Correlate)
+        );
+    }
+
+    #[test]
+    fn esc_closes_correlate_overlay() {
+        assert_eq!(
+            translate(
+                &k(KeyCode::Esc),
+                Mode::Normal,
+                Layout::A,
+                Overlay::Correlate,
+            ),
+            Some(Action::CloseOverlay)
+        );
+    }
+
+    #[test]
+    fn q_closes_correlate_overlay_instead_of_quitting() {
+        assert_eq!(
+            translate(
+                &k(KeyCode::Char('q')),
+                Mode::Normal,
+                Layout::A,
+                Overlay::Correlate,
+            ),
+            Some(Action::CloseOverlay)
+        );
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_inside_correlate_overlay() {
+        assert_eq!(
+            translate(
+                &ctrl(KeyCode::Char('c')),
+                Mode::Normal,
+                Layout::A,
+                Overlay::Correlate,
+            ),
+            Some(Action::Quit)
+        );
     }
 
     #[test]

@@ -14,7 +14,10 @@ use nico_doctor::baseline::Delta;
 
 use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
-use crate::model::{Finding, LayerSnapshot, overall_verdict};
+use crate::model::{
+    CorrelateState, CorrelateStatus, Finding, LayerSnapshot, PopoverEvent, PopoverSeverity,
+    SourceError, overall_verdict,
+};
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
 
 /// How many recent verdicts the header breadcrumb shows. The ring buffer
@@ -40,7 +43,7 @@ pub const HELP_LINES: &[&str] = &[
     "a / Esc   show all (return from spotlight)",
     "y         copy focused next-command (spotlight)",
     "o         open focused link (spotlight)",
-    "c         correlate (spotlight; reserved)",
+    "c         quick-correlate popover (workflow Finding)",
     "Esc       close overlay",
     "?         this help",
     "q / ^C    quit",
@@ -79,6 +82,7 @@ fn render_layout_a(app: &mut App, theme: &Theme, frame: &mut Frame) {
     match app.overlay() {
         Overlay::Detail => render_detail_overlay(app, theme, frame, area),
         Overlay::Help => render_help_overlay(theme, frame, area),
+        Overlay::Correlate => render_correlate_overlay(app, theme, frame, area),
         Overlay::None => {}
     }
 }
@@ -104,8 +108,10 @@ fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
 
     // Layout C still honors the help overlay (`?`) so the operator can
     // see all keybinds, including the Spotlight-only ones.
-    if matches!(app.overlay(), Overlay::Help) {
-        render_help_overlay(theme, frame, area);
+    match app.overlay() {
+        Overlay::Help => render_help_overlay(theme, frame, area),
+        Overlay::Correlate => render_correlate_overlay(app, theme, frame, area),
+        _ => {}
     }
 }
 
@@ -521,6 +527,106 @@ fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect
     );
 }
 
+/// Quick-correlate popover (issue #157). Centered ~80%×70% modal; title
+/// shows the workflow ID and a throbber while collecting; body renders
+/// the Source-attributed Timeline. Failed Sources surface as inline
+/// `source_error` rows so the operator can see *why* a Source dropped
+/// out without leaving the dashboard.
+fn render_correlate_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let inner_area = centered(area, 80, 70);
+    let Some(state) = app.correlate_state() else {
+        return;
+    };
+    let title = correlate_title(app, state);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().bg(theme.overlay_bg).fg(theme.overlay_fg));
+    let inner = block.inner(inner_area);
+    frame.render_widget(Clear, inner_area);
+    frame.render_widget(block, inner_area);
+
+    let body = inner.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    let lines = correlate_body_lines(state, theme);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+}
+
+fn correlate_title(app: &App, state: &CorrelateState) -> String {
+    let throb = app.throbber_glyph();
+    let (loading_marker, suffix) = match state.status {
+        CorrelateStatus::Loading if !throb.is_empty() => (format!(" {throb}"), " collecting…"),
+        CorrelateStatus::Loading => (String::new(), " collecting…"),
+        CorrelateStatus::Loaded { .. } => (String::new(), ""),
+    };
+    format!(
+        " correlate — {}{}{} ",
+        state.workflow_id, loading_marker, suffix
+    )
+}
+
+fn correlate_body_lines(state: &CorrelateState, theme: &Theme) -> Vec<Line<'static>> {
+    match &state.status {
+        CorrelateStatus::Loading => vec![Line::from(Span::styled(
+            "loading timeline…".to_string(),
+            Style::default().fg(theme.muted),
+        ))],
+        CorrelateStatus::Loaded {
+            events,
+            source_errors,
+        } => {
+            if events.is_empty() && source_errors.is_empty() {
+                return vec![Line::from(Span::styled(
+                    "(no events found for this workflow)".to_string(),
+                    Style::default().fg(theme.muted),
+                ))];
+            }
+            let mut out: Vec<Line<'static>> =
+                Vec::with_capacity(events.len() + source_errors.len());
+            for e in events {
+                out.push(format_popover_event(e, theme));
+            }
+            for se in source_errors {
+                out.push(format_source_error(se, theme));
+            }
+            out
+        }
+    }
+}
+
+fn format_popover_event(e: &PopoverEvent, theme: &Theme) -> Line<'static> {
+    let color = popover_color(theme, e.severity);
+    let ts = e.ts.format("%H:%M:%S").to_string();
+    let mut spans = vec![
+        Span::styled(format!("{ts}  "), Style::default().fg(theme.muted)),
+        Span::styled(format!("{}  ", e.source), Style::default().fg(color)),
+        Span::styled(e.kind.clone(), Style::default().fg(color)),
+    ];
+    if !e.message.is_empty() {
+        spans.push(Span::raw(format!("  {}", e.message)));
+    }
+    Line::from(spans)
+}
+
+fn format_source_error(se: &SourceError, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("          ".to_string(), Style::default().fg(theme.muted)),
+        Span::styled(format!("{}  ", se.name), Style::default().fg(theme.error)),
+        Span::styled("source_error".to_string(), Style::default().fg(theme.error)),
+        Span::raw(format!("  {}", se.reason)),
+    ])
+}
+
+fn popover_color(theme: &Theme, severity: PopoverSeverity) -> ratatui::style::Color {
+    match severity {
+        PopoverSeverity::Info => theme.muted,
+        PopoverSeverity::Warning => theme.warn,
+        PopoverSeverity::Error => theme.error,
+    }
+}
+
 fn render_help_overlay(theme: &Theme, frame: &mut Frame, area: Rect) {
     let inner_area = centered(area, 60, 50);
     let block = Block::default()
@@ -663,7 +769,8 @@ fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::action::{Action, Dir};
-    use crate::model::LayerSnapshot;
+    use crate::model::{LayerSnapshot, PopoverEvent, PopoverSeverity, SourceError};
+    use chrono::TimeZone;
     use nico_common::theme::DEFAULT;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1547,5 +1654,156 @@ mod tests {
             enter_spotlight(&mut app);
             let _ = render_to_string(&mut app, w, h);
         }
+    }
+
+    // ── Quick-correlate popover (issue #157) ────────────────────────────
+
+    fn workflows_snap_with_id(id: &str) -> LayerSnapshot {
+        LayerSnapshot {
+            name: "workflows".into(),
+            status: Status::Warn,
+            evidence: "1 stuck".into(),
+            findings: vec![Finding {
+                status: Status::Warn,
+                message: format!(
+                    "stuck_workflow: {id} (HostProvisioning): 47m running, last: 47 events"
+                ),
+                next_command: Some(format!("temporal workflow show -w {id}")),
+                link: None,
+            }],
+            duration_ms: 0,
+        }
+    }
+
+    fn open_correlate(app: &mut App) {
+        app.handle(Action::Correlate);
+    }
+
+    #[test]
+    fn correlate_overlay_title_shows_workflow_id_and_throbber_while_loading() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
+        open_correlate(&mut app);
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(s.contains("correlate"), "popover title missing:\n{s}");
+        assert!(s.contains("wf-001"), "workflow id missing in title:\n{s}");
+        assert!(
+            s.contains("collecting"),
+            "throbber/collecting indicator missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn correlate_overlay_body_renders_loaded_timeline_events() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
+        open_correlate(&mut app);
+        app.handle(Action::CorrelateResults {
+            workflow_id: "wf-001".into(),
+            events: vec![
+                PopoverEvent {
+                    ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 5).unwrap(),
+                    source: "temporal".into(),
+                    kind: "WorkflowExecutionStarted".into(),
+                    message: String::new(),
+                    severity: PopoverSeverity::Info,
+                },
+                PopoverEvent {
+                    ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 9).unwrap(),
+                    source: "temporal".into(),
+                    kind: "WorkflowExecutionFailed".into(),
+                    message: "deadline exceeded".into(),
+                    severity: PopoverSeverity::Error,
+                },
+            ],
+            source_errors: vec![],
+        });
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("WorkflowExecutionStarted"),
+            "first event missing:\n{s}"
+        );
+        assert!(
+            s.contains("WorkflowExecutionFailed"),
+            "second event missing:\n{s}"
+        );
+        assert!(
+            s.contains("deadline exceeded"),
+            "event message missing:\n{s}"
+        );
+        assert!(
+            !s.contains("collecting"),
+            "Loading indicator should disappear after results land:\n{s}"
+        );
+    }
+
+    #[test]
+    fn correlate_overlay_renders_source_errors_inline_as_source_error_rows() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
+        open_correlate(&mut app);
+        app.handle(Action::CorrelateResults {
+            workflow_id: "wf-001".into(),
+            events: vec![],
+            source_errors: vec![SourceError {
+                name: "loki".into(),
+                reason: "LOKI_URL not set".into(),
+            }],
+        });
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("source_error"),
+            "synthetic source_error row missing:\n{s}"
+        );
+        assert!(s.contains("loki"), "failed source name missing:\n{s}");
+        assert!(
+            s.contains("LOKI_URL not set"),
+            "failed source reason missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn correlate_overlay_renders_empty_state_when_no_events_and_no_source_errors() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
+        open_correlate(&mut app);
+        app.handle(Action::CorrelateResults {
+            workflow_id: "wf-001".into(),
+            events: vec![],
+            source_errors: vec![],
+        });
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("no events found"),
+            "empty-state hint missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn correlate_overlay_does_not_render_when_overlay_is_none() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            !s.contains("correlate —"),
+            "popover must not render until `c` opens it:\n{s}"
+        );
+    }
+
+    #[test]
+    fn correlate_overlay_renders_in_spotlight_layout_too() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
+        app.handle(Action::ShowSpotlight);
+        open_correlate(&mut app);
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("correlate"),
+            "popover should overlay Spotlight:\n{s}"
+        );
+        assert!(
+            s.contains("wf-001"),
+            "wf id missing in Spotlight overlay:\n{s}"
+        );
     }
 }

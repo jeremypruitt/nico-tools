@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 nico-common = { path = "../nico-common" }
 nico-doctor = { path = "../nico-doctor" }
+nico-correlate = { path = "../nico-correlate" }
 clap = { version = "4", features = ["derive", "env"] }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", features = ["event-stream"] }

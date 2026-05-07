@@ -30,7 +30,7 @@ use crate::action::Action;
 use crate::app::{App, Effect};
 use crate::clock::{Clock, SystemClock};
 use crate::events::{Mode, translate};
-use crate::model::LayerSnapshot;
+use crate::model::{LayerSnapshot, PopoverEvent, PopoverSeverity, SourceError};
 
 pub use cli::OpsArgs;
 
@@ -256,7 +256,100 @@ fn dispatch(
             }
             false
         }
+        Some(Effect::Correlate(workflow_id)) => {
+            spawn_correlate(workflow_id, tx.clone());
+            false
+        }
         None => false,
+    }
+}
+
+/// Run `nico_correlate::collect_all` for `workflow_id` on a background
+/// task and post the resulting timeline back through the action channel.
+/// All errors (config load, source preparation, collection) end up as
+/// `Action::CorrelateResults` with a populated `source_errors` so the
+/// popover can render them inline as `source_error` rows. (Issue #157.)
+fn spawn_correlate(workflow_id: String, tx: mpsc::Sender<Action>) {
+    tokio::spawn(async move {
+        let (events, source_errors) = run_correlate_collect(&workflow_id).await;
+        let _ = tx
+            .send(Action::CorrelateResults {
+                workflow_id,
+                events,
+                source_errors,
+            })
+            .await;
+    });
+}
+
+async fn run_correlate_collect(workflow_id: &str) -> (Vec<PopoverEvent>, Vec<SourceError>) {
+    let args = correlate_args(workflow_id);
+    let cfg = match nico_correlate::resolve_config(&args) {
+        Ok(c) => c,
+        Err(nico_correlate::BootstrapErr::Fatal { message, .. }) => {
+            return (
+                vec![],
+                vec![SourceError {
+                    name: "config".into(),
+                    reason: message,
+                }],
+            );
+        }
+    };
+    let prepared = nico_correlate::prepare_sources(&args, &cfg).await;
+    let results =
+        nico_correlate::collect_all(&prepared.named_sources, &args.id, &cfg.id_type).await;
+    drop(prepared._pf_guards);
+
+    let mut events: Vec<PopoverEvent> = Vec::new();
+    let mut source_errors: Vec<SourceError> = Vec::new();
+    for r in results {
+        match r {
+            nico_correlate::source::SourceResult::Output(o) => {
+                for e in o.events {
+                    events.push(PopoverEvent {
+                        ts: e.ts,
+                        source: e.source,
+                        kind: e.kind,
+                        message: e.message,
+                        severity: severity_to_popover(&e.severity),
+                    });
+                }
+            }
+            nico_correlate::source::SourceResult::Unavailable(u) => {
+                source_errors.push(SourceError {
+                    name: u.name.to_string(),
+                    reason: u.reason.clone(),
+                });
+            }
+        }
+    }
+    events.sort_by_key(|e| e.ts);
+    (events, source_errors)
+}
+
+fn severity_to_popover(s: &nico_correlate::event::Severity) -> PopoverSeverity {
+    match s {
+        nico_correlate::event::Severity::Info => PopoverSeverity::Info,
+        nico_correlate::event::Severity::Warning => PopoverSeverity::Warning,
+        nico_correlate::event::Severity::Error => PopoverSeverity::Error,
+    }
+}
+
+fn correlate_args(workflow_id: &str) -> nico_correlate::CorrelateArgs {
+    nico_correlate::CorrelateArgs {
+        id: workflow_id.to_string(),
+        r#type: Some("workflow".to_string()),
+        sources: vec![],
+        pod: None,
+        since: "1h".to_string(),
+        json: false,
+        tail: false,
+        ascii: false,
+        no_color: true,
+        theme: None,
+        config: None,
+        mode: None,
     }
 }
 

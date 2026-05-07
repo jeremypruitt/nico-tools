@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 
 use crate::action::{Action, Dir, ScrollDir};
 use crate::events::Overlay;
-use crate::model::LayerSnapshot;
+use crate::model::{CorrelateState, CorrelateStatus, LayerSnapshot, workflow_id_from_finding};
 use crate::pulse::PulseTimer;
 use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
 
@@ -63,6 +63,10 @@ pub enum Effect {
     /// default). Best-effort; failures translate into
     /// `Action::ShowToast`.
     OpenUrl(String),
+    /// Kick off `nico_correlate::collect_all` for the given workflow ID.
+    /// The host loop spawns the call and posts the results back via
+    /// `Action::CorrelateResults`. (Issue #157.)
+    Correlate(String),
     /// Tear down and exit cleanly.
     Quit,
 }
@@ -92,6 +96,7 @@ pub struct App {
     layout: Layout,
     spotlight_focus: usize,
     toast: Option<Toast>,
+    correlate: Option<CorrelateState>,
 }
 
 /// A transient bottom-bar message and its expiry timestamp. Cleared by
@@ -132,6 +137,7 @@ impl App {
             layout: Layout::default(),
             spotlight_focus: 0,
             toast: None,
+            correlate: None,
         }
     }
 
@@ -181,6 +187,13 @@ impl App {
     /// `expires_at`.
     pub fn toast(&self) -> Option<&Toast> {
         self.toast.as_ref()
+    }
+
+    /// Quick-correlate popover state. `None` when the popover has never
+    /// been opened or has been dismissed (`Esc` / `q`). The renderer
+    /// only consults this when `overlay() == Overlay::Correlate`.
+    pub fn correlate_state(&self) -> Option<&CorrelateState> {
+        self.correlate.as_ref()
     }
 
     pub fn overlay_scroll(&self) -> u16 {
@@ -297,6 +310,7 @@ impl App {
             Action::CloseOverlay => {
                 if self.overlay != Overlay::None {
                     self.overlay = Overlay::None;
+                    self.correlate = None;
                     self.dirty = true;
                 }
                 None
@@ -432,8 +446,32 @@ impl App {
                 }
             }
             Action::Correlate => {
-                // Placeholder for the quick-correlate popover slice.
-                // Wired so the keybind is discoverable; no-op today.
+                if self.overlay != Overlay::None {
+                    return None;
+                }
+                let workflow_id = self.focused_workflow_id()?;
+                self.overlay = Overlay::Correlate;
+                self.correlate = Some(CorrelateState {
+                    workflow_id: workflow_id.clone(),
+                    status: CorrelateStatus::Loading,
+                });
+                self.dirty = true;
+                Some(Effect::Correlate(workflow_id))
+            }
+            Action::CorrelateResults {
+                workflow_id,
+                events,
+                source_errors,
+            } => {
+                let state = self.correlate.as_mut()?;
+                if state.workflow_id != workflow_id {
+                    return None;
+                }
+                state.status = CorrelateStatus::Loaded {
+                    events,
+                    source_errors,
+                };
+                self.dirty = true;
                 None
             }
             Action::ShowToast(msg) => {
@@ -454,6 +492,32 @@ impl App {
             expires_at,
         });
         self.dirty = true;
+    }
+
+    /// Workflow ID extracted from the first Finding on the currently
+    /// focused Layer, if (a) the focused Layer is `workflows` and (b) at
+    /// least one Finding's message carries a recognizable workflow ID
+    /// (`wf-…` or `hp-…`). Drives the `[c]` quick-correlate trigger; see
+    /// [`workflow_id_from_finding`].
+    fn focused_workflow_id(&self) -> Option<String> {
+        let snap = self.focused_for_correlate()?;
+        if snap.name != "workflows" {
+            return None;
+        }
+        snap.findings.iter().find_map(workflow_id_from_finding)
+    }
+
+    /// In Spotlight, `[c]` should target the focused incident card; in
+    /// Layout A, the focused scorecard. This returns whichever the
+    /// current layout considers focused.
+    fn focused_for_correlate(&self) -> Option<&LayerSnapshot> {
+        match self.layout {
+            Layout::Spotlight => self
+                .non_green_snapshots()
+                .get(self.spotlight_focus)
+                .copied(),
+            Layout::A => self.snapshots.get(self.focus),
+        }
     }
 
     fn non_green_snapshots(&self) -> Vec<&LayerSnapshot> {
@@ -624,6 +688,7 @@ fn contains(r: &Rect, col: u16, row: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{PopoverEvent, SourceError};
     use nico_common::output::Status;
 
     fn snap(name: &str, status: Status) -> LayerSnapshot {
@@ -1339,15 +1404,169 @@ mod tests {
         assert!(app.toast().is_some());
     }
 
+    fn workflows_warn_snap_with_id(workflow_id: &str) -> LayerSnapshot {
+        LayerSnapshot {
+            name: "workflows".into(),
+            status: Status::Warn,
+            evidence: "1 stuck".into(),
+            findings: vec![crate::model::Finding {
+                status: Status::Warn,
+                message: format!(
+                    "stuck_workflow: {workflow_id} (HostProvisioning): 47m running, last: 47 events"
+                ),
+                next_command: Some(format!("temporal workflow show -w {workflow_id}")),
+                link: None,
+            }],
+            duration_ms: 0,
+        }
+    }
+
     #[test]
-    fn correlate_is_a_noop_today() {
+    fn correlate_on_workflows_layer_opens_loading_overlay_and_emits_effect() {
         let mut app = App::new();
-        app.handle(Action::Snapshots(mixed_layers()));
-        app.handle(Action::ShowSpotlight);
+        app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
+            "wf-001",
+        )]));
+        let eff = app.handle(Action::Correlate);
+        assert_eq!(eff, Some(Effect::Correlate("wf-001".into())));
+        assert_eq!(app.overlay(), Overlay::Correlate);
+        let cs = app.correlate_state().expect("correlate state set");
+        assert_eq!(cs.workflow_id, "wf-001");
+        assert!(matches!(cs.status, CorrelateStatus::Loading));
+    }
+
+    #[test]
+    fn correlate_on_non_workflows_layer_is_inert() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![warn_snap("logs")]));
         let eff = app.handle(Action::Correlate);
         assert_eq!(eff, None);
-        // The keybind is wired but the popover slice has not landed yet.
-        // We deliberately do not assert any state mutation.
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(app.correlate_state().is_none());
+    }
+
+    #[test]
+    fn correlate_on_workflows_layer_with_no_id_is_inert() {
+        // workflows layer with only the aggregate "0 stuck, 0 failed"
+        // style finding (no recognizable workflow ID token).
+        let snap = LayerSnapshot {
+            name: "workflows".into(),
+            status: Status::Ok,
+            evidence: "0 stuck, 0 failed".into(),
+            findings: vec![],
+            duration_ms: 0,
+        };
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![snap]));
+        let eff = app.handle(Action::Correlate);
+        assert_eq!(eff, None);
+        assert_eq!(app.overlay(), Overlay::None);
+    }
+
+    #[test]
+    fn correlate_in_spotlight_targets_focused_incident_card() {
+        let mut app = App::new();
+        // Two non-green cards; the second is workflows.
+        app.handle(Action::Snapshots(vec![
+            warn_snap("logs"),
+            workflows_warn_snap_with_id("wf-042"),
+        ]));
+        app.handle(Action::ShowSpotlight);
+        // Default focus is 0 (logs) — should be inert.
+        assert_eq!(app.handle(Action::Correlate), None);
+        assert_eq!(app.overlay(), Overlay::None);
+    }
+
+    #[test]
+    fn correlate_results_for_matching_workflow_id_populates_loaded_state() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
+            "wf-001",
+        )]));
+        app.handle(Action::Correlate);
+        let evs = vec![PopoverEvent {
+            ts: chrono::Utc::now(),
+            source: "temporal".into(),
+            kind: "WorkflowExecutionStarted".into(),
+            message: "started".into(),
+            severity: crate::model::PopoverSeverity::Info,
+        }];
+        app.handle(Action::CorrelateResults {
+            workflow_id: "wf-001".into(),
+            events: evs.clone(),
+            source_errors: vec![],
+        });
+        let cs = app.correlate_state().expect("still open");
+        match &cs.status {
+            CorrelateStatus::Loaded {
+                events,
+                source_errors,
+            } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].kind, "WorkflowExecutionStarted");
+                assert!(source_errors.is_empty());
+            }
+            _ => panic!("expected Loaded, got {:?}", cs.status),
+        }
+    }
+
+    #[test]
+    fn correlate_results_for_stale_workflow_id_are_dropped() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
+            "wf-001",
+        )]));
+        app.handle(Action::Correlate);
+        app.handle(Action::CorrelateResults {
+            workflow_id: "wf-OTHER".into(),
+            events: vec![],
+            source_errors: vec![],
+        });
+        let cs = app.correlate_state().unwrap();
+        assert!(
+            matches!(cs.status, CorrelateStatus::Loading),
+            "stale results must not flip the popover into Loaded"
+        );
+    }
+
+    #[test]
+    fn close_overlay_clears_correlate_state() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
+            "wf-001",
+        )]));
+        app.handle(Action::Correlate);
+        app.handle(Action::CloseOverlay);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(app.correlate_state().is_none());
+    }
+
+    #[test]
+    fn correlate_with_overlay_already_open_is_inert() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
+            "wf-001",
+        )]));
+        app.handle(Action::OpenHelp);
+        let eff = app.handle(Action::Correlate);
+        assert_eq!(eff, None);
+        assert_eq!(app.overlay(), Overlay::Help);
+    }
+
+    #[test]
+    fn correlate_results_when_no_overlay_open_are_dropped() {
+        let mut app = App::new();
+        // Never opened the popover; out-of-band results must not crash
+        // or flip state.
+        app.handle(Action::CorrelateResults {
+            workflow_id: "wf-001".into(),
+            events: vec![],
+            source_errors: vec![SourceError {
+                name: "loki".into(),
+                reason: "x".into(),
+            }],
+        });
+        assert!(app.correlate_state().is_none());
     }
 
     #[test]

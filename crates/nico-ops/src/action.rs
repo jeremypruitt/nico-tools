@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::model::LayerSnapshot;
+use crate::model::{LayerSnapshot, PopoverEvent, SourceError};
 
 /// Direction for focus navigation across the scorecard grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +67,20 @@ pub enum Action {
     /// `o` in Spotlight — open the focused Finding's link via the system
     /// browser. Best-effort; toast on failure (or when no link is set).
     OpenLink,
-    /// `c` in Spotlight — placeholder for the quick-correlate popover
-    /// slice. Wired so the keybind is discoverable; today this is a no-op.
+    /// `c` on a workflow Finding — open the quick-correlate popover for
+    /// the focused workflow ID and kick off `nico_correlate::collect_all`.
+    /// No-op when the focused Layer is not `workflows` or no finding
+    /// surfaces a workflow ID. (Issue #157.)
     Correlate,
+    /// Results from a `nico_correlate::collect_all` round, posted by the
+    /// host loop. Carries the `workflow_id` so the reducer can drop stale
+    /// results when the operator has already closed or re-opened the
+    /// popover for a different workflow.
+    CorrelateResults {
+        workflow_id: String,
+        events: Vec<PopoverEvent>,
+        source_errors: Vec<SourceError>,
+    },
     /// Show a transient toast in the bottom bar (e.g. "clipboard
     /// unavailable"). Auto-clears after `TOAST_TTL`.
     ShowToast(String),
