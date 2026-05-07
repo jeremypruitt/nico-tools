@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nico_common::output::Status;
 
+#[derive(Clone)]
 pub struct RunOpts {
     pub namespace: String,
     pub since: Duration,
@@ -59,6 +60,50 @@ pub fn aggregate_status(checks: &[Check]) -> Status {
         Status::Unknown
     } else {
         Status::Ok
+    }
+}
+
+pub struct SkippedLayer {
+    name: &'static str,
+}
+
+impl SkippedLayer {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(name: &'static str) -> Box<dyn Layer> {
+        Box::new(Self { name })
+    }
+}
+
+#[async_trait]
+impl Layer for SkippedLayer {
+    fn name(&self) -> &'static str { self.name }
+    async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
+        LayerOutcome::Skipped
+    }
+}
+
+pub struct UnconfiguredLayer {
+    name: &'static str,
+    reason: String,
+}
+
+impl UnconfiguredLayer {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(name: &'static str, reason: impl Into<String>) -> Box<dyn Layer> {
+        Box::new(Self { name, reason: reason.into() })
+    }
+}
+
+#[async_trait]
+impl Layer for UnconfiguredLayer {
+    fn name(&self) -> &'static str { self.name }
+    async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
+        LayerOutcome::Checks(vec![Check {
+            name: "config",
+            status: Status::Unknown,
+            value: self.reason.clone(),
+            next_command: None,
+        }])
     }
 }
 
@@ -150,49 +195,5 @@ mod tests {
         let layer = StubLayer::new(LayerOutcome::Checks(vec![check(Status::Ok)]));
         let result = layer.run(&opts()).await;
         assert_eq!(result.name, layer.name());
-    }
-}
-
-pub struct SkippedLayer {
-    name: &'static str,
-}
-
-impl SkippedLayer {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(name: &'static str) -> Box<dyn Layer> {
-        Box::new(Self { name })
-    }
-}
-
-#[async_trait]
-impl Layer for SkippedLayer {
-    fn name(&self) -> &'static str { self.name }
-    async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
-        LayerOutcome::Skipped
-    }
-}
-
-pub struct UnconfiguredLayer {
-    name: &'static str,
-    reason: String,
-}
-
-impl UnconfiguredLayer {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(name: &'static str, reason: impl Into<String>) -> Box<dyn Layer> {
-        Box::new(Self { name, reason: reason.into() })
-    }
-}
-
-#[async_trait]
-impl Layer for UnconfiguredLayer {
-    fn name(&self) -> &'static str { self.name }
-    async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
-        LayerOutcome::Checks(vec![Check {
-            name: "config",
-            status: Status::Unknown,
-            value: self.reason.clone(),
-            next_command: None,
-        }])
     }
 }

@@ -29,6 +29,12 @@ impl ReqwestHttpClient {
     }
 }
 
+impl Default for ReqwestHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
     async fn get_status(&self, url: &str) -> Result<u16> {

@@ -469,7 +469,7 @@ mod tests {
         }
 
         // low-priority rule is first in source array, high-priority rule is last
-        let mut rules = vec![
+        let mut rules = [
             DiagnosisRule { priority: 10, matcher: always_low },
             DiagnosisRule { priority: 1, matcher: always_high },
         ];
