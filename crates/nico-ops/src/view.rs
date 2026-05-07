@@ -15,8 +15,8 @@ use nico_doctor::baseline::Delta;
 use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
 use crate::model::{
-    CorrelateState, CorrelateStatus, Finding, LayerSnapshot, PopoverEvent, PopoverSeverity,
-    Quadrant, SourceError, overall_verdict,
+    CorrelateState, CorrelateStatus, Finding, LayerSnapshot, LogLine, PopoverEvent,
+    PopoverSeverity, Quadrant, SourceError, overall_verdict,
 };
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
 
@@ -437,6 +437,11 @@ fn render_scorecard(app: &App, idx: usize, theme: &Theme, frame: &mut Frame, are
 }
 
 fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    if app.focused().is_some_and(|s| s.name == "logs") {
+        render_logs_panel(app.log_lines(), theme, frame, area);
+        return;
+    }
+
     let title = match app.focused() {
         Some(s) => format!(" findings — {} ", s.name),
         None => " findings ".to_string(),
@@ -462,6 +467,72 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             .scroll((app.drill_scroll(), 0)),
         inner,
     );
+}
+
+/// Render the snapshot logs panel — top-N error log lines from the most
+/// recent refresh round. Used by Layout A's drill panel (when the `logs`
+/// layer is focused) and Layout B's `Logs` quadrant. Empty `lines` yields
+/// a "no errors" empty state. Issue #158.
+fn render_logs_panel(lines: &[LogLine], theme: &Theme, frame: &mut Frame, area: Rect) {
+    let title = format!(" logs — top {} ", lines.len());
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    if lines.is_empty() {
+        let empty = Line::from(Span::styled(
+            "no errors",
+            Style::default().fg(theme.muted),
+        ));
+        frame.render_widget(Paragraph::new(empty), inner);
+        return;
+    }
+
+    let body: Vec<Line> = lines
+        .iter()
+        .take(inner.height as usize)
+        .map(|l| log_line_spans(l, theme, inner.width))
+        .collect();
+    frame.render_widget(Paragraph::new(body), inner);
+}
+
+/// Format one `LogLine` as `HH:MM:SS · pod · glyph · message`. Truncates
+/// the message so the whole row fits in `width` cells (best-effort — uses
+/// char count, not display width). The message is always truncated, never
+/// the timestamp/pod columns, so the alignment stays scannable.
+fn log_line_spans(line: &LogLine, theme: &Theme, width: u16) -> Line<'static> {
+    let ts = line.ts.format("%H:%M:%S").to_string();
+    let pod = line.pod.clone();
+    let glyph = pip_glyph(&line.level).to_string();
+    let prefix_len = ts.chars().count() + 3 + pod.chars().count() + 3 + glyph.chars().count() + 1;
+    let budget = (width as usize).saturating_sub(prefix_len);
+    let msg = truncate_message(&line.message, budget);
+    let level_style = Style::default().fg(theme_color(theme, &line.level));
+    Line::from(vec![
+        Span::styled(ts, Style::default().fg(theme.muted)),
+        Span::raw(" · "),
+        Span::raw(pod),
+        Span::raw(" · "),
+        Span::styled(glyph, level_style.add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::raw(msg),
+    ])
+}
+
+fn truncate_message(s: &str, budget: usize) -> String {
+    if budget <= 1 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= budget {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(budget.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn render_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -893,8 +964,30 @@ fn render_quadrant(
 
     match quadrant {
         Quadrant::Activity => render_activity_body(app, theme, frame, inner),
+        Quadrant::Logs => render_logs_quadrant_body(app, theme, frame, inner),
         _ => render_layer_body(app, quadrant, theme, frame, inner),
     }
+}
+
+/// Layout B's `Logs` quadrant body. Reuses the snapshot logs panel so
+/// Layout A's drill and this quadrant stay visually consistent. Issue
+/// #158.
+fn render_logs_quadrant_body(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let lines = app.log_lines();
+    if lines.is_empty() {
+        let line = Line::from(Span::styled(
+            "no errors",
+            Style::default().fg(theme.muted),
+        ));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    let body: Vec<Line> = lines
+        .iter()
+        .take(area.height as usize)
+        .map(|l| log_line_spans(l, theme, area.width))
+        .collect();
+    frame.render_widget(Paragraph::new(body), area);
 }
 
 fn render_layer_body(
@@ -1319,13 +1412,127 @@ mod tests {
 
     #[test]
     fn render_drill_shows_findings_for_focused_layer() {
+        // Focus `workflows` (idx 2) with a synthetic Finding; the drill
+        // panel shows the standard findings list for non-logs layers.
+        let mut snaps = six_layers();
+        snaps[2].findings.push(Finding {
+            status: Status::Warn,
+            message: "1 stuck workflow".into(),
+            next_command: Some("nico correlate wf-001".into()),
+            link: None,
+        });
+        let mut app = App::new();
+        app.handle(Action::Snapshots(snaps));
+        app.handle(Action::Focus(Dir::Right));
+        app.handle(Action::Focus(Dir::Right));
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("findings — workflows"), "drill title missing:\n{s}");
+        assert!(s.contains("stuck workflow"), "finding text missing:\n{s}");
+        assert!(s.contains("next:"), "next-cmd hint missing:\n{s}");
+    }
+
+    fn log_lines_sample() -> Vec<crate::model::LogLine> {
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 5, 6, 14, 1, 9).unwrap();
+        vec![
+            crate::model::LogLine {
+                ts,
+                pod: "carbide-controller".into(),
+                level: Status::Warn,
+                message: "ERROR: disk full on /var/lib".into(),
+            },
+            crate::model::LogLine {
+                ts,
+                pod: "site-agent-7f3a".into(),
+                level: Status::Fail,
+                message: "FATAL: oom kill".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn render_drill_renders_log_panel_when_logs_focused_and_lines_present() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // focus logs (idx 1)
+        app.handle(Action::LogLines(log_lines_sample()));
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("logs — top 2"), "panel title missing:\n{s}");
+        assert!(s.contains("carbide-controller"), "pod name missing:\n{s}");
+        assert!(s.contains("disk full"), "message missing:\n{s}");
+        assert!(s.contains("FATAL"), "fail-level message missing:\n{s}");
+    }
+
+    #[test]
+    fn render_drill_logs_panel_shows_empty_state_when_no_lines() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::Focus(Dir::Right));
+        // No LogLines action — log_lines is empty.
         let s = render_to_string(&mut app, 120, 24);
-        assert!(s.contains("findings — logs"), "drill title missing:\n{s}");
-        assert!(s.contains("ERROR lines"), "finding text missing:\n{s}");
-        assert!(s.contains("next:"), "next-cmd hint missing:\n{s}");
+        assert!(
+            s.contains("no errors"),
+            "empty-state copy missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn layout_b_logs_quadrant_renders_log_panel_when_lines_present() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::ToggleLayout); // A → B
+        app.handle(Action::LogLines(log_lines_sample()));
+        // Layout B grids 3-up; zoom the logs quadrant so the row has full
+        // width and the truncated message text is reliably visible.
+        // (`Logs` is index 4, so right-down-down from the default focus
+        // lands on it.)
+        app.handle(Action::Focus(Dir::Right));
+        app.handle(Action::Focus(Dir::Down));
+        app.handle(Action::ZoomQuadrant);
+        let s = render_to_string(&mut app, 140, 30);
+        assert!(s.contains("Logs"), "Logs quadrant title missing:\n{s}");
+        assert!(s.contains("carbide-controller"), "pod name missing:\n{s}");
+        assert!(s.contains("disk full"), "log message missing:\n{s}");
+    }
+
+    #[test]
+    fn layout_b_logs_quadrant_empty_state_when_no_lines() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::ToggleLayout);
+        let s = render_to_string(&mut app, 140, 30);
+        assert!(s.contains("no errors"), "empty-state copy missing:\n{s}");
+    }
+
+    #[test]
+    fn truncate_message_returns_input_when_under_budget() {
+        assert_eq!(truncate_message("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_message_appends_ellipsis_when_over_budget() {
+        let out = truncate_message("abcdefghij", 5);
+        assert_eq!(out.chars().count(), 5);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_message_handles_zero_budget() {
+        assert_eq!(truncate_message("hello", 0), "");
+    }
+
+    #[test]
+    fn render_drill_uses_findings_panel_for_non_logs_layer() {
+        // Sanity-check: focusing cluster (which has no findings) should not
+        // render the logs panel header even if log_lines is populated.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::LogLines(log_lines_sample()));
+        // focus stays at idx 0 (cluster).
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(
+            !s.contains("logs — top"),
+            "logs panel must not appear when cluster is focused:\n{s}"
+        );
     }
 
     #[test]
@@ -1737,9 +1944,12 @@ mod tests {
 
     #[test]
     fn drill_scroll_offset_is_applied_to_drill_paragraph() {
+        // Use `workflows` so we exercise the standard drill paragraph
+        // (the `logs` drill is now backed by the snapshot logs panel,
+        // issue #158).
         let mut app = App::new();
         let many = vec![LayerSnapshot {
-            name: "logs".into(),
+            name: "workflows".into(),
             status: Status::Warn,
             evidence: "many".into(),
             findings: (0..10)

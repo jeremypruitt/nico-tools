@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 
 use crate::action::{Action, Dir, ScrollDir};
 use crate::events::Overlay;
-use crate::model::{CorrelateState, CorrelateStatus, LayerSnapshot, Quadrant, workflow_id_from_finding};
+use crate::model::{CorrelateState, CorrelateStatus, LayerSnapshot, LogLine, Quadrant, workflow_id_from_finding};
 use crate::pulse::PulseTimer;
 use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
 
@@ -104,6 +104,7 @@ pub struct App {
     b_focus: usize,
     b_zoomed: bool,
     namespace_events: Vec<nico_correlate::Event>,
+    log_lines: Vec<LogLine>,
 }
 
 /// A transient bottom-bar message and its expiry timestamp. Cleared by
@@ -148,6 +149,7 @@ impl App {
             b_focus: 0,
             b_zoomed: false,
             namespace_events: Vec::new(),
+            log_lines: Vec::new(),
         }
     }
 
@@ -277,6 +279,12 @@ impl App {
         &self.namespace_events
     }
 
+    /// Snapshot logs panel content, populated by the refresh side-effect.
+    /// Empty vec means "no errors" (or no log source at all).
+    pub fn log_lines(&self) -> &[LogLine] {
+        &self.log_lines
+    }
+
     /// Throbber glyph for the current frame: an animated braille spinner
     /// while a refresh is in flight, frozen `✓` once the latest refresh
     /// has completed, or empty when no run has happened yet.
@@ -365,6 +373,11 @@ impl App {
                 if matches!(self.layout, Layout::B) {
                     self.dirty = true;
                 }
+                None
+            }
+            Action::LogLines(lines) => {
+                self.log_lines = lines;
+                self.dirty = true;
                 None
             }
             Action::OpenHelp => {
@@ -851,6 +864,22 @@ mod tests {
         assert_eq!(app.snapshots().len(), 6);
         assert!(!app.refreshing());
         assert!(app.last_refreshed().is_some());
+        assert!(app.dirty());
+    }
+
+    #[test]
+    fn log_lines_action_replaces_state_and_marks_dirty() {
+        use chrono::Utc;
+        let mut app = App::new();
+        app.clear_dirty();
+        let line = LogLine {
+            ts: Utc::now(),
+            pod: "core-abc".into(),
+            level: Status::Warn,
+            message: "ERROR: disk full".into(),
+        };
+        app.handle(Action::LogLines(vec![line.clone()]));
+        assert_eq!(app.log_lines(), &[line]);
         assert!(app.dirty());
     }
 

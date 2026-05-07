@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::model::{LayerSnapshot, PopoverEvent, SourceError};
+use crate::model::{LayerSnapshot, LogLine, PopoverEvent, SourceError};
 
 /// Direction for focus navigation across the scorecard grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,10 @@ pub enum Action {
     /// New namespace-scoped events for Layout B's Activity quadrant.
     /// Sourced from `nico_correlate::recent_namespace_events`.
     NamespaceEvents(Vec<nico_correlate::Event>),
+    /// Top-N error log lines from a completed refresh round. Powers the
+    /// snapshot logs panel (Layout A `logs` drill, Layout B `Logs`
+    /// quadrant). Issue #158.
+    LogLines(Vec<LogLine>),
     /// Left-click at terminal cell `(col, row)`. The reducer hit-tests
     /// against the scorecard regions captured during the last render.
     Click { col: u16, row: u16 },

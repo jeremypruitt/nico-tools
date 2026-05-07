@@ -66,6 +66,10 @@ pub struct Bootstrapped {
     /// `None` when no kubeconfig is reachable; the Activity quadrant just
     /// reports an empty feed in that case.
     pub k8s_client: Option<Arc<dyn nico_common::k8s::K8sClient>>,
+    /// Best-effort log source chain (Loki preferred, k8s fallback). Reused
+    /// by `nico-ops` for the snapshot logs panel (issue #158). `None` when
+    /// neither Loki nor a k8s client is reachable.
+    pub log_source: Option<Arc<dyn log_source::LogSource>>,
     /// Kept alive until the caller is done running layers; dropping closes port-forwards.
     pub _pf_guards: Vec<nico_common::reach::ForwardedEndpoint>,
 }
@@ -97,6 +101,26 @@ pub struct LayerInputs {
     pub skip: Vec<String>,
 }
 
+/// Build the best-effort log source chain (Loki preferred, k8s fallback)
+/// from the same inputs `prepare_layers` consumes. Returns `None` when
+/// neither a kubeconfig nor `LOKI_URL` is reachable. Exposed so callers
+/// (e.g. `nico-ops`) can reuse the same chain without rebuilding it.
+pub fn build_log_source(inputs: &LayerInputs) -> Option<Arc<dyn log_source::LogSource>> {
+    match (inputs.k8s_client.as_ref(), inputs.loki_url.is_some()) {
+        (Some(k8s), _) => Some(log_source::best_effort_chain(vec![
+            Arc::new(loki::LokiLogSource::new(inputs.loki_client.clone())),
+            Arc::new(log_source::K8sLogSource::new(k8s.clone())),
+        ])),
+        (None, true) => Some(log_source::best_effort_chain(vec![
+            Arc::new(loki::LokiLogSource::new(inputs.loki_client.clone())),
+            Arc::new(log_source::K8sLogSource::new(Arc::new(Unavailable {
+                reason: "kubeconfig not found",
+            }))),
+        ])),
+        (None, false) => None,
+    }
+}
+
 /// Build the ordered layer set from prepared inputs.
 pub fn prepare_layers(inputs: &LayerInputs) -> Vec<Box<dyn Layer>> {
     let mut out: Vec<Box<dyn Layer>> = vec![];
@@ -114,24 +138,11 @@ pub fn prepare_layers(inputs: &LayerInputs) -> Vec<Box<dyn Layer>> {
                     "kubeconfig not found; set --context or cluster.context in config",
                 )),
             },
-            "logs" => match (inputs.k8s_client.as_ref(), inputs.loki_url.is_some()) {
-                (Some(k8s), _) => {
-                    let chain = log_source::best_effort_chain(vec![
-                        Arc::new(loki::LokiLogSource::new(inputs.loki_client.clone())),
-                        Arc::new(log_source::K8sLogSource::new(k8s.clone())),
-                    ]);
+            "logs" => match build_log_source(inputs) {
+                Some(chain) => {
                     out.push(Box::new(layers::logs::LogsLayer::new(chain)));
                 }
-                (None, true) => {
-                    let chain = log_source::best_effort_chain(vec![
-                        Arc::new(loki::LokiLogSource::new(inputs.loki_client.clone())),
-                        Arc::new(log_source::K8sLogSource::new(
-                            Arc::new(Unavailable { reason: "kubeconfig not found" }),
-                        )),
-                    ]);
-                    out.push(Box::new(layers::logs::LogsLayer::new(chain)));
-                }
-                (None, false) => {
+                None => {
                     out.push(layer::UnconfiguredLayer::new(
                         "logs", "set LOKI_URL or ensure kubeconfig is accessible",
                     ));
@@ -421,6 +432,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         skip: args.skip.clone(),
     };
 
+    let log_source = build_log_source(&inputs);
     let layers = prepare_layers(&inputs);
 
     Ok(Bootstrapped {
@@ -435,6 +447,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         temporal_address,
         temporal_namespace: config.temporal.namespace.clone(),
         k8s_client: bootstrap_k8s,
+        log_source,
         _pf_guards: pf_guards,
     })
 }

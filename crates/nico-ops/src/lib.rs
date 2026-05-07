@@ -32,7 +32,9 @@ use crate::action::Action;
 use crate::app::{App, Effect};
 use crate::clock::{Clock, SystemClock};
 use crate::events::{Mode, translate};
-use crate::model::{LayerSnapshot, PopoverEvent, PopoverSeverity, SourceError};
+use crate::model::{
+    LayerSnapshot, LogLine, PopoverEvent, PopoverSeverity, SourceError, log_level_from_text,
+};
 
 pub use cli::OpsArgs;
 
@@ -159,6 +161,7 @@ async fn run_event_loop<C: Clock>(
         temporal_address,
         temporal_namespace,
         k8s_client,
+        log_source,
         _pf_guards,
         ..
     } = bootstrapped;
@@ -172,21 +175,23 @@ async fn run_event_loop<C: Clock>(
     app.set_baseline(nico_doctor::baseline::load());
     let (tx, mut rx) = mpsc::channel::<Action>(64);
 
-    let activity_ctx = ActivityCtx {
-        temporal: temporal_client.clone(),
-        k8s: k8s_client.clone(),
-        namespace: temporal_namespace.clone(),
-        since: activity_since,
+    let refresh_ctx = RefreshCtx {
+        activity: ActivityCtx {
+            temporal: temporal_client.clone(),
+            k8s: k8s_client.clone(),
+            namespace: temporal_namespace.clone(),
+            since: activity_since,
+        },
+        logs: LogsCtx {
+            log_source: log_source.clone(),
+            namespace: opts.namespace.clone(),
+            since: opts.since,
+        },
     };
 
     spawn_refresh(layers.clone(), opts.clone(), tx.clone());
-    spawn_activity_refresh(
-        temporal_client.clone(),
-        k8s_client.clone(),
-        temporal_namespace.clone(),
-        activity_since,
-        tx.clone(),
-    );
+    spawn_activity_refresh(&refresh_ctx.activity, tx.clone());
+    spawn_logs_refresh(&refresh_ctx.logs, tx.clone());
     let _ = app.handle(Action::Refresh);
 
     let mut events = EventStream::new();
@@ -204,7 +209,7 @@ async fn run_event_loop<C: Clock>(
                 match maybe_event {
                     Some(Ok(ev)) => {
                         if let Some(action) = translate(&ev, Mode::Normal, app.layout(), app.overlay())
-                            && dispatch(&mut app, action, &layers, &opts, &activity_ctx, &tx, terminal) {
+                            && dispatch(&mut app, action, &layers, &opts, &refresh_ctx, &tx, terminal) {
                             break;
                         }
                     }
@@ -213,12 +218,12 @@ async fn run_event_loop<C: Clock>(
             }
             maybe_action = rx.recv() => {
                 if let Some(action) = maybe_action
-                    && dispatch(&mut app, action, &layers, &opts, &activity_ctx, &tx, terminal) {
+                    && dispatch(&mut app, action, &layers, &opts, &refresh_ctx, &tx, terminal) {
                     break;
                 }
             }
             _ = tick.tick() => {
-                if dispatch(&mut app, Action::Tick(clock.now()), &layers, &opts, &activity_ctx, &tx, terminal) {
+                if dispatch(&mut app, Action::Tick(clock.now()), &layers, &opts, &refresh_ctx, &tx, terminal) {
                     break;
                 }
             }
@@ -245,9 +250,15 @@ pub fn resolve_interval(
     }
 }
 
-/// Bundle of dependencies the activity refresh spawner needs. Carried
-/// alongside layer refresh so a single `StartRefresh` effect kicks both
-/// off in lockstep.
+/// All non-layer fan-out dependencies the host loop spawns alongside a
+/// `StartRefresh`. One `R` press kicks off layer collection (via
+/// `spawn_refresh`) plus the Activity feed and the snapshot logs panel
+/// in lockstep.
+struct RefreshCtx {
+    activity: ActivityCtx,
+    logs: LogsCtx,
+}
+
 struct ActivityCtx {
     temporal: Arc<dyn TemporalClient>,
     k8s: Option<Arc<dyn K8sClient>>,
@@ -255,12 +266,18 @@ struct ActivityCtx {
     since: chrono::Duration,
 }
 
+struct LogsCtx {
+    log_source: Option<Arc<dyn nico_doctor::log_source::LogSource>>,
+    namespace: String,
+    since: Duration,
+}
+
 fn dispatch(
     app: &mut App,
     action: Action,
     layers: &Arc<Vec<Box<dyn nico_doctor::layer::Layer>>>,
     opts: &nico_doctor::layer::RunOpts,
-    activity: &ActivityCtx,
+    refresh: &RefreshCtx,
     tx: &mpsc::Sender<Action>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> bool {
@@ -268,13 +285,8 @@ fn dispatch(
         Some(Effect::Quit) => true,
         Some(Effect::StartRefresh) => {
             spawn_refresh(layers.clone(), opts.clone(), tx.clone());
-            spawn_activity_refresh(
-                activity.temporal.clone(),
-                activity.k8s.clone(),
-                activity.namespace.clone(),
-                activity.since,
-                tx.clone(),
-            );
+            spawn_activity_refresh(&refresh.activity, tx.clone());
+            spawn_logs_refresh(&refresh.logs, tx.clone());
             false
         }
         Some(Effect::EnableMouseCapture) => {
@@ -447,21 +459,63 @@ fn spawn_refresh(
     });
 }
 
-fn spawn_activity_refresh(
-    temporal: Arc<dyn TemporalClient>,
-    k8s: Option<Arc<dyn K8sClient>>,
-    namespace: String,
-    since: chrono::Duration,
-    tx: mpsc::Sender<Action>,
-) {
-    let Some(k8s) = k8s else {
+fn spawn_activity_refresh(ctx: &ActivityCtx, tx: mpsc::Sender<Action>) {
+    let Some(k8s) = ctx.k8s.clone() else {
         // No reachable kubeconfig — leave the Activity feed empty.
         return;
     };
+    let temporal = ctx.temporal.clone();
+    let namespace = ctx.namespace.clone();
+    let since = ctx.since;
     tokio::spawn(async move {
         let events = nico_correlate::recent_namespace_events(temporal, k8s, &namespace, since).await;
         let _ = tx.send(Action::NamespaceEvents(events)).await;
     });
+}
+
+/// Top-N for the snapshot logs panel. Issue #158 picked 20 as the
+/// default; the underlying `LogSource::collect` is asked for a larger cap
+/// (matching `LogsLayer`) so the panel sees the same firehose the layer
+/// does.
+const LOG_PANEL_TOP_N: usize = 20;
+const LOG_PANEL_FETCH_LIMIT: usize = 500;
+
+/// Fan-out partner of `spawn_refresh` for the snapshot logs panel. Calls
+/// `LogSource::collect` (the same `best_effort_chain` the `LogsLayer`
+/// uses) and posts an `Action::LogLines` carrying the top-N. Failures
+/// surface as an empty panel; the layer card already raises the warning
+/// for an unreachable source.
+fn spawn_logs_refresh(ctx: &LogsCtx, tx: mpsc::Sender<Action>) {
+    let Some(source) = ctx.log_source.clone() else {
+        return;
+    };
+    let namespace = ctx.namespace.clone();
+    let since = ctx.since;
+    tokio::spawn(async move {
+        let lines = match source.collect(&namespace, since, LOG_PANEL_FETCH_LIMIT).await {
+            Ok(c) => log_lines_from_entries(c.entries),
+            Err(_) => Vec::new(),
+        };
+        let _ = tx.send(Action::LogLines(lines)).await;
+    });
+}
+
+/// Convert raw `(pod, line)` entries from a `LogCollection` into
+/// `LogLine`s for the snapshot panel. Caps at `LOG_PANEL_TOP_N`. The
+/// timestamp is the snapshot fetch time — the shared `LogSource` API
+/// drops Loki's per-line timestamps today; carrying them is a follow-up.
+fn log_lines_from_entries(entries: Vec<(String, String)>) -> Vec<LogLine> {
+    let now = chrono::Utc::now();
+    entries
+        .into_iter()
+        .take(LOG_PANEL_TOP_N)
+        .map(|(pod, line)| LogLine {
+            ts: now,
+            pod,
+            level: log_level_from_text(&line),
+            message: line,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -497,5 +551,29 @@ mod tests {
     fn resolve_interval_rejects_invalid_input() {
         let err = resolve_interval(Some("not-a-duration"), Duration::from_secs(30)).unwrap_err();
         assert!(err.contains("invalid --interval"), "{err}");
+    }
+
+    #[test]
+    fn log_lines_from_entries_caps_at_top_n() {
+        let entries: Vec<(String, String)> = (0..50)
+            .map(|i| (format!("pod-{i}"), format!("ERROR line {i}")))
+            .collect();
+        let out = log_lines_from_entries(entries);
+        assert_eq!(out.len(), LOG_PANEL_TOP_N);
+        assert_eq!(out[0].pod, "pod-0");
+    }
+
+    #[test]
+    fn log_lines_from_entries_classifies_levels() {
+        use nico_common::output::Status;
+        let entries = vec![
+            ("a".into(), "FATAL: oom".into()),
+            ("b".into(), "ERROR: bad".into()),
+            ("c".into(), "trace".into()),
+        ];
+        let out = log_lines_from_entries(entries);
+        assert_eq!(out[0].level, Status::Fail);
+        assert_eq!(out[1].level, Status::Warn);
+        assert_eq!(out[2].level, Status::Unknown);
     }
 }

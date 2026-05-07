@@ -125,6 +125,31 @@ pub fn workflow_id_from_finding(f: &Finding) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// One line in the snapshot logs panel. `ts` is the snapshot fetch time
+/// (no per-entry timestamps are preserved by the shared `LogSource` API
+/// today — that's a follow-up). `level` drives the glyph + color.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogLine {
+    pub ts: DateTime<Utc>,
+    pub pod: String,
+    pub level: Status,
+    pub message: String,
+}
+
+/// Heuristic level inference from raw log text. Matches the same
+/// substring discipline used by `nico_doctor::log_source::is_error_line`
+/// so the operator's mental model stays consistent.
+pub fn log_level_from_text(s: &str) -> Status {
+    let l = s.to_lowercase();
+    if l.contains("panic") || l.contains("fatal") {
+        Status::Fail
+    } else if l.contains("error") || l.contains("warn") {
+        Status::Warn
+    } else {
+        Status::Unknown
+    }
+}
+
 /// What a single Layer scorecard shows: its aggregate status, a one-line
 /// evidence summary, and the underlying findings used by the drill panel
 /// and the detail overlay. `duration_ms` carries the layer's reported
@@ -221,5 +246,22 @@ mod tests {
     fn workflow_id_returns_none_when_no_prefixed_token() {
         let f = finding("0 stuck, 0 failed");
         assert_eq!(workflow_id_from_finding(&f), None);
+    }
+
+    #[test]
+    fn log_level_from_text_promotes_panic_and_fatal_to_fail() {
+        assert_eq!(log_level_from_text("PANIC: nil deref"), Status::Fail);
+        assert_eq!(log_level_from_text("fatal: oom"), Status::Fail);
+    }
+
+    #[test]
+    fn log_level_from_text_classifies_error_and_warn_as_warn() {
+        assert_eq!(log_level_from_text("ERROR: disk full"), Status::Warn);
+        assert_eq!(log_level_from_text("WARN: deprecated api"), Status::Warn);
+    }
+
+    #[test]
+    fn log_level_from_text_falls_back_to_unknown() {
+        assert_eq!(log_level_from_text("unhelpful trace"), Status::Unknown);
     }
 }
