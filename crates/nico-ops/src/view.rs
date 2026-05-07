@@ -469,15 +469,23 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     );
 }
 
-/// Render the snapshot logs panel — top-N error log lines from the most
-/// recent refresh round. Used by Layout A's drill panel (when the `logs`
-/// layer is focused) and Layout B's `Logs` quadrant. Empty `lines` yields
-/// a "no errors" empty state. Issue #158.
+/// Render the snapshot logs panel — error log lines from the most recent
+/// refresh round. Used by Layout A's drill panel (when the `logs` layer is
+/// focused) and Layout B's `Logs` quadrant. The renderer is the sole cap
+/// on visible row count: it shows up to `inner.height` rows from `lines`
+/// and the title carries the `1–{end} of {total}` range. Empty `lines`
+/// yields a "no errors" empty state. Issue #158, ADR-0014.
 fn render_logs_panel(lines: &[LogLine], theme: &Theme, frame: &mut Frame, area: Rect) {
-    let title = format!(" logs — top {} ", lines.len());
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let total = lines.len();
+    let visible = total.min(inner.height as usize);
+    let title = if total == 0 {
+        " logs ".to_string()
+    } else {
+        format!(" logs — 1–{visible} of {total} ")
+    };
+    frame.render_widget(block.title(title), area);
     if inner.height == 0 {
         return;
     }
@@ -493,7 +501,7 @@ fn render_logs_panel(lines: &[LogLine], theme: &Theme, frame: &mut Frame, area: 
 
     let body: Vec<Line> = lines
         .iter()
-        .take(inner.height as usize)
+        .take(visible)
         .map(|l| log_line_spans(l, theme, inner.width))
         .collect();
     frame.render_widget(Paragraph::new(body), inner);
@@ -1449,6 +1457,18 @@ mod tests {
         ]
     }
 
+    fn log_lines_sample_n(n: usize) -> Vec<crate::model::LogLine> {
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 5, 6, 14, 1, 9).unwrap();
+        (0..n)
+            .map(|i| crate::model::LogLine {
+                ts,
+                pod: format!("pod-{i:03}"),
+                level: Status::Warn,
+                message: format!("ERROR line {i}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn render_drill_renders_log_panel_when_logs_focused_and_lines_present() {
         let mut app = App::new();
@@ -1456,10 +1476,50 @@ mod tests {
         app.handle(Action::Focus(Dir::Right)); // focus logs (idx 1)
         app.handle(Action::LogLines(log_lines_sample()));
         let s = render_to_string(&mut app, 120, 24);
-        assert!(s.contains("logs — top 2"), "panel title missing:\n{s}");
+        assert!(s.contains("logs — 1–2 of 2"), "panel title missing:\n{s}");
         assert!(s.contains("carbide-controller"), "pod name missing:\n{s}");
         assert!(s.contains("disk full"), "message missing:\n{s}");
         assert!(s.contains("FATAL"), "fail-level message missing:\n{s}");
+    }
+
+    #[test]
+    fn render_drill_logs_panel_visible_row_count_tracks_inner_height() {
+        // ADR-0014: the renderer is the sole cap. With > 20 entries and a
+        // tall window, all entries should render — there must be no
+        // implicit 20-line cap on the data path. h=120 gives the drill
+        // panel ~56 inner rows after layout split, which fits 40 lines.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // focus logs (idx 1)
+        app.handle(Action::LogLines(log_lines_sample_n(40)));
+        let s = render_to_string(&mut app, 120, 120);
+        assert!(
+            s.contains("logs — 1–40 of 40"),
+            "title must reflect renderer-side sizing, got:\n{s}"
+        );
+        assert!(s.contains("pod-039"), "row 40 (pod-039) must be visible:\n{s}");
+        assert!(s.contains("pod-020"), "row 21 (pod-020) must be visible:\n{s}");
+    }
+
+    #[test]
+    fn render_drill_logs_panel_caps_at_inner_height_when_data_exceeds() {
+        // When data exceeds inner.height, the renderer trims and the title
+        // shows the visible range vs total.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right));
+        app.handle(Action::LogLines(log_lines_sample_n(200)));
+        let s = render_to_string(&mut app, 120, 24);
+        // total stays at 200; end varies with the layout's drill-panel
+        // share. Assert the shape, not the exact end value.
+        assert!(
+            s.contains("of 200"),
+            "title must carry total=200, got:\n{s}"
+        );
+        assert!(
+            s.contains("logs — 1–"),
+            "title must use 1–{{end}} of {{total}} form, got:\n{s}"
+        );
     }
 
     #[test]
@@ -1530,7 +1590,7 @@ mod tests {
         // focus stays at idx 0 (cluster).
         let s = render_to_string(&mut app, 120, 24);
         assert!(
-            !s.contains("logs — top"),
+            !s.contains("logs — 1–"),
             "logs panel must not appear when cluster is focused:\n{s}"
         );
     }

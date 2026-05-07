@@ -475,11 +475,10 @@ fn spawn_activity_refresh(ctx: &ActivityCtx, tx: mpsc::Sender<Action>) {
     });
 }
 
-/// Top-N for the snapshot logs panel. Issue #158 picked 20 as the
-/// default; the underlying `LogSource::collect` is asked for a larger cap
-/// (matching `LogsLayer`) so the panel sees the same firehose the layer
-/// does.
-const LOG_PANEL_TOP_N: usize = 20;
+/// Fetch-side firehose cap for the snapshot logs panel — matches
+/// `LogsLayer` so the panel and the layer see the same data. The
+/// renderer (`render_logs_panel`) is the sole cap on visible row count;
+/// see ADR-0014.
 const LOG_PANEL_FETCH_LIMIT: usize = 500;
 
 /// Fan-out partner of `spawn_refresh` for the snapshot logs panel. Calls
@@ -503,14 +502,14 @@ fn spawn_logs_refresh(ctx: &LogsCtx, tx: mpsc::Sender<Action>) {
 }
 
 /// Convert raw `(pod, line)` entries from a `LogCollection` into
-/// `LogLine`s for the snapshot panel. Caps at `LOG_PANEL_TOP_N`. The
-/// timestamp is the snapshot fetch time — the shared `LogSource` API
+/// `LogLine`s for the snapshot panel. Returns every classified entry —
+/// `render_logs_panel` is the sole cap on visible row count (ADR-0014).
+/// The timestamp is the snapshot fetch time — the shared `LogSource` API
 /// drops Loki's per-line timestamps today; carrying them is a follow-up.
 fn log_lines_from_entries(entries: Vec<(String, String)>) -> Vec<LogLine> {
     let now = chrono::Utc::now();
     entries
         .into_iter()
-        .take(LOG_PANEL_TOP_N)
         .map(|(pod, line)| LogLine {
             ts: now,
             pod,
@@ -556,13 +555,16 @@ mod tests {
     }
 
     #[test]
-    fn log_lines_from_entries_caps_at_top_n() {
+    fn log_lines_from_entries_returns_all_entries_uncapped() {
+        // ADR-0014: the data path no longer caps; the renderer is the sole
+        // cap on visible row count (see view::tests for renderer behavior).
         let entries: Vec<(String, String)> = (0..50)
             .map(|i| (format!("pod-{i}"), format!("ERROR line {i}")))
             .collect();
         let out = log_lines_from_entries(entries);
-        assert_eq!(out.len(), LOG_PANEL_TOP_N);
+        assert_eq!(out.len(), 50);
         assert_eq!(out[0].pod, "pod-0");
+        assert_eq!(out[49].pod, "pod-49");
     }
 
     #[test]
