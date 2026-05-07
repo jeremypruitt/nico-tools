@@ -1,6 +1,11 @@
+use std::io::IsTerminal;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use async_trait::async_trait;
+use nico_common::boot_probe::{
+    next_command_for, standard_steps, BootProbe, ProbeMode, ProbeOutcome, ProbeState, StderrSink,
+    StepId, StepState,
+};
 use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, ReachMode};
 use nico_common::output::OutputMode;
 use nico_common::reach::ReachManager;
@@ -14,6 +19,7 @@ use crate::http;
 use crate::grpc;
 use crate::postgres;
 use crate::preflight;
+use crate::preflight::PreflightChecks;
 
 const LAYER_ORDER: &[&str] = &["cluster", "logs", "workflows", "health", "grpc", "postgres"];
 
@@ -250,14 +256,15 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
     })?;
 
     let reach_mode = config.cluster.reach_mode;
-    eprintln!(
-        "nico: reach mode: {} ({})",
-        reach_mode.as_str(),
-        if mode_override.is_some() { "--mode flag" }
-        else if env.contains_key("NICO_REACH_MODE") { "NICO_REACH_MODE" }
-        else if env.contains_key("KUBERNETES_SERVICE_HOST") { "auto-detected: in-cluster" }
-        else { "auto-detected: no KUBERNETES_SERVICE_HOST" }
-    );
+    let reach_source = if mode_override.is_some() {
+        "--mode flag"
+    } else if env.contains_key("NICO_REACH_MODE") {
+        "NICO_REACH_MODE"
+    } else if env.contains_key("KUBERNETES_SERVICE_HOST") {
+        "auto-detected: in-cluster"
+    } else {
+        "auto-detected: no KUBERNETES_SERVICE_HOST"
+    };
 
     let output_mode = OutputMode {
         color: match config.output.color {
@@ -276,98 +283,28 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         timeout,
     };
 
-    let k8s_result = nico_common::k8s::KubeRsK8sClient::try_new(
-        config.cluster.context.as_deref(),
-        config.bootstrap.timeouts.kube_client,
-    ).await;
-    let (k8s_client, raw_k8s, reach_mgr): (
-        Option<Arc<dyn nico_common::k8s::K8sClient>>,
-        Option<kube::Client>,
-        Option<ReachManager>,
-    ) = match k8s_result {
-        Ok(c) => {
-            let raw = c.raw_client().clone();
-            let mgr = ReachManager::new(
-                reach_mode,
-                raw.clone(),
-                config.cluster.namespace.clone(),
-                config.cluster.postgres_namespace.clone(),
-            );
-            (
-                Some(Arc::new(c) as Arc<dyn nico_common::k8s::K8sClient>),
-                Some(raw),
-                Some(mgr),
-            )
-        }
-        Err(e) => {
-            if e.is_timed_out() {
-                eprintln!("nico: warn: kube client setup {e}");
-            }
-            (None, None, None)
+    let probe_outcome = run_boot_probe(
+        &config,
+        reach_mode,
+        reach_source,
+        &output_mode,
+    )
+    .await;
+
+    let BootProbeResult {
+        k8s_client,
+        reach_mgr,
+        temporal_address,
+        postgres_url,
+        mut pf_guards,
+    } = match probe_outcome {
+        Ok(r) => r,
+        Err(failure) => {
+            return Err(failure);
         }
     };
 
-    if let Some(raw) = raw_k8s.as_ref() {
-        let pf = preflight::KubePreflightClient::new(raw.clone());
-        if let preflight::Outcome::Failed(failure) = preflight::run(
-            &pf,
-            &config.cluster.namespace,
-            &config.bootstrap.timeouts,
-        ).await {
-            let json_payload = preflight::format_failure_json(&failure, &config.cluster.namespace);
-            let human_message = format!(
-                "error: pre-flight check failed [{}]: {}\n  → {}",
-                failure.step.as_str(),
-                failure.message,
-                failure.next_command
-            );
-            return Err(BootstrapErr::Preflight {
-                human_message,
-                json_payload,
-                format: config.output.format,
-            });
-        }
-    }
-
-    let mut pf_guards: Vec<nico_common::reach::ForwardedEndpoint> = vec![];
     let pf_budget = config.bootstrap.timeouts.port_forward;
-
-    let temporal_address = if let Some(ref mgr) = reach_mgr {
-        match mgr.temporal_address(pf_budget).await {
-            Ok((addr, guard)) => {
-                pf_guards.extend(guard);
-                addr
-            }
-            Err(e) => {
-                eprintln!("nico: warn: temporal port-forward failed ({e}); using config address");
-                config.temporal.address.clone()
-            }
-        }
-    } else {
-        config.temporal.address.clone()
-    };
-
-    let postgres_url = if let Some(ref mgr) = reach_mgr {
-        match mgr.postgres_url(&config.postgres.url, pf_budget).await {
-            Ok((url, guard)) => {
-                pf_guards.extend(guard);
-                url
-            }
-            Err(e) => {
-                eprintln!("nico: warn: postgres port-forward failed ({e}); using config URL");
-                config.postgres.url.clone()
-            }
-        }
-    } else {
-        config.postgres.url.clone()
-    };
-
-    if let Err(e) = nico_common::bootstrap::probe_postgres(
-        &postgres_url,
-        config.bootstrap.timeouts.postgres_reach,
-    ).await {
-        eprintln!("nico: warn: postgres reach probe: {e}");
-    }
 
     let (loki_url, loki_client): (Option<String>, Arc<dyn loki::LokiClient>) = {
         if let Ok(url) = std::env::var("LOKI_URL") {
@@ -471,4 +408,449 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         log_source,
         _pf_guards: pf_guards,
     })
+}
+
+/// Internal carry value: what the boot probe produces on the `Ok` path.
+/// On a fatal pre-flight failure the probe instead yields a
+/// `BootstrapErr::Preflight`. Connecting failures (no kubeconfig)
+/// degrade gracefully: probe marks them failed/skipped but bootstrap
+/// continues with `k8s_client = None`. Serving failures (port-forward,
+/// reach postgres) are non-fatal warnings — the probe shows them in
+/// red but bootstrap continues with the configured fallback URL.
+struct BootProbeResult {
+    k8s_client: Option<Arc<dyn nico_common::k8s::K8sClient>>,
+    reach_mgr: Option<ReachManager>,
+    temporal_address: String,
+    postgres_url: String,
+    pf_guards: Vec<nico_common::reach::ForwardedEndpoint>,
+}
+
+async fn run_boot_probe(
+    config: &Config,
+    reach_mode: ReachMode,
+    reach_source: &str,
+    output_mode: &OutputMode,
+) -> Result<BootProbeResult, BootstrapErr> {
+    let probe_mode = if config.output.format == OutputFormat::Json {
+        ProbeMode::Json
+    } else if !std::io::stderr().is_terminal() {
+        ProbeMode::NonTty
+    } else {
+        ProbeMode::Tty {
+            color: output_mode.color,
+            ascii: output_mode.ascii,
+        }
+    };
+
+    let steps = standard_steps(&config.cluster.namespace, &config.bootstrap.timeouts);
+    let probe_state = ProbeState::new(steps, reach_mode.as_str(), reach_source);
+    let mut probe = BootProbe::new(probe_state, probe_mode, Box::new(StderrSink));
+    probe.start_ticking();
+    let tracker = probe.tracker();
+
+    let ns = config.cluster.namespace.clone();
+    let timeouts = config.bootstrap.timeouts;
+
+    // ---------- Connecting (sequential gate) ----------
+
+    // 1. LoadKubeconfig — non-fatal: degrade gracefully if it fails.
+    tracker.started(StepId::LoadKubeconfig).await;
+    let t = Instant::now();
+    let kube_result = nico_common::k8s::KubeRsK8sClient::try_new(
+        config.cluster.context.as_deref(),
+        timeouts.kube_client,
+    )
+    .await;
+
+    let kube_client = match kube_result {
+        Ok(c) => {
+            tracker
+                .finished(
+                    StepId::LoadKubeconfig,
+                    StepState::Passed { elapsed: t.elapsed() },
+                )
+                .await;
+            Some(c)
+        }
+        Err(e) => {
+            let elapsed = t.elapsed();
+            let timed_out = e.is_timed_out();
+            tracker
+                .finished(
+                    StepId::LoadKubeconfig,
+                    StepState::Failed {
+                        elapsed,
+                        message: e.to_string(),
+                        timed_out,
+                        next_command: next_command_for(StepId::LoadKubeconfig, &ns),
+                    },
+                )
+                .await;
+            // No client → all downstream is skipped.
+            tracker
+                .skip_remaining(&[
+                    StepId::ReachApiServer,
+                    StepId::Credentials,
+                    StepId::NamespaceExists,
+                    StepId::Rbac,
+                    StepId::PortForwardWorkflows,
+                    StepId::PortForwardGrpc,
+                    StepId::PortForwardPostgres,
+                    StepId::ReachPostgres,
+                ])
+                .await;
+            // Graceful degradation — probe completes (with the failed
+            // kubeconfig step rendered), bootstrap continues without
+            // a client.
+            let _ = probe.finish_failure(&ns).await;
+            return Ok(BootProbeResult {
+                k8s_client: None,
+                reach_mgr: None,
+                temporal_address: config.temporal.address.clone(),
+                postgres_url: config.postgres.url.clone(),
+                pf_guards: vec![],
+            });
+        }
+    };
+
+    let raw = kube_client.as_ref().unwrap().raw_client().clone();
+
+    // 2. ReachApiServer — fatal gate.
+    tracker.started(StepId::ReachApiServer).await;
+    let t = Instant::now();
+    let raw_for_reach = raw.clone();
+    let reach_result = nico_common::bootstrap::run_with_budget(
+        timeouts.reach_api,
+        async move {
+            raw_for_reach
+                .apiserver_version()
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot reach API server: {e}"))
+                .map(|_| ())
+        },
+    )
+    .await;
+    if let Err(e) = reach_result {
+        let elapsed = t.elapsed();
+        let timed_out = e.is_timed_out();
+        tracker
+            .finished(
+                StepId::ReachApiServer,
+                StepState::Failed {
+                    elapsed,
+                    message: e.to_string(),
+                    timed_out,
+                    next_command: next_command_for(StepId::ReachApiServer, &ns),
+                },
+            )
+            .await;
+        tracker
+            .skip_remaining(&[
+                StepId::Credentials,
+                StepId::NamespaceExists,
+                StepId::Rbac,
+                StepId::PortForwardWorkflows,
+                StepId::PortForwardGrpc,
+                StepId::PortForwardPostgres,
+                StepId::ReachPostgres,
+            ])
+            .await;
+        return Err(probe_to_preflight_err(probe, config).await);
+    }
+    tracker
+        .finished(
+            StepId::ReachApiServer,
+            StepState::Passed { elapsed: t.elapsed() },
+        )
+        .await;
+
+    // ---------- Validating + Serving in parallel ----------
+
+    let pf = preflight::KubePreflightClient::new(raw.clone());
+    let reach_mgr = ReachManager::new(
+        reach_mode,
+        raw.clone(),
+        config.cluster.namespace.clone(),
+        config.cluster.postgres_namespace.clone(),
+    );
+
+    let (validating_ok, serving_results) = tokio::join!(
+        run_validating_section(&tracker, &pf, &ns, timeouts.preflight),
+        run_serving_section(&tracker, &reach_mgr, config, timeouts.port_forward, timeouts.postgres_reach),
+    );
+
+    if !validating_ok {
+        // Mark serving steps that may have started or are still pending as
+        // appropriate; serving may have run concurrently — we leave its
+        // state as-is (each step recorded its own outcome). Validating
+        // failure is fatal regardless.
+        return Err(probe_to_preflight_err(probe, config).await);
+    }
+
+    let (temporal_address, postgres_url, pf_guards) = serving_results;
+
+    // Serving failures are non-fatal (probe shows them; bootstrap falls
+    // back to config addresses). Probe completes successfully so long
+    // as connecting + validating passed.
+    let _ = if probe_state_any_failed(&probe).await {
+        probe.finish_failure(&ns).await
+    } else {
+        probe.finish_success(&ns).await
+    };
+
+    Ok(BootProbeResult {
+        k8s_client: Some(Arc::new(kube_client.unwrap()) as Arc<dyn nico_common::k8s::K8sClient>),
+        reach_mgr: Some(reach_mgr),
+        temporal_address,
+        postgres_url,
+        pf_guards,
+    })
+}
+
+async fn probe_state_any_failed(probe: &BootProbe) -> bool {
+    // BootProbe doesn't expose its inner state directly; we use the
+    // tracker's flow indirectly by calling finish_*. Here we inspect
+    // the stored outcome by peeking at the JSON success/failure flag.
+    // For our use, we just call finish_* in the caller; this helper is
+    // only needed to choose between success and failure variants.
+    let tracker = probe.tracker();
+    tracker.any_failed().await
+}
+
+async fn run_validating_section(
+    tracker: &nico_common::boot_probe::Tracker,
+    pf: &preflight::KubePreflightClient,
+    ns: &str,
+    budget: Duration,
+) -> bool {
+    let cred_fut = run_step(
+        tracker,
+        StepId::Credentials,
+        ns,
+        budget,
+        async { pf.check_token_valid().await },
+    );
+    let ns_fut = run_step(
+        tracker,
+        StepId::NamespaceExists,
+        ns,
+        budget,
+        async { pf.check_namespace_exists(ns).await },
+    );
+    let rbac_fut = run_step(
+        tracker,
+        StepId::Rbac,
+        ns,
+        budget,
+        async { pf.check_rbac(ns).await },
+    );
+    let (cred_ok, ns_ok, rbac_ok) = tokio::join!(cred_fut, ns_fut, rbac_fut);
+    cred_ok && ns_ok && rbac_ok
+}
+
+async fn run_step<F>(
+    tracker: &nico_common::boot_probe::Tracker,
+    id: StepId,
+    ns: &str,
+    budget: Duration,
+    fut: F,
+) -> bool
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    tracker.started(id).await;
+    let t = Instant::now();
+    let r = nico_common::bootstrap::run_with_budget(budget, fut).await;
+    let elapsed = t.elapsed();
+    match r {
+        Ok(()) => {
+            tracker
+                .finished(id, StepState::Passed { elapsed })
+                .await;
+            true
+        }
+        Err(e) => {
+            let timed_out = e.is_timed_out();
+            tracker
+                .finished(
+                    id,
+                    StepState::Failed {
+                        elapsed,
+                        message: e.to_string(),
+                        timed_out,
+                        next_command: next_command_for(id, ns),
+                    },
+                )
+                .await;
+            false
+        }
+    }
+}
+
+async fn run_serving_section(
+    tracker: &nico_common::boot_probe::Tracker,
+    reach_mgr: &ReachManager,
+    config: &Config,
+    pf_budget: Duration,
+    pg_reach_budget: Duration,
+) -> (String, String, Vec<nico_common::reach::ForwardedEndpoint>) {
+    let ns = config.cluster.namespace.clone();
+
+    // Workflows port-forward
+    let temporal_fut = async {
+        tracker.started(StepId::PortForwardWorkflows).await;
+        let t = Instant::now();
+        match reach_mgr.temporal_address(pf_budget).await {
+            Ok((addr, guard)) => {
+                tracker
+                    .finished(
+                        StepId::PortForwardWorkflows,
+                        StepState::Passed { elapsed: t.elapsed() },
+                    )
+                    .await;
+                (addr, guard)
+            }
+            Err(e) => {
+                let elapsed = t.elapsed();
+                let timed_out = e.is_timed_out();
+                tracker
+                    .finished(
+                        StepId::PortForwardWorkflows,
+                        StepState::Failed {
+                            elapsed,
+                            message: e.to_string(),
+                            timed_out,
+                            next_command: next_command_for(StepId::PortForwardWorkflows, &ns),
+                        },
+                    )
+                    .await;
+                (config.temporal.address.clone(), None)
+            }
+        }
+    };
+
+    // gRPC port-forward — currently a no-op placeholder. If
+    // grpc_address is configured, mark Passed; otherwise mark Skipped
+    // (no actual port-forward to attempt today).
+    let grpc_fut = async {
+        tracker.started(StepId::PortForwardGrpc).await;
+        let t = Instant::now();
+        if config.cluster.grpc_address.is_some() {
+            tracker
+                .finished(
+                    StepId::PortForwardGrpc,
+                    StepState::Passed { elapsed: t.elapsed() },
+                )
+                .await;
+        } else {
+            tracker
+                .finished(StepId::PortForwardGrpc, StepState::Skipped)
+                .await;
+        }
+    };
+
+    // Postgres port-forward → reach postgres (sequential within
+    // serving's parallel group).
+    let postgres_fut = async {
+        tracker.started(StepId::PortForwardPostgres).await;
+        let t = Instant::now();
+        let (postgres_url, pf_guard, pf_ok) = match reach_mgr
+            .postgres_url(&config.postgres.url, pf_budget)
+            .await
+        {
+            Ok((url, guard)) => {
+                tracker
+                    .finished(
+                        StepId::PortForwardPostgres,
+                        StepState::Passed { elapsed: t.elapsed() },
+                    )
+                    .await;
+                (url, guard, true)
+            }
+            Err(e) => {
+                let elapsed = t.elapsed();
+                let timed_out = e.is_timed_out();
+                tracker
+                    .finished(
+                        StepId::PortForwardPostgres,
+                        StepState::Failed {
+                            elapsed,
+                            message: e.to_string(),
+                            timed_out,
+                            next_command: next_command_for(StepId::PortForwardPostgres, &ns),
+                        },
+                    )
+                    .await;
+                (config.postgres.url.clone(), None, false)
+            }
+        };
+
+        if !pf_ok {
+            tracker
+                .finished(StepId::ReachPostgres, StepState::Skipped)
+                .await;
+            return (postgres_url, pf_guard);
+        }
+
+        tracker.started(StepId::ReachPostgres).await;
+        let t = Instant::now();
+        match nico_common::bootstrap::probe_postgres(&postgres_url, pg_reach_budget).await {
+            Ok(()) => {
+                tracker
+                    .finished(
+                        StepId::ReachPostgres,
+                        StepState::Passed { elapsed: t.elapsed() },
+                    )
+                    .await;
+            }
+            Err(e) => {
+                let elapsed = t.elapsed();
+                let timed_out = e.is_timed_out();
+                tracker
+                    .finished(
+                        StepId::ReachPostgres,
+                        StepState::Failed {
+                            elapsed,
+                            message: e.to_string(),
+                            timed_out,
+                            next_command: next_command_for(StepId::ReachPostgres, &ns),
+                        },
+                    )
+                    .await;
+            }
+        }
+        (postgres_url, pf_guard)
+    };
+
+    let ((temporal_address, t_guard), _grpc, (postgres_url, pg_guard)) =
+        tokio::join!(temporal_fut, grpc_fut, postgres_fut);
+
+    let mut guards = vec![];
+    if let Some(g) = t_guard {
+        guards.push(g);
+    }
+    if let Some(g) = pg_guard {
+        guards.push(g);
+    }
+    (temporal_address, postgres_url, guards)
+}
+
+async fn probe_to_preflight_err(probe: BootProbe, config: &Config) -> BootstrapErr {
+    let outcome = probe.finish_failure(&config.cluster.namespace).await;
+    let (json, human_message) = match outcome {
+        ProbeOutcome::Failure {
+            json,
+            human_message,
+        } => (json, human_message),
+        ProbeOutcome::Success { json } => (
+            json,
+            "boot probe failed (no specific step recorded)".to_string(),
+        ),
+    };
+    BootstrapErr::Preflight {
+        human_message,
+        json_payload: serde_json::to_string_pretty(&json)
+            .unwrap_or_else(|_| "{}".to_string()),
+        format: config.output.format,
+    }
 }

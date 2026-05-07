@@ -1922,6 +1922,7 @@ dependencies = [
  "prost-wkt-types",
  "ratatui",
  "serde",
+ "serde_json",
  "temporal-sdk-core-protos",
  "thiserror",
  "tokio",
