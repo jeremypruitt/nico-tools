@@ -96,6 +96,7 @@ pub struct App {
     mouse_capture: bool,
     drill_scroll: u16,
     overlay_scroll: u16,
+    logs_scroll: u16,
     card_regions: Vec<Rect>,
     layout: Layout,
     spotlight_focus: usize,
@@ -141,6 +142,7 @@ impl App {
             mouse_capture: true,
             drill_scroll: 0,
             overlay_scroll: 0,
+            logs_scroll: 0,
             card_regions: Vec::new(),
             layout: Layout::default(),
             spotlight_focus: 0,
@@ -180,6 +182,26 @@ impl App {
 
     pub fn drill_scroll(&self) -> u16 {
         self.drill_scroll
+    }
+
+    /// Scroll offset for the snapshot logs panel when it is the dominant
+    /// view (Layout A drill with `logs` focused, or Layout B `Logs` quadrant
+    /// while zoomed). See [`logs_panel_dominant`](Self::logs_panel_dominant).
+    pub fn logs_scroll(&self) -> u16 {
+        self.logs_scroll
+    }
+
+    /// Whether the snapshot logs panel is currently the dominant view —
+    /// i.e. the surface the operator is reading. Returns true when the
+    /// Layout A drill panel is showing the logs panel (focused layer is
+    /// `logs`) or when Layout B's `Logs` quadrant is zoomed. Drives input
+    /// routing so j/k/wheel target `logs_scroll` here. ADR-0014.
+    pub fn logs_panel_dominant(&self) -> bool {
+        match self.layout {
+            Layout::A => self.focused().is_some_and(|s| s.name == "logs"),
+            Layout::B => self.b_zoomed && self.focused_quadrant() == Quadrant::Logs,
+            Layout::Spotlight => false,
+        }
     }
 
     /// Which top-level layout the renderer should draw.
@@ -322,6 +344,19 @@ impl App {
                 if self.overlay != Overlay::None {
                     return None;
                 }
+                if self.logs_panel_dominant() && matches!(dir, Dir::Up | Dir::Down) {
+                    let next = match dir {
+                        Dir::Up => self.logs_scroll.saturating_sub(1),
+                        Dir::Down => self.logs_scroll.saturating_add(1),
+                        _ => self.logs_scroll,
+                    };
+                    if next != self.logs_scroll {
+                        self.logs_scroll = next;
+                        self.dirty = true;
+                    }
+                    return None;
+                }
+                let was_logs_dominant = self.logs_panel_dominant();
                 let moved = match self.layout {
                     Layout::A => self.move_focus(dir),
                     Layout::B => {
@@ -335,6 +370,9 @@ impl App {
                 };
                 if moved {
                     self.dirty = true;
+                    if was_logs_dominant && !self.logs_panel_dominant() {
+                        self.logs_scroll = 0;
+                    }
                 }
                 None
             }
@@ -358,12 +396,14 @@ impl App {
                     Layout::Spotlight => Layout::A,
                 };
                 self.b_zoomed = false;
+                self.logs_scroll = 0;
                 self.dirty = true;
                 None
             }
             Action::ZoomQuadrant => {
                 if matches!(self.layout, Layout::B) && !self.b_zoomed {
                     self.b_zoomed = true;
+                    self.logs_scroll = 0;
                     self.dirty = true;
                 }
                 None
@@ -377,6 +417,7 @@ impl App {
             }
             Action::LogLines(lines) => {
                 self.log_lines = lines;
+                self.logs_scroll = 0;
                 self.dirty = true;
                 None
             }
@@ -462,6 +503,7 @@ impl App {
                 {
                     self.focus = idx;
                     self.drill_scroll = 0;
+                    self.logs_scroll = 0;
                     self.dirty = true;
                 }
                 None
@@ -470,7 +512,11 @@ impl App {
                 let target = if self.overlay == Overlay::Detail {
                     &mut self.overlay_scroll
                 } else if self.overlay == Overlay::None {
-                    &mut self.drill_scroll
+                    if self.logs_panel_dominant() {
+                        &mut self.logs_scroll
+                    } else {
+                        &mut self.drill_scroll
+                    }
                 } else {
                     return None;
                 };
@@ -667,6 +713,15 @@ impl App {
     fn force_now(&mut self, boot: Instant, now: Instant) {
         self.boot = Some(boot);
         self.now = Some(now);
+    }
+
+    /// Test seam: replace `log_lines` without going through
+    /// `Action::LogLines` (which resets `logs_scroll`). Lets the renderer
+    /// clamp test verify behavior on a stale scroll offset.
+    #[cfg(test)]
+    pub(crate) fn set_log_lines_for_test(&mut self, lines: Vec<LogLine>) {
+        self.log_lines = lines;
+        self.dirty = true;
     }
 
     fn update_pulses(&mut self, snaps: &[LayerSnapshot]) {
@@ -1487,6 +1542,260 @@ mod tests {
         app.handle(Action::Scroll(ScrollDir::Down));
         assert_eq!(app.overlay_scroll(), 2);
         assert_eq!(app.drill_scroll(), 0);
+    }
+
+    #[test]
+    fn fresh_app_has_logs_scroll_zero() {
+        let app = App::new();
+        assert_eq!(app.logs_scroll(), 0);
+    }
+
+    #[test]
+    fn logs_panel_not_dominant_when_layout_a_focused_layer_is_not_logs() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        // focus stays at idx 0 (cluster).
+        assert!(!app.logs_panel_dominant());
+    }
+
+    #[test]
+    fn logs_panel_dominant_in_layout_a_when_logs_focused() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // logs at idx 1
+        assert!(app.logs_panel_dominant());
+    }
+
+    fn focus_layout_b_logs_quadrant(app: &mut App) {
+        // Layout B grid: 0 Cluster / 1 Workflows / 2 Services /
+        //                3 Postgres / 4 Logs / 5 Activity
+        app.handle(Action::ToggleLayout);
+        app.handle(Action::Focus(Dir::Right)); // Workflows
+        app.handle(Action::Focus(Dir::Down)); // Logs (idx 4)
+    }
+
+    #[test]
+    fn logs_panel_not_dominant_in_layout_b_when_logs_focused_but_not_zoomed() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        focus_layout_b_logs_quadrant(&mut app);
+        assert_eq!(app.focused_quadrant(), Quadrant::Logs);
+        assert!(!app.b_zoomed());
+        assert!(!app.logs_panel_dominant());
+    }
+
+    #[test]
+    fn logs_panel_dominant_in_layout_b_when_logs_focused_and_zoomed() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        focus_layout_b_logs_quadrant(&mut app);
+        app.handle(Action::ZoomQuadrant);
+        assert!(app.logs_panel_dominant());
+    }
+
+    #[test]
+    fn logs_panel_not_dominant_in_layout_b_when_zoomed_but_other_quadrant() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::ToggleLayout);
+        // focus stays on Cluster (idx 0).
+        app.handle(Action::ZoomQuadrant);
+        assert!(!app.logs_panel_dominant());
+    }
+
+    #[test]
+    fn scroll_layout_a_logs_dominant_targets_logs_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // logs at idx 1
+        app.clear_dirty();
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.logs_scroll(), 2);
+        assert_eq!(app.drill_scroll(), 0);
+        assert!(app.dirty());
+    }
+
+    #[test]
+    fn scroll_layout_b_logs_zoomed_targets_logs_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        focus_layout_b_logs_quadrant(&mut app);
+        app.handle(Action::ZoomQuadrant);
+        app.clear_dirty();
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.logs_scroll(), 1);
+        assert_eq!(app.drill_scroll(), 0);
+    }
+
+    #[test]
+    fn scroll_when_logs_panel_not_dominant_keeps_drill_scroll_behavior() {
+        // Regression: focus stays on cluster (idx 0), so logs panel is not
+        // dominant. Wheel must still drive drill_scroll, not logs_scroll.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.clear_dirty();
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.drill_scroll(), 1);
+        assert_eq!(app.logs_scroll(), 0);
+    }
+
+    #[test]
+    fn scroll_up_at_zero_logs_dominant_is_inert() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right));
+        app.clear_dirty();
+        app.handle(Action::Scroll(ScrollDir::Up));
+        assert_eq!(app.logs_scroll(), 0);
+        assert!(!app.dirty());
+    }
+
+    #[test]
+    fn focus_down_layout_a_logs_dominant_routes_to_logs_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // logs at idx 1
+        app.clear_dirty();
+        let focus_before = app.focus();
+        app.handle(Action::Focus(Dir::Down));
+        app.handle(Action::Focus(Dir::Down));
+        assert_eq!(app.logs_scroll(), 2);
+        assert_eq!(
+            app.focus(),
+            focus_before,
+            "focus must not move while logs panel is dominant"
+        );
+        assert!(app.dirty());
+    }
+
+    #[test]
+    fn focus_up_layout_a_logs_dominant_decrements_logs_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // logs
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.logs_scroll(), 2);
+        app.handle(Action::Focus(Dir::Up));
+        assert_eq!(app.logs_scroll(), 1);
+    }
+
+    #[test]
+    fn focus_horizontal_when_logs_dominant_does_not_scroll() {
+        // Only Up/Down route to logs_scroll. Left/Right are unchanged
+        // (and currently move focus when logs is dominant — but the key
+        // contract is that they don't touch logs_scroll).
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // logs
+        app.clear_dirty();
+        app.handle(Action::Focus(Dir::Right));
+        app.handle(Action::Focus(Dir::Left));
+        assert_eq!(app.logs_scroll(), 0);
+    }
+
+    #[test]
+    fn focus_down_layout_b_logs_zoomed_routes_to_logs_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        focus_layout_b_logs_quadrant(&mut app);
+        app.handle(Action::ZoomQuadrant);
+        let b_before = app.b_focus();
+        app.handle(Action::Focus(Dir::Down));
+        assert_eq!(app.logs_scroll(), 1);
+        assert_eq!(app.b_focus(), b_before);
+    }
+
+    #[test]
+    fn focus_when_logs_panel_not_dominant_still_moves_focus() {
+        // Regression: cluster focused (idx 0). j/k must still navigate.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.clear_dirty();
+        app.handle(Action::Focus(Dir::Down));
+        assert_eq!(app.focus(), 3, "focus should move down across the grid");
+        assert_eq!(app.logs_scroll(), 0);
+    }
+
+    #[test]
+    fn log_lines_action_resets_logs_scroll() {
+        use chrono::Utc;
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // logs
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.logs_scroll(), 2);
+        let line = LogLine {
+            ts: Utc::now(),
+            pod: "core-abc".into(),
+            level: Status::Warn,
+            message: "ERROR: disk full".into(),
+        };
+        app.handle(Action::LogLines(vec![line]));
+        assert_eq!(app.logs_scroll(), 0);
+    }
+
+    #[test]
+    fn focus_change_away_from_logs_resets_logs_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // logs
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.logs_scroll(), 1);
+        // Logs is at idx 1; Right moves to workflows (idx 2). Logs panel
+        // is no longer dominant — so this Focus(Right) routes to focus
+        // movement, not scroll. The reset must fire on the transition.
+        app.handle(Action::Focus(Dir::Right));
+        assert_eq!(app.focus(), 2);
+        assert_eq!(app.logs_scroll(), 0);
+    }
+
+    #[test]
+    fn click_to_non_logs_card_resets_logs_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // logs
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.logs_scroll(), 1);
+        app.set_card_regions(vec![
+            rect(0, 0, 30, 4),
+            rect(30, 0, 30, 4),
+            rect(60, 0, 30, 4),
+        ]);
+        app.handle(Action::Click { col: 65, row: 1 }); // focus card 2 (workflows)
+        assert_eq!(app.focus(), 2);
+        assert_eq!(app.logs_scroll(), 0);
+    }
+
+    #[test]
+    fn toggle_layout_resets_logs_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // logs (Layout A)
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.logs_scroll(), 1);
+        app.handle(Action::ToggleLayout); // A → B
+        assert_eq!(app.logs_scroll(), 0);
+    }
+
+    #[test]
+    fn zoom_quadrant_clears_logs_scroll_on_entry() {
+        // ZoomQuadrant only fires zoom-in (unzoom is via CloseOverlay).
+        // The reset on entry is a belt-and-suspenders guarantee that no
+        // stale offset survives a transition into the dominant view. We
+        // can't preload logs_scroll>0 just before ZoomQuadrant in Layout B
+        // (panel only becomes dominant once zoomed), so this checks the
+        // field stays at 0 across the action — combined with the explicit
+        // reset assignment in the reducer, this is the spec-compliant
+        // round-trip.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        focus_layout_b_logs_quadrant(&mut app);
+        assert_eq!(app.logs_scroll(), 0);
+        app.handle(Action::ZoomQuadrant);
+        assert_eq!(app.logs_scroll(), 0);
     }
 
     #[test]

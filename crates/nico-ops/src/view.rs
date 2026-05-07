@@ -38,6 +38,7 @@ pub const HELP_LINES: &[&str] = &[
     "R         refresh",
     "Space     pause / resume auto-refresh",
     "↑↓←→/hjkl move focus",
+    "j/k/wheel scroll logs (when logs panel is zoomed/focused)",
     "Enter     open detail",
     "s         spotlight (incident-only) view",
     "a / Esc   show all (return from spotlight)",
@@ -438,7 +439,7 @@ fn render_scorecard(app: &App, idx: usize, theme: &Theme, frame: &mut Frame, are
 
 fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     if app.focused().is_some_and(|s| s.name == "logs") {
-        render_logs_panel(app.log_lines(), theme, frame, area);
+        render_logs_panel(app.log_lines(), app.logs_scroll(), theme, frame, area);
         return;
     }
 
@@ -472,18 +473,30 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 /// Render the snapshot logs panel — error log lines from the most recent
 /// refresh round. Used by Layout A's drill panel (when the `logs` layer is
 /// focused) and Layout B's `Logs` quadrant. The renderer is the sole cap
-/// on visible row count: it shows up to `inner.height` rows from `lines`
-/// and the title carries the `1–{end} of {total}` range. Empty `lines`
-/// yields a "no errors" empty state. Issue #158, ADR-0014.
-fn render_logs_panel(lines: &[LogLine], theme: &Theme, frame: &mut Frame, area: Rect) {
+/// on visible row count: it shows up to `inner.height` rows from
+/// `lines[clamped..]` and the title carries the `start–end of total`
+/// range. `scroll` is clamped on use so a post-refresh dataset shrink
+/// can't render past the end. Empty `lines` yields a "no errors" empty
+/// state. Issue #158, ADR-0014.
+fn render_logs_panel(
+    lines: &[LogLine],
+    scroll: u16,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
     let total = lines.len();
-    let visible = total.min(inner.height as usize);
+    let max_offset = total.saturating_sub(inner.height as usize);
+    let clamped = (scroll as usize).min(max_offset);
+    let visible = total.saturating_sub(clamped).min(inner.height as usize);
     let title = if total == 0 {
         " logs ".to_string()
     } else {
-        format!(" logs — 1–{visible} of {total} ")
+        let start = clamped + 1;
+        let end = clamped + visible;
+        format!(" logs — {start}–{end} of {total} ")
     };
     frame.render_widget(block.title(title), area);
     if inner.height == 0 {
@@ -501,6 +514,7 @@ fn render_logs_panel(lines: &[LogLine], theme: &Theme, frame: &mut Frame, area: 
 
     let body: Vec<Line> = lines
         .iter()
+        .skip(clamped)
         .take(visible)
         .map(|l| log_line_spans(l, theme, inner.width))
         .collect();
@@ -978,8 +992,10 @@ fn render_quadrant(
 }
 
 /// Layout B's `Logs` quadrant body. Reuses the snapshot logs panel so
-/// Layout A's drill and this quadrant stay visually consistent. Issue
-/// #158.
+/// Layout A's drill and this quadrant stay visually consistent. Honors
+/// `logs_scroll` when the quadrant is the dominant view (zoomed); the
+/// offset is clamped on use so a stale value can't render past the end.
+/// Issue #158, ADR-0014.
 fn render_logs_quadrant_body(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let lines = app.log_lines();
     if lines.is_empty() {
@@ -990,9 +1006,14 @@ fn render_logs_quadrant_body(app: &App, theme: &Theme, frame: &mut Frame, area: 
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
+    let height = area.height as usize;
+    let max_offset = lines.len().saturating_sub(height);
+    let clamped = (app.logs_scroll() as usize).min(max_offset);
+    let visible = lines.len().saturating_sub(clamped).min(height);
     let body: Vec<Line> = lines
         .iter()
-        .take(area.height as usize)
+        .skip(clamped)
+        .take(visible)
         .map(|l| log_line_spans(l, theme, area.width))
         .collect();
     frame.render_widget(Paragraph::new(body), area);
@@ -1502,6 +1523,49 @@ mod tests {
     }
 
     #[test]
+    fn render_drill_logs_panel_title_reflects_logs_scroll_offset() {
+        // Scroll 20 down on a 200-line dataset; title shifts from
+        // "1–{end} of 200" to "21–{end+20} of 200".
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right));
+        app.handle(Action::LogLines(log_lines_sample_n(200)));
+        // 20 wheel-down events. While dominant (logs focused), each
+        // increments logs_scroll.
+        for _ in 0..20 {
+            app.handle(Action::Scroll(ScrollDir::Down));
+        }
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("logs — 21–"), "title must start at 21:\n{s}");
+        assert!(s.contains("of 200"), "total must be 200:\n{s}");
+        assert!(
+            s.contains("pod-020"),
+            "row 21 (pod-020) must be visible at top:\n{s}"
+        );
+    }
+
+    #[test]
+    fn render_drill_logs_panel_clamps_offset_when_data_shrinks() {
+        // Build up a scroll offset on a big dataset, then replace lines
+        // with a tiny dataset directly mutating logs_scroll via the test
+        // seam to bypass the LogLines reset (which would zero it).
+        // Verifies the renderer's clamp prevents panic on a stale offset.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right));
+        app.handle(Action::LogLines(log_lines_sample_n(200)));
+        for _ in 0..50 {
+            app.handle(Action::Scroll(ScrollDir::Down));
+        }
+        // Force a small dataset *without* dispatching Action::LogLines so
+        // the renderer sees a stale offset.
+        app.set_log_lines_for_test(log_lines_sample_n(3));
+        // Render must not panic and must produce a sensible title.
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("of 3"), "total must be 3 after shrink:\n{s}");
+    }
+
+    #[test]
     fn render_drill_logs_panel_caps_at_inner_height_when_data_exceeds() {
         // When data exceeds inner.height, the renderer trims and the title
         // shows the visible range vs total.
@@ -1532,6 +1596,30 @@ mod tests {
         assert!(
             s.contains("no errors"),
             "empty-state copy missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn layout_b_zoomed_logs_quadrant_honors_logs_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::ToggleLayout); // → B
+        app.handle(Action::Focus(Dir::Right)); // Workflows
+        app.handle(Action::Focus(Dir::Down)); // Logs (idx 4)
+        app.handle(Action::ZoomQuadrant);
+        app.handle(Action::LogLines(log_lines_sample_n(50)));
+        // Now dominant — wheel-down 5 should advance logs_scroll.
+        for _ in 0..5 {
+            app.handle(Action::Scroll(ScrollDir::Down));
+        }
+        let s = render_to_string(&mut app, 140, 30);
+        assert!(
+            s.contains("pod-005"),
+            "row at offset 5 must be visible:\n{s}"
+        );
+        assert!(
+            !s.contains("pod-000"),
+            "row 0 must be scrolled out:\n{s}"
         );
     }
 
@@ -1649,6 +1737,36 @@ mod tests {
         assert!(
             s.contains("pause"),
             "help overlay should mention pause keybind:\n{s}"
+        );
+    }
+
+    #[test]
+    fn render_help_overlay_lists_logs_scroll_keybind() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::OpenHelp);
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(
+            s.contains("scroll logs"),
+            "help overlay should document logs scroll:\n{s}"
+        );
+    }
+
+    #[test]
+    fn render_hint_bar_does_not_carry_logs_scroll_hint() {
+        // Per ADR-0014, the footer hint bar is intentionally NOT extended
+        // with a logs-panel-specific hint. The help overlay is the home
+        // for the new keybind.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::Focus(Dir::Right)); // focus logs (dominant)
+        let s = render_to_string(&mut app, 120, 24);
+        // The hint bar is the last line of output; assert the dominant-
+        // view scroll text doesn't leak into it.
+        let hint_line = s.lines().last().unwrap_or("");
+        assert!(
+            !hint_line.contains("scroll logs"),
+            "hint bar must not carry logs-scroll hint:\n{hint_line}"
         );
     }
 
