@@ -2,7 +2,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::postgres::{LockWait, PoolStats, PostgresClient};
-use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
+use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
 
 const POOL_WARN_RATIO: f64 = 0.90;
 const LOCK_WARN_SECS: f64 = 5.0;
@@ -35,6 +35,7 @@ fn pool_check(stats: &PoolStats) -> Check {
         } else {
             None
         },
+        kind: CheckKind::Headline,
     }
 }
 
@@ -45,6 +46,7 @@ fn lock_checks(waits: &[LockWait]) -> Vec<Check> {
         status: if long_waits.is_empty() { Status::Ok } else { Status::Warn },
         value: format!("{} lock waits", long_waits.len()),
         next_command: None,
+        kind: CheckKind::Headline,
     }];
     for w in &long_waits {
         let pids: Vec<String> = std::iter::once(w.waiting_pid)
@@ -67,6 +69,7 @@ fn lock_checks(waits: &[LockWait]) -> Vec<Check> {
                 "SELECT * FROM pg_stat_activity WHERE pid IN ({})",
                 pids.join(", ")
             )),
+            kind: CheckKind::Headline,
         });
     }
     checks
@@ -85,6 +88,7 @@ impl Layer for PostgresLayer {
                     status: Status::Unknown,
                     value: "postgres unreachable".into(),
                     next_command: Some("kubectl get svc -n nico | grep postgres".into()),
+                    kind: CheckKind::Headline,
                 }]);
             }
         };
@@ -99,6 +103,7 @@ impl Layer for PostgresLayer {
                     status: Status::Unknown,
                     value: "lock query failed".into(),
                     next_command: Some("kubectl get svc -n nico | grep postgres".into()),
+                    kind: CheckKind::Headline,
                 });
             }
         }

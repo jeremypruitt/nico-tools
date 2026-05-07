@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nico_common::k8s::{K8sClient, PodScope, RawEvent, RawPod};
 use nico_common::output::Status;
-use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
+use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
 
 pub struct ClusterLayer {
     k8s: Arc<dyn K8sClient>,
@@ -76,6 +76,7 @@ fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) 
             } else {
                 None
             },
+            kind: CheckKind::Headline,
         },
         Check {
             name: "recent_restarts",
@@ -86,6 +87,7 @@ fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) 
             } else {
                 None
             },
+            kind: CheckKind::Headline,
         },
         Check {
             name: "warning_events",
@@ -96,6 +98,7 @@ fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) 
             } else {
                 None
             },
+            kind: CheckKind::Headline,
         },
     ]
 }

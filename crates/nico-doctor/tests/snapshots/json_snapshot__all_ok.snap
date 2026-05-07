@@ -1,5 +1,6 @@
 ---
 source: crates/nico-doctor/tests/json_snapshot.rs
+assertion_line: 67
 expression: v
 ---
 {
@@ -7,16 +8,19 @@ expression: v
     {
       "checks": [
         {
+          "kind": "headline",
           "name": "pods_ready",
           "status": "ok",
           "value": "3/3"
         },
         {
+          "kind": "headline",
           "name": "recent_restarts",
           "status": "ok",
           "value": "0"
         },
         {
+          "kind": "headline",
           "name": "warning_events",
           "status": "ok",
           "value": "0"
@@ -30,11 +34,13 @@ expression: v
     {
       "checks": [
         {
+          "kind": "headline",
           "name": "error_lines",
           "status": "ok",
           "value": "0 errors"
         },
         {
+          "kind": "headline",
           "name": "source",
           "status": "ok",
           "value": "loki"
@@ -48,11 +54,13 @@ expression: v
     {
       "checks": [
         {
+          "kind": "headline",
           "name": "stuck",
           "status": "ok",
           "value": "0 stuck"
         },
         {
+          "kind": "headline",
           "name": "failed",
           "status": "ok",
           "value": "0 failed"

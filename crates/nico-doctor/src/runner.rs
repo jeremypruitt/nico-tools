@@ -49,7 +49,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use async_trait::async_trait;
-    use crate::layer::{Check, LayerOutcome, RunOpts};
+    use crate::layer::{Check, CheckKind, LayerOutcome, RunOpts};
 
     struct StubLayer {
         name: &'static str,
@@ -74,6 +74,7 @@ mod tests {
                 status: self.result.clone(),
                 value: String::new(),
                 next_command: None,
+                kind: CheckKind::Headline,
             }])
         }
     }

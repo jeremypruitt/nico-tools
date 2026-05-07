@@ -1,5 +1,6 @@
 ---
 source: crates/nico-doctor/tests/json_snapshot.rs
+assertion_line: 85
 expression: v
 ---
 {
@@ -7,11 +8,13 @@ expression: v
     {
       "checks": [
         {
+          "kind": "headline",
           "name": "pods_ready",
           "status": "warn",
           "value": "2/3"
         },
         {
+          "kind": "headline",
           "name": "recent_restarts",
           "status": "ok",
           "value": "0"
@@ -25,11 +28,13 @@ expression: v
     {
       "checks": [
         {
+          "kind": "headline",
           "name": "pool",
           "status": "warn",
           "value": "pool 18/20 in-use"
         },
         {
+          "kind": "headline",
           "name": "locks",
           "status": "ok",
           "value": "0 lock waits"

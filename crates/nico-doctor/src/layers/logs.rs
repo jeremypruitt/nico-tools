@@ -2,7 +2,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::log_source::LogSource;
-use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
+use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
 
 const LOG_LINE_LIMIT: usize = 500;
 
@@ -44,12 +44,14 @@ fn checks_from(
             status: if error_count == 0 { Status::Ok } else { Status::Warn },
             value: format!("{error_count} errors"),
             next_command: None,
+            kind: CheckKind::Headline,
         },
         Check {
             name: "source",
             status: if source_ok { Status::Ok } else { Status::Warn },
             value: source_label.to_string(),
             next_command: None,
+            kind: CheckKind::Headline,
         },
     ];
 
@@ -64,6 +66,7 @@ fn checks_from(
             status: Status::Warn,
             value: format!("{pod}: {count} errors — {excerpt}"),
             next_command: Some(format!("kubectl logs {pod} -n {namespace}")),
+            kind: CheckKind::Detail,
         });
     }
 
@@ -123,6 +126,31 @@ mod tests {
                 entries: self.entries.clone(),
             })
         }
+    }
+
+    #[test]
+    fn pod_error_checks_are_marked_detail() {
+        let pod_errors = vec![
+            ("core-abc".to_string(), "ERROR: disk full".to_string()),
+            ("rest-xyz".to_string(), "FATAL: oom".to_string()),
+        ];
+        let checks = checks_from(&pod_errors, "loki", true, "nico");
+        let pod_error_kinds: Vec<_> = checks.iter()
+            .filter(|c| c.name == "pod_error")
+            .map(|c| c.kind)
+            .collect();
+        assert_eq!(pod_error_kinds.len(), 2);
+        assert!(pod_error_kinds.iter().all(|k| *k == CheckKind::Detail));
+    }
+
+    #[test]
+    fn headline_checks_remain_headline_kind() {
+        let pod_errors = vec![("core-abc".to_string(), "ERROR".to_string())];
+        let checks = checks_from(&pod_errors, "loki", true, "nico");
+        let err = checks.iter().find(|c| c.name == "error_lines").unwrap();
+        assert_eq!(err.kind, CheckKind::Headline);
+        let src = checks.iter().find(|c| c.name == "source").unwrap();
+        assert_eq!(src.kind, CheckKind::Headline);
     }
 
     #[test]

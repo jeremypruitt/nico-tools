@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use nico_common::output::Status;
 use nico_doctor::baseline::Delta;
 use nico_doctor::formatter::format_json;
-use nico_doctor::layer::{Check, LayerResult};
+use nico_doctor::layer::{Check, CheckKind, LayerResult};
 use nico_doctor::runner::Report;
 
 fn no_deltas() -> HashMap<String, Delta> {
@@ -10,15 +10,15 @@ fn no_deltas() -> HashMap<String, Delta> {
 }
 
 fn ok_check(name: &'static str, value: &str) -> Check {
-    Check { name, status: Status::Ok, value: value.to_string(), next_command: None }
+    Check { name, status: Status::Ok, value: value.to_string(), next_command: None, kind: CheckKind::Headline }
 }
 
 fn warn_check(name: &'static str, value: &str) -> Check {
-    Check { name, status: Status::Warn, value: value.to_string(), next_command: Some(format!("kubectl get {name}")) }
+    Check { name, status: Status::Warn, value: value.to_string(), next_command: Some(format!("kubectl get {name}")), kind: CheckKind::Headline }
 }
 
 fn fail_check(name: &'static str, value: &str) -> Check {
-    Check { name, status: Status::Fail, value: value.to_string(), next_command: Some(format!("kubectl describe {name}")) }
+    Check { name, status: Status::Fail, value: value.to_string(), next_command: Some(format!("kubectl describe {name}")), kind: CheckKind::Headline }
 }
 
 fn layer_from_checks(name: &'static str, checks: Vec<Check>) -> LayerResult {

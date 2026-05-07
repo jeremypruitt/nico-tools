@@ -2,7 +2,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::http::{HttpClient, ServiceEndpoint};
-use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
+use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
 
 enum ProbeOutcome { Healthy, Degraded, Failed }
 
@@ -37,6 +37,7 @@ fn checks_from(probes: &[ServiceProbe]) -> Vec<Check> {
         status: summary_status,
         value: summary_value,
         next_command: None,
+        kind: CheckKind::Headline,
     }];
 
     for probe in probes {
@@ -46,12 +47,14 @@ fn checks_from(probes: &[ServiceProbe]) -> Vec<Check> {
                 status: Status::Fail,
                 value: format!("{} /healthz failed", probe.name),
                 next_command: Some(format!("curl -s {}/healthz", probe.base_url)),
+                kind: CheckKind::Headline,
             }),
             ProbeOutcome::Degraded => checks.push(Check {
                 name: "service",
                 status: Status::Warn,
                 value: format!("{} degraded (/readyz)", probe.name),
                 next_command: Some(format!("curl -s {}/readyz", probe.base_url)),
+                kind: CheckKind::Headline,
             }),
             ProbeOutcome::Healthy => {}
         }

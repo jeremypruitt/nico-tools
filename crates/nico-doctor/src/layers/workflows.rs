@@ -6,7 +6,7 @@ use nico_common::output::Status;
 use nico_common::temporal::TemporalClient;
 use temporal_sdk_core_protos::temporal::api::workflow::v1::WorkflowExecutionInfo;
 
-use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
+use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
 
 /// Doctor's view of a running workflow that has exceeded the stuck
 /// threshold. Built from a `WorkflowExecutionInfo` returned by the
@@ -152,12 +152,14 @@ fn checks_from(stuck: &[RunningWorkflow], failed: &[FailedWorkflow], now: System
             } else {
                 Some(r#"temporal workflow list --query "ExecutionStatus=Running""#.to_string())
             },
+            kind: CheckKind::Headline,
         },
         Check {
             name: "failed",
             status: if failed.is_empty() { Status::Ok } else { Status::Warn },
             value: format!("{} failed", failed.len()),
             next_command: None,
+            kind: CheckKind::Headline,
         },
     ];
 
@@ -175,6 +177,7 @@ fn checks_from(stuck: &[RunningWorkflow], failed: &[FailedWorkflow], now: System
                 wf.workflow_id, wf.workflow_type, running_mins, wf.last_event
             ),
             next_command: Some(format!("temporal workflow show -w {}", wf.workflow_id)),
+            kind: CheckKind::Detail,
         });
     }
 
@@ -184,6 +187,7 @@ fn checks_from(stuck: &[RunningWorkflow], failed: &[FailedWorkflow], now: System
             status: Status::Warn,
             value: format!("{} ({}): failed", wf.workflow_id, wf.workflow_type),
             next_command: Some(format!("temporal workflow show -w {}", wf.workflow_id)),
+            kind: CheckKind::Headline,
         });
     }
 
@@ -202,6 +206,33 @@ mod tests {
     };
 
     // --- Sync tests for checks_from (deterministic, fixed `now`). ---
+
+    #[test]
+    fn stuck_workflow_checks_are_marked_detail() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+        let stuck = vec![RunningWorkflow {
+            workflow_id: "wf-001".into(),
+            workflow_type: "HostProvisioning".into(),
+            start_time: now - Duration::from_secs(47 * 60),
+            last_event: "47 events".into(),
+        }];
+        let checks = checks_from(&stuck, &[], now);
+        let kinds: Vec<_> = checks.iter()
+            .filter(|c| c.name == "stuck_workflow")
+            .map(|c| c.kind)
+            .collect();
+        assert_eq!(kinds, vec![CheckKind::Detail]);
+    }
+
+    #[test]
+    fn headline_workflow_checks_remain_headline_kind() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+        let checks = checks_from(&[], &[], now);
+        let stuck = checks.iter().find(|c| c.name == "stuck").unwrap();
+        let failed = checks.iter().find(|c| c.name == "failed").unwrap();
+        assert_eq!(stuck.kind, CheckKind::Headline);
+        assert_eq!(failed.kind, CheckKind::Headline);
+    }
 
     #[test]
     fn checks_from_empty_slices_produces_ok_checks() {

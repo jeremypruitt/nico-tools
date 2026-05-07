@@ -84,7 +84,7 @@ fn summarize_evidence(r: &LayerResult) -> String {
 mod tests {
     use super::*;
     use nico_common::output::Status;
-    use nico_doctor::layer::{Check, LayerResult};
+    use nico_doctor::layer::{Check, CheckKind, LayerResult};
 
     fn check(name: &'static str, status: Status, value: &str) -> Check {
         Check {
@@ -92,6 +92,7 @@ mod tests {
             status,
             value: value.to_string(),
             next_command: None,
+            kind: CheckKind::Headline,
         }
     }
 

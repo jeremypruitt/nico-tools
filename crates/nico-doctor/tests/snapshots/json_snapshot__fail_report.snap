@@ -1,5 +1,6 @@
 ---
 source: crates/nico-doctor/tests/json_snapshot.rs
+assertion_line: 102
 expression: v
 ---
 {
@@ -7,11 +8,13 @@ expression: v
     {
       "checks": [
         {
+          "kind": "headline",
           "name": "endpoints",
           "status": "fail",
           "value": "1/2 healthy, 1 failed"
         },
         {
+          "kind": "headline",
           "name": "service",
           "status": "fail",
           "value": "core /healthz failed"
@@ -25,6 +28,7 @@ expression: v
     {
       "checks": [
         {
+          "kind": "headline",
           "name": "reachable",
           "status": "fail",
           "value": "unreachable"

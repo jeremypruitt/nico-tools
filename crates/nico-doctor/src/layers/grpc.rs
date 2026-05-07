@@ -2,7 +2,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::grpc::{GrpcInspectResult, GrpcInspector};
-use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
+use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
 
 pub struct GrpcLayer {
     inspector: Arc<dyn GrpcInspector>,
@@ -37,18 +37,21 @@ fn checks_from(result: &GrpcInspectResult, addr: &str) -> Vec<Check> {
                     status: Status::Ok,
                     value: "reachable".to_string(),
                     next_command: None,
+                    kind: CheckKind::Headline,
                 },
                 Check {
                     name: "services",
                     status: Status::Ok,
                     value: format!("{svc_count} services"),
                     next_command: None,
+                    kind: CheckKind::Headline,
                 },
                 Check {
                     name: "methods",
                     status: Status::Ok,
                     value: format!("{method_count} methods"),
                     next_command: None,
+                    kind: CheckKind::Headline,
                 },
             ]
         }
@@ -58,6 +61,7 @@ fn checks_from(result: &GrpcInspectResult, addr: &str) -> Vec<Check> {
                 status: Status::Fail,
                 value: "unreachable".to_string(),
                 next_command: Some(format!("grpcurl -plaintext {addr} list")),
+                kind: CheckKind::Headline,
             }]
         }
     }

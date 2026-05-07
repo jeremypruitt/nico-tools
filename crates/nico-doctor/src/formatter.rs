@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use nico_common::output::{OutputMode, Status};
 use crate::baseline::Delta;
+use crate::layer::CheckKind;
 use crate::runner::Report;
 
 /// Maximum detail bullets rendered per layer in the default human-mode findings
@@ -33,6 +34,7 @@ pub fn format_report(
             "(skipped)".to_string()
         } else {
             layer.checks.iter()
+                .filter(|c| c.kind == CheckKind::Headline)
                 .map(|c| c.value.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -136,6 +138,10 @@ pub fn format_json(
                     "name": c.name,
                     "status": format!("{:?}", c.status).to_lowercase(),
                     "value": c.value,
+                    "kind": match c.kind {
+                        CheckKind::Headline => "headline",
+                        CheckKind::Detail => "detail",
+                    },
                 })).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
@@ -146,7 +152,7 @@ pub fn format_json(
 mod tests {
     use super::*;
     use crate::baseline::Delta;
-    use crate::layer::{Check, LayerResult};
+    use crate::layer::{Check, CheckKind, LayerResult};
     use crate::runner::Report;
 
     fn plain() -> OutputMode {
@@ -164,15 +170,19 @@ mod tests {
     }
 
     fn ok_check(name: &'static str, value: &str) -> Check {
-        Check { name, status: Status::Ok, value: value.to_string(), next_command: None }
+        Check { name, status: Status::Ok, value: value.to_string(), next_command: None, kind: CheckKind::Headline }
     }
 
     fn warn_check(name: &'static str, value: &str, cmd: Option<&str>) -> Check {
-        Check { name, status: Status::Warn, value: value.to_string(), next_command: cmd.map(str::to_string) }
+        Check { name, status: Status::Warn, value: value.to_string(), next_command: cmd.map(str::to_string), kind: CheckKind::Headline }
     }
 
     fn fail_check(name: &'static str, value: &str, cmd: Option<&str>) -> Check {
-        Check { name, status: Status::Fail, value: value.to_string(), next_command: cmd.map(str::to_string) }
+        Check { name, status: Status::Fail, value: value.to_string(), next_command: cmd.map(str::to_string), kind: CheckKind::Headline }
+    }
+
+    fn detail_warn(name: &'static str, value: &str, cmd: Option<&str>) -> Check {
+        Check { name, status: Status::Warn, value: value.to_string(), next_command: cmd.map(str::to_string), kind: CheckKind::Detail }
     }
 
     fn layer(name: &'static str, checks: Vec<Check>) -> LayerResult {
@@ -302,12 +312,12 @@ mod tests {
         let report = Report { layers: vec![layer("logs", vec![
             warn_check("error_lines", "2 errors", None),
             ok_check("source", "loki"),
-            warn_check("pod_error", "core-abc: ERROR: disk full", Some("kubectl logs core-abc -n nico")),
-            warn_check("pod_error", "rest-xyz: FATAL: oom", Some("kubectl logs rest-xyz -n nico")),
+            detail_warn("pod_error", "core-abc: ERROR: disk full", Some("kubectl logs core-abc -n nico")),
+            detail_warn("pod_error", "rest-xyz: FATAL: oom", Some("kubectl logs rest-xyz -n nico")),
         ])] };
         let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
-            "  warn logs         2 errors, loki, core-abc: ERROR: disk full, rest-xyz: FATAL: oom\n",
+            "  warn logs         2 errors, loki\n",
             "\n",
             "logs:\n",
             "  • 2 errors (error_lines)\n",
@@ -356,12 +366,12 @@ mod tests {
         let report = Report { layers: vec![layer("workflows", vec![
             warn_check("stuck", "1 stuck", None),
             ok_check("failed", "0 failed"),
-            warn_check("stuck_workflow", "wf-001 (HostProvisioning): 47m running, last: ActivityScheduled",
+            detail_warn("stuck_workflow", "wf-001 (HostProvisioning): 47m running, last: ActivityScheduled",
                 Some("temporal workflow show -w wf-001")),
         ])] };
         let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
-            "  warn workflows    1 stuck, 0 failed, wf-001 (HostProvisioning): 47m running, last: ActivityScheduled\n",
+            "  warn workflows    1 stuck, 0 failed\n",
             "\n",
             "workflows:\n",
             "  • 1 stuck (stuck)\n",
@@ -862,6 +872,7 @@ mod tests {
             status: Status::Warn,
             value: format!("pod-{i}: ERROR: boom"),
             next_command: Some(format!("kubectl logs pod-{i} -n nico")),
+            kind: CheckKind::Detail,
         }).collect()
     }
 
@@ -1010,5 +1021,117 @@ mod tests {
         for l in json["layers"].as_array().unwrap() {
             assert!(l.get("delta").is_some(), "layer {} missing delta field", l["name"]);
         }
+    }
+
+    // ── headline vs detail (issue #181) ───────────────────────────────────────
+
+    /// Returns the layer summary line (the "  ICON name  values" line) for
+    /// `layer_name` from formatted output. Strips status icon + name padding
+    /// and returns the `value, value, ...` portion.
+    fn layer_summary_values(out: &str, layer_name: &str) -> String {
+        out.lines()
+            .find(|l| l.contains(&format!(" {layer_name:<12} ")))
+            .map(|l| l.split_once(&format!(" {layer_name:<12} ")).unwrap().1.to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn summary_line_excludes_detail_check_values() {
+        // Layer with 2 headlines + 100 details. Detail values must never
+        // appear in the summary line, regardless of count.
+        let mut checks = vec![
+            warn_check("error_lines", "100 errors", None),
+            ok_check("source", "loki"),
+        ];
+        for i in 0..100 {
+            checks.push(detail_warn(
+                "pod_error",
+                &format!("pod-{i}: ERROR boom"),
+                Some(&format!("kubectl logs pod-{i} -n nico")),
+            ));
+        }
+        let report = Report { layers: vec![layer("logs", checks)] };
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
+
+        let summary = layer_summary_values(&out, "logs");
+        assert_eq!(summary, "100 errors, loki",
+            "summary line must contain headline values only, got: {summary:?}\nfull:\n{out}");
+        assert!(!summary.contains("pod_error"));
+        assert!(!summary.contains("pod-0:"));
+    }
+
+    #[test]
+    fn summary_line_joins_only_headlines() {
+        // Bounded summary: 3 headline checks → 3 comma-separated values.
+        let report = Report { layers: vec![layer("cluster", vec![
+            ok_check("pods_ready", "2/2"),
+            ok_check("recent_restarts", "0"),
+            ok_check("warning_events", "0"),
+        ])]};
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
+        let summary = layer_summary_values(&out, "cluster");
+        assert_eq!(summary, "2/2, 0, 0");
+    }
+
+    #[test]
+    fn json_every_check_includes_kind_field() {
+        // Acceptance: JSON exposes `kind` additively for every check.
+        let report = Report { layers: vec![
+            layer("logs", vec![
+                warn_check("error_lines", "2 errors", None),
+                ok_check("source", "loki"),
+                detail_warn("pod_error", "core: boom", Some("kubectl logs core")),
+            ]),
+        ]};
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())
+        ).unwrap();
+
+        let checks = json["layers"][0]["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0]["kind"], "headline");
+        assert_eq!(checks[1]["kind"], "headline");
+        assert_eq!(checks[2]["kind"], "detail");
+    }
+
+    #[test]
+    fn json_version_unchanged_after_kind_field_added() {
+        // ADR-0003: additive changes don't bump version. version stays at 1.
+        let report = Report { layers: vec![layer("logs", vec![
+            detail_warn("pod_error", "core: boom", Some("kubectl logs core")),
+        ])]};
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())
+        ).unwrap();
+        assert_eq!(json["version"], 1);
+    }
+
+    #[test]
+    fn findings_block_iterates_all_non_ok_checks_including_details() {
+        // Acceptance: Findings block (default and verbose) is unchanged —
+        // still iterates all non-OK checks (subject to the per-layer cap).
+        let report = Report { layers: vec![layer("logs", vec![
+            warn_check("error_lines", "2 errors", None),
+            detail_warn("pod_error", "core: boom", None),
+            detail_warn("pod_error", "rest: oom", None),
+        ])]};
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
+        // All three non-ok checks appear as bullets.
+        assert!(out.contains("• 2 errors (error_lines)"));
+        assert!(out.contains("• core: boom (pod_error)"));
+        assert!(out.contains("• rest: oom (pod_error)"));
+    }
+
+    #[test]
+    fn verbose_mode_unchanged_renders_every_check() {
+        // Verbose mode iterates all checks, headline and detail alike.
+        let report = Report { layers: vec![layer("logs", vec![
+            warn_check("error_lines", "2 errors", None),
+            detail_warn("pod_error", "core: boom", None),
+        ])]};
+        let out = format_report(&report, &plain(), true, &no_deltas(), false);
+        assert!(out.contains("error_lines"));
+        assert!(out.contains("pod_error"));
+        assert!(out.contains("core: boom"));
     }
 }

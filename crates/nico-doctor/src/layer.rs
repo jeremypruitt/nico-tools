@@ -9,11 +9,22 @@ pub struct RunOpts {
     pub timeout: Duration,
 }
 
+/// A `Check` is either a **headline** (summarizes the layer at a glance,
+/// joined into the layer summary line) or a **detail** (one-per-finding
+/// evidence, never in the summary line). See ADR-0003 (2026-05-07 amendment).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum CheckKind {
+    #[default]
+    Headline,
+    Detail,
+}
+
 pub struct Check {
     pub name: &'static str,
     pub status: Status,
     pub value: String,
     pub next_command: Option<String>,
+    pub kind: CheckKind,
 }
 
 pub struct LayerResult {
@@ -103,6 +114,7 @@ impl Layer for UnconfiguredLayer {
             status: Status::Unknown,
             value: self.reason.clone(),
             next_command: None,
+            kind: CheckKind::Headline,
         }])
     }
 }
@@ -112,7 +124,12 @@ mod tests {
     use super::*;
 
     fn check(status: Status) -> Check {
-        Check { name: "x", status, value: String::new(), next_command: None }
+        Check { name: "x", status, value: String::new(), next_command: None, kind: CheckKind::Headline }
+    }
+
+    #[test]
+    fn check_kind_default_is_headline() {
+        assert_eq!(CheckKind::default(), CheckKind::Headline);
     }
 
     #[test]
