@@ -32,6 +32,13 @@ pub struct OpsArgs {
 
     #[arg(long, env = "NICO_THEME", value_name = "NAME", help = "Color theme: default, dracula, nord, gruvbox")]
     pub theme: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "DURATION",
+        help = "Auto-refresh interval (e.g. 5s, 1m). Overrides [output] tui_refresh and NICO_TUI_REFRESH; default 30s"
+    )]
+    pub interval: Option<String>,
 }
 
 impl Default for OpsArgs {
@@ -46,6 +53,7 @@ impl Default for OpsArgs {
             config: None,
             mode: None,
             theme: None,
+            interval: None,
         }
     }
 }

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::model::LayerSnapshot;
 
 /// Direction for focus navigation across the scorecard grid.
@@ -28,6 +30,14 @@ pub enum Action {
     Resize,
     /// Snapshots from a completed (or in-progress) refresh round.
     Snapshots(Vec<LayerSnapshot>),
+    /// `space` — pause/resume the auto-refresh timer. Manual `R` always
+    /// works regardless of pause state.
+    TogglePause,
+    /// Periodic clock tick from the host loop. The reducer compares
+    /// `now` against the next-refresh deadline and may emit
+    /// `Effect::StartRefresh`. Throbber animation is also driven by
+    /// the timestamp on this action.
+    Tick(Instant),
     /// `q` / `Ctrl-C` — exit cleanly.
     Quit,
 }

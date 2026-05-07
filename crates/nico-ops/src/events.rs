@@ -52,6 +52,7 @@ fn translate_normal(key: &KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::Refresh),
+        KeyCode::Char(' ') => Some(Action::TogglePause),
         KeyCode::Char('?') => Some(Action::OpenHelp),
         KeyCode::Enter => Some(Action::OpenDetail),
         KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
@@ -130,6 +131,21 @@ mod tests {
             translate(&k(KeyCode::Char('R')), Mode::Normal, Overlay::None),
             Some(Action::Refresh)
         );
+    }
+
+    #[test]
+    fn space_toggles_pause_in_normal() {
+        assert_eq!(
+            translate(&k(KeyCode::Char(' ')), Mode::Normal, Overlay::None),
+            Some(Action::TogglePause)
+        );
+    }
+
+    #[test]
+    fn space_inert_inside_overlay() {
+        for ov in [Overlay::Detail, Overlay::Help] {
+            assert_eq!(translate(&k(KeyCode::Char(' ')), Mode::Normal, ov), None);
+        }
     }
 
     #[test]

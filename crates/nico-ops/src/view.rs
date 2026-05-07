@@ -15,6 +15,7 @@ use crate::model::{Finding, LayerSnapshot, overall_verdict};
 
 pub const HELP_LINES: &[&str] = &[
     "R         refresh",
+    "Space     pause / resume auto-refresh",
     "↑↓←→/hjkl move focus",
     "Enter     open detail",
     "Esc       close overlay",
@@ -38,7 +39,7 @@ pub fn render(app: &App, theme: &Theme, frame: &mut Frame) {
     render_header(app, theme, frame, chunks[0]);
     render_grid(app, theme, frame, chunks[1]);
     render_drill(app, theme, frame, chunks[2]);
-    render_hint_bar(theme, frame, chunks[3]);
+    render_hint_bar(app, theme, frame, chunks[3]);
 
     match app.overlay() {
         Overlay::Detail => render_detail_overlay(app, theme, frame, area),
@@ -80,14 +81,17 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         (None, false) => "—".to_string(),
     };
 
-    let title = Line::from(vec![
-        Span::raw(" nico ops "),
-        Span::styled(
-            format!(" {timestamp}"),
-            Style::default().fg(theme.muted),
-        ),
-    ]);
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let throbber = app.throbber_glyph();
+    let title_right = if throbber.is_empty() {
+        format!(" {timestamp} ")
+    } else {
+        format!(" {timestamp}  {throbber} ")
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" nico ops ")
+        .title_top(Line::from(title_right).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
@@ -192,14 +196,20 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn render_hint_bar(theme: &Theme, frame: &mut Frame, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled(
-            " R:refresh  hjkl/arrows:focus  Enter:detail  ?:help  q:quit ",
-            Style::default().fg(theme.muted),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+fn render_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let mut spans: Vec<Span> = vec![Span::styled(
+        " R:refresh  Space:pause  hjkl/arrows:focus  Enter:detail  ?:help  q:quit ",
+        Style::default().fg(theme.muted),
+    )];
+    if app.paused() {
+        spans.push(Span::styled(
+            " PAUSED ",
+            Style::default()
+                .fg(theme.warn)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -364,6 +374,7 @@ mod tests {
                 status: Status::Ok,
                 evidence: "3 nodes ready".into(),
                 findings: vec![],
+                duration_ms: 12,
             },
             LayerSnapshot {
                 name: "logs".into(),
@@ -374,30 +385,35 @@ mod tests {
                     message: "12 ERROR lines in carbide-controller".into(),
                     next_command: Some("kubectl logs -n nico carbide-controller".into()),
                 }],
+                duration_ms: 34,
             },
             LayerSnapshot {
                 name: "workflows".into(),
                 status: Status::Ok,
                 evidence: "no stuck wf".into(),
                 findings: vec![],
+                duration_ms: 8,
             },
             LayerSnapshot {
                 name: "health".into(),
                 status: Status::Ok,
                 evidence: "4/4 healthy".into(),
                 findings: vec![],
+                duration_ms: 5,
             },
             LayerSnapshot {
                 name: "grpc".into(),
                 status: Status::Ok,
                 evidence: "reachable".into(),
                 findings: vec![],
+                duration_ms: 7,
             },
             LayerSnapshot {
                 name: "postgres".into(),
                 status: Status::Ok,
                 evidence: "12ms ping".into(),
                 findings: vec![],
+                duration_ms: 12,
             },
         ]
     }
@@ -507,6 +523,43 @@ mod tests {
     }
 
     #[test]
+    fn render_hint_bar_shows_paused_when_paused() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::TogglePause);
+        let s = render_to_string(&app, 120, 24);
+        assert!(s.contains("PAUSED"), "PAUSED indicator missing:\n{s}");
+    }
+
+    #[test]
+    fn render_hint_bar_omits_paused_when_running() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let s = render_to_string(&app, 120, 24);
+        assert!(!s.contains("PAUSED"), "PAUSED unexpectedly shown:\n{s}");
+    }
+
+    #[test]
+    fn render_header_shows_done_glyph_after_completion() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let s = render_to_string(&app, 120, 24);
+        assert!(s.contains("✓"), "expected ✓ in header after refresh:\n{s}");
+    }
+
+    #[test]
+    fn render_help_overlay_lists_pause_keybind() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::OpenHelp);
+        let s = render_to_string(&app, 120, 24);
+        assert!(
+            s.contains("pause"),
+            "help overlay should mention pause keybind:\n{s}"
+        );
+    }
+
+    #[test]
     fn render_detail_overlay_shows_focused_findings() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
@@ -530,6 +583,7 @@ mod tests {
             status: status.clone(),
             evidence: String::new(),
             findings: vec![],
+            duration_ms: 0,
         }]));
         let backend = TestBackend::new(120, 20);
         let mut terminal = Terminal::new(backend).unwrap();

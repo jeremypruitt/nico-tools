@@ -10,13 +10,16 @@ pub struct Finding {
 
 /// What a single Layer scorecard shows: its aggregate status, a one-line
 /// evidence summary, and the underlying findings used by the drill panel
-/// and the detail overlay.
+/// and the detail overlay. `duration_ms` carries the layer's reported
+/// runtime so the ring buffer can record per-layer durations without a
+/// second pass over the raw `LayerResult`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerSnapshot {
     pub name: String,
     pub status: Status,
     pub evidence: String,
     pub findings: Vec<Finding>,
+    pub duration_ms: u64,
 }
 
 /// Computes the overall verdict word across all layers in the snapshot:
@@ -43,6 +46,7 @@ mod tests {
             status,
             evidence: String::new(),
             findings: vec![],
+            duration_ms: 0,
         }
     }
 

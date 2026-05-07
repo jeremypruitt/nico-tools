@@ -31,6 +31,7 @@ pub async fn collect(layers: Arc<Vec<Box<dyn Layer>>>, opts: RunOpts) -> Vec<Lay
 
 fn layer_result_to_snapshot(r: LayerResult) -> LayerSnapshot {
     let evidence = summarize_evidence(&r);
+    let duration_ms = r.duration_ms;
     let findings = r
         .checks
         .into_iter()
@@ -46,6 +47,7 @@ fn layer_result_to_snapshot(r: LayerResult) -> LayerSnapshot {
         status: r.status,
         evidence,
         findings,
+        duration_ms,
     }
 }
 

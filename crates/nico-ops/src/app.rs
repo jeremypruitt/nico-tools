@@ -1,8 +1,24 @@
+use std::time::{Duration, Instant};
+
 use chrono::{DateTime, Local};
 
 use crate::action::{Action, Dir};
 use crate::events::Overlay;
 use crate::model::LayerSnapshot;
+use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
+
+/// Default auto-refresh cadence when no flag/env/config override is set.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Number of frames in the braille throbber cycle.
+const THROBBER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Glyph used in place of the throbber once a refresh has completed.
+pub const THROBBER_DONE: &str = "✓";
+
+/// Tick interval the host loop should drive the reducer at; the throbber
+/// frame index is `(now - boot) / TICK`.
+pub const TICK: Duration = Duration::from_millis(100);
 
 /// Side-effects requested by the reducer that the host loop has to carry
 /// out (since `App::handle` is otherwise pure).
@@ -22,10 +38,20 @@ pub struct App {
     refreshing: bool,
     last_refreshed: Option<DateTime<Local>>,
     dirty: bool,
+    paused: bool,
+    interval: Duration,
+    next_refresh_at: Option<Instant>,
+    boot: Option<Instant>,
+    now: Option<Instant>,
+    history: RingBuffer,
 }
 
 impl App {
     pub fn new() -> Self {
+        Self::with_interval(DEFAULT_INTERVAL)
+    }
+
+    pub fn with_interval(interval: Duration) -> Self {
         Self {
             snapshots: Vec::new(),
             focus: 0,
@@ -33,6 +59,12 @@ impl App {
             refreshing: false,
             last_refreshed: None,
             dirty: true,
+            paused: false,
+            interval,
+            next_refresh_at: None,
+            boot: None,
+            now: None,
+            history: RingBuffer::new(),
         }
     }
 
@@ -66,6 +98,38 @@ impl App {
 
     pub fn clear_dirty(&mut self) {
         self.dirty = false;
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    pub fn history(&self) -> &RingBuffer {
+        &self.history
+    }
+
+    /// Throbber glyph for the current frame: an animated braille spinner
+    /// while a refresh is in flight, frozen `✓` once the latest refresh
+    /// has completed, or empty when no run has happened yet.
+    pub fn throbber_glyph(&self) -> String {
+        if self.refreshing {
+            let frame = match (self.now, self.boot) {
+                (Some(now), Some(boot)) => {
+                    let dt = now.saturating_duration_since(boot);
+                    (dt.as_millis() / TICK.as_millis()) as usize % THROBBER_FRAMES.len()
+                }
+                _ => 0,
+            };
+            THROBBER_FRAMES[frame].to_string()
+        } else if self.last_refreshed.is_some() {
+            THROBBER_DONE.to_string()
+        } else {
+            String::new()
+        }
     }
 
     /// The single mutator. Returns an optional `Effect` for the host loop
@@ -119,14 +183,52 @@ impl App {
                 if self.focus >= snaps.len() && !snaps.is_empty() {
                     self.focus = snaps.len() - 1;
                 }
+                self.history.push(run_snapshot_from(&snaps));
                 self.snapshots = snaps;
                 self.refreshing = false;
                 self.last_refreshed = Some(Local::now());
+                if let Some(now) = self.now {
+                    self.next_refresh_at = Some(now + self.interval);
+                }
                 self.dirty = true;
+                None
+            }
+            Action::TogglePause => {
+                self.paused = !self.paused;
+                self.dirty = true;
+                None
+            }
+            Action::Tick(now) => {
+                if self.boot.is_none() {
+                    self.boot = Some(now);
+                }
+                self.now = Some(now);
+                if self.refreshing {
+                    self.dirty = true;
+                    return None;
+                }
+                if !self.paused
+                    && self
+                        .next_refresh_at
+                        .is_some_and(|deadline| now >= deadline)
+                {
+                    self.refreshing = true;
+                    self.next_refresh_at = None;
+                    self.dirty = true;
+                    return Some(Effect::StartRefresh);
+                }
                 None
             }
             Action::Quit => Some(Effect::Quit),
         }
+    }
+
+    /// Test seam: lets unit tests drive the throbber without going through
+    /// the full Tick handler (which also implicates auto-refresh).
+    #[cfg(test)]
+    fn force_now(&mut self, boot: Instant, now: Instant) {
+        self.boot = Some(boot);
+        self.now = Some(now);
     }
 
     fn move_focus(&mut self, dir: Dir) -> bool {
@@ -185,6 +287,24 @@ fn grid_cols(_n: usize) -> usize {
     3
 }
 
+fn run_snapshot_from(snaps: &[LayerSnapshot]) -> RunSnapshot {
+    let layers: Vec<LayerStat> = snaps
+        .iter()
+        .map(|s| LayerStat {
+            name: s.name.clone(),
+            status: s.status.clone(),
+            finding_count: s.findings.len(),
+            duration_ms: s.duration_ms,
+        })
+        .collect();
+    let total_ms: u64 = layers.iter().map(|l| l.duration_ms).sum();
+    RunSnapshot {
+        timestamp: Local::now(),
+        total_duration: Duration::from_millis(total_ms),
+        layers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +316,7 @@ mod tests {
             status,
             evidence: String::new(),
             findings: vec![],
+            duration_ms: 0,
         }
     }
 
@@ -353,4 +474,160 @@ mod tests {
         app.handle(Action::Focus(Dir::Right));
         assert_eq!(app.focused().unwrap().name, "logs");
     }
+
+    #[test]
+    fn fresh_app_is_not_paused_and_uses_default_interval() {
+        let app = App::new();
+        assert!(!app.paused());
+        assert_eq!(app.interval(), DEFAULT_INTERVAL);
+    }
+
+    #[test]
+    fn toggle_pause_flips_pause_flag_and_marks_dirty() {
+        let mut app = App::new();
+        app.clear_dirty();
+        app.handle(Action::TogglePause);
+        assert!(app.paused());
+        assert!(app.dirty());
+        app.clear_dirty();
+        app.handle(Action::TogglePause);
+        assert!(!app.paused());
+    }
+
+    #[test]
+    fn tick_after_completion_triggers_auto_refresh_when_interval_elapsed() {
+        let interval = Duration::from_secs(5);
+        let mut app = App::with_interval(interval);
+        let t0 = Instant::now();
+        // Initial manual refresh + completion seeds the auto-refresh deadline.
+        app.handle(Action::Tick(t0));
+        app.handle(Action::Refresh);
+        app.handle(Action::Snapshots(six_layers()));
+
+        // Tick before deadline: no effect.
+        let eff = app.handle(Action::Tick(t0 + Duration::from_secs(4)));
+        assert_eq!(eff, None);
+
+        // Tick at/after deadline: StartRefresh.
+        let eff = app.handle(Action::Tick(t0 + Duration::from_secs(5)));
+        assert_eq!(eff, Some(Effect::StartRefresh));
+        assert!(app.refreshing());
+    }
+
+    #[test]
+    fn pause_toggle_via_action_stream() {
+        // Synthetic action stream: TogglePause repeatedly inverts the flag.
+        let mut app = App::new();
+        let stream = vec![
+            Action::TogglePause,
+            Action::TogglePause,
+            Action::TogglePause,
+        ];
+        let mut paused_history = vec![app.paused()];
+        for a in stream {
+            app.handle(a);
+            paused_history.push(app.paused());
+        }
+        assert_eq!(paused_history, vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn pause_suppresses_auto_refresh_but_manual_refresh_still_works() {
+        let interval = Duration::from_secs(5);
+        let mut app = App::with_interval(interval);
+        let t0 = Instant::now();
+        app.handle(Action::Tick(t0));
+        app.handle(Action::Refresh);
+        app.handle(Action::Snapshots(six_layers()));
+
+        app.handle(Action::TogglePause);
+        let eff = app.handle(Action::Tick(t0 + Duration::from_secs(60)));
+        assert_eq!(eff, None, "paused dashboard must not auto-refresh");
+
+        // Manual refresh is unaffected by pause.
+        let eff = app.handle(Action::Refresh);
+        assert_eq!(eff, Some(Effect::StartRefresh));
+    }
+
+    #[test]
+    fn auto_refresh_does_not_double_fire_while_running() {
+        let interval = Duration::from_secs(1);
+        let mut app = App::with_interval(interval);
+        let t0 = Instant::now();
+        app.handle(Action::Tick(t0));
+        app.handle(Action::Refresh);
+        app.handle(Action::Snapshots(six_layers()));
+
+        let eff1 = app.handle(Action::Tick(t0 + Duration::from_secs(2)));
+        assert_eq!(eff1, Some(Effect::StartRefresh));
+        // Another tick while still refreshing must not fire again.
+        let eff2 = app.handle(Action::Tick(t0 + Duration::from_secs(3)));
+        assert_eq!(eff2, None);
+    }
+
+    #[test]
+    fn snapshots_pushes_run_into_history() {
+        let mut app = App::new();
+        assert_eq!(app.history().len(), 0);
+        let snaps = vec![
+            LayerSnapshot {
+                name: "cluster".into(),
+                status: Status::Ok,
+                evidence: String::new(),
+                findings: vec![],
+                duration_ms: 12,
+            },
+            LayerSnapshot {
+                name: "logs".into(),
+                status: Status::Warn,
+                evidence: String::new(),
+                findings: vec![crate::model::Finding {
+                    status: Status::Warn,
+                    message: "12 ERROR lines".into(),
+                    next_command: None,
+                }],
+                duration_ms: 34,
+            },
+        ];
+        app.handle(Action::Snapshots(snaps));
+        assert_eq!(app.history().len(), 1);
+        let latest = app.history().latest().unwrap();
+        assert_eq!(latest.layers.len(), 2);
+        let logs = latest
+            .layers
+            .iter()
+            .find(|l| l.name == "logs")
+            .expect("logs layer present");
+        assert_eq!(logs.finding_count, 1);
+        assert_eq!(logs.duration_ms, 34);
+    }
+
+    #[test]
+    fn throbber_glyph_is_empty_before_any_run() {
+        let app = App::new();
+        assert_eq!(app.throbber_glyph(), "");
+    }
+
+    #[test]
+    fn throbber_glyph_freezes_to_done_after_first_completion() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        assert_eq!(app.throbber_glyph(), THROBBER_DONE);
+    }
+
+    #[test]
+    fn throbber_glyph_animates_while_refreshing() {
+        let mut app = App::new();
+        app.handle(Action::Refresh);
+        let boot = Instant::now();
+        // Frame 0
+        app.force_now(boot, boot);
+        let f0 = app.throbber_glyph();
+        // Frame N (a few ticks later) should be different.
+        app.force_now(boot, boot + TICK * 3);
+        let f3 = app.throbber_glyph();
+        assert_ne!(f0, f3, "throbber should cycle frames over time");
+        assert_ne!(f0, THROBBER_DONE);
+    }
+
 }

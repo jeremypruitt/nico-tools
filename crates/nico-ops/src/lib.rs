@@ -17,19 +17,24 @@ use tokio::sync::mpsc;
 pub mod action;
 pub mod app;
 pub mod cli;
+pub mod clock;
 pub mod data;
 pub mod events;
 pub mod model;
+pub mod ringbuffer;
 pub mod view;
 
 use crate::action::Action;
 use crate::app::{App, Effect};
+use crate::clock::{Clock, SystemClock};
 use crate::events::{Mode, translate};
 use crate::model::LayerSnapshot;
 
 pub use cli::OpsArgs;
 
-const TICK: Duration = Duration::from_millis(250);
+/// How often the host loop sends a `Tick` to the reducer. Drives both
+/// auto-refresh deadline checks and throbber animation.
+const TICK: Duration = Duration::from_millis(100);
 
 const NON_TTY_MESSAGE: &str =
     "nico ops requires an interactive terminal (stdout is not a TTY)";
@@ -84,7 +89,16 @@ pub async fn run_ops(args: OpsArgs) -> i32 {
         }
     };
 
-    let result = run_event_loop(&mut terminal, &theme, bootstrapped).await;
+    let interval = match resolve_interval(args.interval.as_deref(), bootstrapped.tui_refresh) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = restore_terminal(&mut terminal);
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    let result = run_event_loop(&mut terminal, &theme, bootstrapped, interval, SystemClock).await;
 
     let _ = restore_terminal(&mut terminal);
 
@@ -129,10 +143,12 @@ fn install_panic_hook() {
     }));
 }
 
-async fn run_event_loop(
+async fn run_event_loop<C: Clock>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     theme: &Theme,
     bootstrapped: nico_doctor::Bootstrapped,
+    interval: Duration,
+    clock: C,
 ) -> io::Result<()> {
     let nico_doctor::Bootstrapped {
         layers,
@@ -142,7 +158,7 @@ async fn run_event_loop(
     } = bootstrapped;
     let layers = Arc::new(layers);
 
-    let mut app = App::new();
+    let mut app = App::with_interval(interval);
     let (tx, mut rx) = mpsc::channel::<Action>(64);
 
     spawn_refresh(layers.clone(), opts.clone(), tx.clone());
@@ -177,15 +193,30 @@ async fn run_event_loop(
                 }
             }
             _ = tick.tick() => {
-                // Tick exists to wake the loop on a cadence so cancellation
-                // and resize-detection stay responsive; rendering is gated
-                // on `app.dirty()` per ADR-010.
+                if dispatch(&mut app, Action::Tick(clock.now()), &layers, &opts, &tx) {
+                    break;
+                }
             }
         }
     }
 
     drop(_pf_guards);
     Ok(())
+}
+
+/// Resolve the auto-refresh cadence using the ADR-007 precedence chain:
+/// `--interval` flag > env (already absorbed into `bootstrap_default`) >
+/// config file > default. The flag layer is applied here on top of the
+/// already-resolved `bootstrap_default` from `Bootstrapped::tui_refresh`.
+pub fn resolve_interval(
+    interval_flag: Option<&str>,
+    bootstrap_default: Duration,
+) -> Result<Duration, String> {
+    match interval_flag {
+        Some(s) => humantime::parse_duration(s)
+            .map_err(|e| format!("invalid --interval {s:?}: {e}")),
+        None => Ok(bootstrap_default),
+    }
 }
 
 fn dispatch(
@@ -224,5 +255,30 @@ mod tests {
     fn non_tty_message_is_concrete() {
         assert!(NON_TTY_MESSAGE.contains("interactive terminal"));
         assert!(NON_TTY_MESSAGE.contains("not a TTY"));
+    }
+
+    #[test]
+    fn resolve_interval_falls_back_to_bootstrap_default() {
+        let d = resolve_interval(None, Duration::from_secs(30)).unwrap();
+        assert_eq!(d, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn resolve_interval_flag_overrides_default() {
+        let d = resolve_interval(Some("5s"), Duration::from_secs(30)).unwrap();
+        assert_eq!(d, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn resolve_interval_flag_overrides_bootstrap_default_from_config() {
+        // `bootstrap_default` already encodes config + env; the flag wins.
+        let d = resolve_interval(Some("1m"), Duration::from_secs(10)).unwrap();
+        assert_eq!(d, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn resolve_interval_rejects_invalid_input() {
+        let err = resolve_interval(Some("not-a-duration"), Duration::from_secs(30)).unwrap_err();
+        assert!(err.contains("invalid --interval"), "{err}");
     }
 }

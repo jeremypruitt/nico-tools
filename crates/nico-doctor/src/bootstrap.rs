@@ -50,6 +50,11 @@ pub struct Bootstrapped {
     pub namespace: String,
     pub verbose: bool,
     pub spotlight: bool,
+    /// Resolved auto-refresh interval (`[output] tui_refresh` →
+    /// `NICO_TUI_REFRESH` env → default 30s). Consumed by `nico-ops` for
+    /// the dashboard's auto-refresh cadence; ignored by `nico-doctor`'s
+    /// one-shot path.
+    pub tui_refresh: Duration,
     /// Kept alive until the caller is done running layers; dropping closes port-forwards.
     pub _pf_guards: Vec<nico_common::reach::ForwardedEndpoint>,
 }
@@ -413,6 +418,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         namespace: config.cluster.namespace.clone(),
         verbose: args.verbose,
         spotlight: args.spotlight,
+        tui_refresh: config.output.tui_refresh,
         _pf_guards: pf_guards,
     })
 }
