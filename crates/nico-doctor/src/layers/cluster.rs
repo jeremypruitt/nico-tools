@@ -66,7 +66,7 @@ fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) 
 
     let any_not_ready = pods.iter().any(|p| !p.ready);
 
-    vec![
+    let mut checks = vec![
         Check {
             name: "pods_ready",
             status: pods_status,
@@ -100,7 +100,19 @@ fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) 
             },
             kind: CheckKind::Headline,
         },
-    ]
+    ];
+
+    for p in pods.iter().filter(|p| p.restart_count > 0) {
+        checks.push(Check {
+            name: "pod_restart",
+            status: Status::Warn,
+            value: format!("{}: {} restarts", p.name, p.restart_count),
+            next_command: Some(format!("kubectl describe pod {} -n {namespace}", p.name)),
+            kind: CheckKind::Detail,
+        });
+    }
+
+    checks
 }
 
 #[cfg(test)]
@@ -150,8 +162,9 @@ mod tests {
         let e1 = warning_event("OOMKilling");
         let events = vec![&e1];
         let checks = checks_from(&pods, &events, "nico");
-        assert_eq!(checks.len(), 3);
-        assert!(checks.iter().all(|c| c.status == Status::Warn));
+        let headline: Vec<_> = checks.iter().filter(|c| c.kind == CheckKind::Headline).collect();
+        assert_eq!(headline.len(), 3);
+        assert!(headline.iter().all(|c| c.status == Status::Warn));
     }
 
     #[test]
@@ -266,6 +279,61 @@ mod tests {
         assert_eq!(check_value(&result, "pods_ready"), "2/2");
         assert_eq!(check_value(&result, "recent_restarts"), "0");
         assert_eq!(check_value(&result, "warning_events"), "0");
+    }
+
+    #[test]
+    fn checks_from_zero_restarting_pods_emits_no_pod_restart_checks() {
+        let p1 = pod("core-abc", true, 0, false);
+        let p2 = pod("rest-xyz", true, 0, false);
+        let pods = vec![&p1, &p2];
+        let events: Vec<&RawEvent> = vec![];
+        let checks = checks_from(&pods, &events, "nico");
+
+        assert_eq!(checks.iter().filter(|c| c.name == "pod_restart").count(), 0);
+    }
+
+    #[test]
+    fn checks_from_multiple_restarting_pods_emits_one_pod_restart_each() {
+        let p1 = pod("core-abc", true, 3, false);
+        let p2 = pod("rest-xyz", true, 0, false);
+        let p3 = pod("workflow-svc", true, 5, false);
+        let pods = vec![&p1, &p2, &p3];
+        let events: Vec<&RawEvent> = vec![];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let pod_restarts: Vec<_> = checks.iter().filter(|c| c.name == "pod_restart").collect();
+        assert_eq!(pod_restarts.len(), 2);
+
+        let values: Vec<_> = pod_restarts.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"core-abc: 3 restarts"));
+        assert!(values.contains(&"workflow-svc: 5 restarts"));
+
+        let cmds: Vec<_> = pod_restarts.iter().filter_map(|c| c.next_command.as_deref()).collect();
+        assert!(cmds.contains(&"kubectl describe pod core-abc -n nico"));
+        assert!(cmds.contains(&"kubectl describe pod workflow-svc -n nico"));
+
+        let recent = checks.iter().find(|c| c.name == "recent_restarts").unwrap();
+        assert_eq!(recent.value, "8");
+        assert_eq!(recent.kind, CheckKind::Headline);
+    }
+
+    #[test]
+    fn checks_from_pod_with_restarts_emits_detail_pod_restart_check() {
+        let p1 = pod("core-abc", true, 3, false);
+        let pods = vec![&p1];
+        let events: Vec<&RawEvent> = vec![];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let pod_restarts: Vec<_> = checks.iter().filter(|c| c.name == "pod_restart").collect();
+        assert_eq!(pod_restarts.len(), 1);
+        let pr = pod_restarts[0];
+        assert_eq!(pr.kind, CheckKind::Detail);
+        assert_eq!(pr.status, Status::Warn);
+        assert_eq!(pr.value, "core-abc: 3 restarts");
+        assert_eq!(
+            pr.next_command.as_deref(),
+            Some("kubectl describe pod core-abc -n nico"),
+        );
     }
 
     #[tokio::test]
