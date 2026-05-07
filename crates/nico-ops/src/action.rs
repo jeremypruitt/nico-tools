@@ -11,6 +11,14 @@ pub enum Dir {
     Down,
 }
 
+/// Mouse-wheel scroll direction. Routed by the reducer to either the drill
+/// panel (no overlay) or the detail overlay (when open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDir {
+    Up,
+    Down,
+}
+
 /// All state mutations flow through `App::handle(Action)`. There is no
 /// other mutator. (See ADR-010, ADR-012.)
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +46,15 @@ pub enum Action {
     /// `Effect::StartRefresh`. Throbber animation is also driven by
     /// the timestamp on this action.
     Tick(Instant),
+    /// Left-click at terminal cell `(col, row)`. The reducer hit-tests
+    /// against the scorecard regions captured during the last render.
+    Click { col: u16, row: u16 },
+    /// Mouse-wheel scroll. The reducer routes it to the drill panel when
+    /// no overlay is up, otherwise to the open overlay.
+    Scroll(ScrollDir),
+    /// `M` — toggle terminal mouse capture so the operator can reach
+    /// native scrollback when they need to.
+    ToggleMouseCapture,
     /// `q` / `Ctrl-C` — exit cleanly.
     Quit,
 }

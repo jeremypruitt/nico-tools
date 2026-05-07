@@ -1,6 +1,8 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
-use crate::action::{Action, Dir};
+use crate::action::{Action, Dir, ScrollDir};
 
 /// Which overlay (if any) is currently obscuring the dashboard. The
 /// translator branches on this because most navigation keys should be
@@ -27,6 +29,19 @@ pub fn translate(event: &Event, mode: Mode, overlay: Overlay) -> Option<Action> 
     match event {
         Event::Resize(_, _) => Some(Action::Resize),
         Event::Key(key) => translate_key(key, mode, overlay),
+        Event::Mouse(mouse) => translate_mouse(mouse),
+        _ => None,
+    }
+}
+
+fn translate_mouse(mouse: &MouseEvent) -> Option<Action> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => Some(Action::Click {
+            col: mouse.column,
+            row: mouse.row,
+        }),
+        MouseEventKind::ScrollUp => Some(Action::Scroll(ScrollDir::Up)),
+        MouseEventKind::ScrollDown => Some(Action::Scroll(ScrollDir::Down)),
         _ => None,
     }
 }
@@ -53,6 +68,7 @@ fn translate_normal(key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::Refresh),
         KeyCode::Char(' ') => Some(Action::TogglePause),
+        KeyCode::Char('m') | KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
         KeyCode::Char('?') => Some(Action::OpenHelp),
         KeyCode::Enter => Some(Action::OpenDetail),
         KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
@@ -76,7 +92,19 @@ fn translate_overlay(key: &KeyEvent, overlay: Overlay) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
 
     fn k(code: KeyCode) -> Event {
         Event::Key(KeyEvent {
@@ -244,5 +272,76 @@ mod tests {
             translate(&release(KeyCode::Char('q')), Mode::Normal, Overlay::None),
             None
         );
+    }
+
+    #[test]
+    fn left_click_emits_click_action_with_coordinates() {
+        let ev = mouse(MouseEventKind::Down(MouseButton::Left), 42, 7);
+        assert_eq!(
+            translate(&ev, Mode::Normal, Overlay::None),
+            Some(Action::Click { col: 42, row: 7 })
+        );
+    }
+
+    #[test]
+    fn scroll_wheel_up_emits_scroll_up() {
+        let ev = mouse(MouseEventKind::ScrollUp, 0, 0);
+        assert_eq!(
+            translate(&ev, Mode::Normal, Overlay::None),
+            Some(Action::Scroll(ScrollDir::Up))
+        );
+    }
+
+    #[test]
+    fn scroll_wheel_down_emits_scroll_down() {
+        let ev = mouse(MouseEventKind::ScrollDown, 0, 0);
+        assert_eq!(
+            translate(&ev, Mode::Normal, Overlay::None),
+            Some(Action::Scroll(ScrollDir::Down))
+        );
+    }
+
+    #[test]
+    fn scroll_works_inside_overlays_too() {
+        for ov in [Overlay::Detail, Overlay::Help] {
+            let ev = mouse(MouseEventKind::ScrollDown, 0, 0);
+            assert_eq!(
+                translate(&ev, Mode::Normal, ov),
+                Some(Action::Scroll(ScrollDir::Down)),
+                "overlay={:?}",
+                ov
+            );
+        }
+    }
+
+    #[test]
+    fn other_mouse_events_are_inert() {
+        let ev = mouse(MouseEventKind::Moved, 0, 0);
+        assert_eq!(translate(&ev, Mode::Normal, Overlay::None), None);
+        let ev = mouse(MouseEventKind::Down(MouseButton::Right), 0, 0);
+        assert_eq!(translate(&ev, Mode::Normal, Overlay::None), None);
+    }
+
+    #[test]
+    fn upper_m_toggles_mouse_capture_in_normal() {
+        assert_eq!(
+            translate(&k(KeyCode::Char('M')), Mode::Normal, Overlay::None),
+            Some(Action::ToggleMouseCapture)
+        );
+    }
+
+    #[test]
+    fn lower_m_toggles_mouse_capture_in_normal() {
+        assert_eq!(
+            translate(&k(KeyCode::Char('m')), Mode::Normal, Overlay::None),
+            Some(Action::ToggleMouseCapture)
+        );
+    }
+
+    #[test]
+    fn m_inert_inside_overlay() {
+        for ov in [Overlay::Detail, Overlay::Help] {
+            assert_eq!(translate(&k(KeyCode::Char('M')), Mode::Normal, ov), None);
+        }
     }
 }

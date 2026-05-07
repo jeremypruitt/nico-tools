@@ -172,7 +172,7 @@ async fn run_event_loop<C: Clock>(
 
     loop {
         if app.dirty() {
-            terminal.draw(|f| view::render(&app, theme, f))?;
+            terminal.draw(|f| view::render(&mut app, theme, f))?;
             app.clear_dirty();
         }
 
@@ -181,7 +181,7 @@ async fn run_event_loop<C: Clock>(
                 match maybe_event {
                     Some(Ok(ev)) => {
                         if let Some(action) = translate(&ev, Mode::Normal, app.overlay())
-                            && dispatch(&mut app, action, &layers, &opts, &tx) {
+                            && dispatch(&mut app, action, &layers, &opts, &tx, terminal) {
                             break;
                         }
                     }
@@ -190,12 +190,12 @@ async fn run_event_loop<C: Clock>(
             }
             maybe_action = rx.recv() => {
                 if let Some(action) = maybe_action
-                    && dispatch(&mut app, action, &layers, &opts, &tx) {
+                    && dispatch(&mut app, action, &layers, &opts, &tx, terminal) {
                     break;
                 }
             }
             _ = tick.tick() => {
-                if dispatch(&mut app, Action::Tick(clock.now()), &layers, &opts, &tx) {
+                if dispatch(&mut app, Action::Tick(clock.now()), &layers, &opts, &tx, terminal) {
                     break;
                 }
             }
@@ -228,11 +228,20 @@ fn dispatch(
     layers: &Arc<Vec<Box<dyn nico_doctor::layer::Layer>>>,
     opts: &nico_doctor::layer::RunOpts,
     tx: &mpsc::Sender<Action>,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> bool {
     match app.handle(action) {
         Some(Effect::Quit) => true,
         Some(Effect::StartRefresh) => {
             spawn_refresh(layers.clone(), opts.clone(), tx.clone());
+            false
+        }
+        Some(Effect::EnableMouseCapture) => {
+            let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+            false
+        }
+        Some(Effect::DisableMouseCapture) => {
+            let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
             false
         }
         None => false,

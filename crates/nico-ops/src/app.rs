@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use nico_common::output::Status;
 use nico_doctor::baseline::{Baseline, Delta, compute_deltas_for};
+use ratatui::layout::Rect;
 
-use crate::action::{Action, Dir};
+use crate::action::{Action, Dir, ScrollDir};
 use crate::events::Overlay;
 use crate::model::LayerSnapshot;
 use crate::pulse::PulseTimer;
@@ -30,6 +31,11 @@ pub const TICK: Duration = Duration::from_millis(100);
 pub enum Effect {
     /// Kick off a new collection round.
     StartRefresh,
+    /// Turn on terminal mouse capture.
+    EnableMouseCapture,
+    /// Turn off terminal mouse capture so the operator can use native
+    /// terminal scrollback / text selection.
+    DisableMouseCapture,
     /// Tear down and exit cleanly.
     Quit,
 }
@@ -52,6 +58,10 @@ pub struct App {
     deltas: HashMap<String, Delta>,
     prev_status: HashMap<String, Status>,
     pulses: HashMap<String, PulseTimer>,
+    mouse_capture: bool,
+    drill_scroll: u16,
+    overlay_scroll: u16,
+    card_regions: Vec<Rect>,
 }
 
 impl App {
@@ -77,6 +87,10 @@ impl App {
             deltas: HashMap::new(),
             prev_status: HashMap::new(),
             pulses: HashMap::new(),
+            mouse_capture: true,
+            drill_scroll: 0,
+            overlay_scroll: 0,
+            card_regions: Vec::new(),
         }
     }
 
@@ -99,6 +113,25 @@ impl App {
             (Some(t), Some(now)) => t.is_active(now),
             _ => false,
         }
+    }
+
+    pub fn mouse_capture(&self) -> bool {
+        self.mouse_capture
+    }
+
+    pub fn drill_scroll(&self) -> u16 {
+        self.drill_scroll
+    }
+
+    pub fn overlay_scroll(&self) -> u16 {
+        self.overlay_scroll
+    }
+
+    /// The view layer captures the rendered scorecard rectangles here so
+    /// that subsequent `Action::Click` events can be hit-tested against
+    /// what the operator actually sees on screen.
+    pub fn set_card_regions(&mut self, regions: Vec<Rect>) {
+        self.card_regions = regions;
     }
 
     pub fn snapshots(&self) -> &[LayerSnapshot] {
@@ -251,6 +284,50 @@ impl App {
                 }
                 None
             }
+            Action::Click { col, row } => {
+                if self.overlay != Overlay::None {
+                    return None;
+                }
+                if let Some(idx) = self
+                    .card_regions
+                    .iter()
+                    .position(|r| contains(r, col, row))
+                    && idx < self.snapshots.len()
+                    && idx != self.focus
+                {
+                    self.focus = idx;
+                    self.drill_scroll = 0;
+                    self.dirty = true;
+                }
+                None
+            }
+            Action::Scroll(dir) => {
+                let target = if self.overlay == Overlay::Detail {
+                    &mut self.overlay_scroll
+                } else if self.overlay == Overlay::None {
+                    &mut self.drill_scroll
+                } else {
+                    return None;
+                };
+                let next = match dir {
+                    ScrollDir::Up => target.saturating_sub(1),
+                    ScrollDir::Down => target.saturating_add(1),
+                };
+                if next != *target {
+                    *target = next;
+                    self.dirty = true;
+                }
+                None
+            }
+            Action::ToggleMouseCapture => {
+                self.mouse_capture = !self.mouse_capture;
+                self.dirty = true;
+                Some(if self.mouse_capture {
+                    Effect::EnableMouseCapture
+                } else {
+                    Effect::DisableMouseCapture
+                })
+            }
             Action::Quit => Some(Effect::Quit),
         }
     }
@@ -360,6 +437,10 @@ fn run_snapshot_from(snaps: &[LayerSnapshot]) -> RunSnapshot {
         total_duration: Duration::from_millis(total_ms),
         layers,
     }
+}
+
+fn contains(r: &Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
 }
 
 #[cfg(test)]
@@ -789,5 +870,118 @@ mod tests {
         let f3 = app.throbber_glyph();
         assert_ne!(f0, f3, "throbber should cycle frames over time");
         assert_ne!(f0, THROBBER_DONE);
+    }
+
+    fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect { x, y, width: w, height: h }
+    }
+
+    #[test]
+    fn click_inside_a_card_region_focuses_that_card() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.set_card_regions(vec![
+            rect(0, 0, 30, 4),
+            rect(30, 0, 30, 4),
+            rect(60, 0, 30, 4),
+            rect(0, 4, 30, 4),
+            rect(30, 4, 30, 4),
+            rect(60, 4, 30, 4),
+        ]);
+        app.clear_dirty();
+        app.handle(Action::Click { col: 35, row: 5 });
+        assert_eq!(app.focus(), 4);
+        assert!(app.dirty());
+    }
+
+    #[test]
+    fn click_outside_any_card_is_inert() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.set_card_regions(vec![rect(0, 0, 30, 4)]);
+        app.clear_dirty();
+        app.handle(Action::Click { col: 99, row: 99 });
+        assert_eq!(app.focus(), 0);
+        assert!(!app.dirty());
+    }
+
+    #[test]
+    fn click_inert_when_overlay_is_open() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.set_card_regions(vec![rect(0, 0, 30, 4), rect(30, 0, 30, 4)]);
+        app.handle(Action::OpenDetail);
+        app.clear_dirty();
+        app.handle(Action::Click { col: 35, row: 1 });
+        assert_eq!(app.focus(), 0);
+        assert!(!app.dirty());
+    }
+
+    #[test]
+    fn click_resets_drill_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.set_card_regions(vec![
+            rect(0, 0, 30, 4),
+            rect(30, 0, 30, 4),
+        ]);
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.drill_scroll(), 2);
+        app.handle(Action::Click { col: 35, row: 1 });
+        assert_eq!(app.focus(), 1);
+        assert_eq!(app.drill_scroll(), 0);
+    }
+
+    #[test]
+    fn scroll_down_with_no_overlay_increments_drill_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.clear_dirty();
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.drill_scroll(), 1);
+        assert!(app.dirty());
+    }
+
+    #[test]
+    fn scroll_up_at_zero_is_inert() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.clear_dirty();
+        app.handle(Action::Scroll(ScrollDir::Up));
+        assert_eq!(app.drill_scroll(), 0);
+        assert!(!app.dirty());
+    }
+
+    #[test]
+    fn scroll_with_detail_overlay_open_targets_overlay_scroll() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::OpenDetail);
+        app.clear_dirty();
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        assert_eq!(app.overlay_scroll(), 2);
+        assert_eq!(app.drill_scroll(), 0);
+    }
+
+    #[test]
+    fn toggle_mouse_capture_starts_on_and_flips() {
+        let mut app = App::new();
+        assert!(app.mouse_capture());
+        let eff = app.handle(Action::ToggleMouseCapture);
+        assert!(!app.mouse_capture());
+        assert_eq!(eff, Some(Effect::DisableMouseCapture));
+        let eff = app.handle(Action::ToggleMouseCapture);
+        assert!(app.mouse_capture());
+        assert_eq!(eff, Some(Effect::EnableMouseCapture));
+    }
+
+    #[test]
+    fn toggle_mouse_capture_marks_dirty() {
+        let mut app = App::new();
+        app.clear_dirty();
+        app.handle(Action::ToggleMouseCapture);
+        assert!(app.dirty());
     }
 }

@@ -41,7 +41,11 @@ pub const HELP_LINES: &[&str] = &[
 ];
 
 /// Top-level render. The host loop calls this once per dirty frame.
-pub fn render(app: &App, theme: &Theme, frame: &mut Frame) {
+///
+/// Takes `&mut App` so the renderer can publish the rendered scorecard
+/// rectangles back to the reducer for click hit-testing — the regions are
+/// only known here and have to round-trip to the reducer somehow.
+pub fn render(app: &mut App, theme: &Theme, frame: &mut Frame) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -54,7 +58,8 @@ pub fn render(app: &App, theme: &Theme, frame: &mut Frame) {
         .split(area);
 
     render_header(app, theme, frame, chunks[0]);
-    render_grid(app, theme, frame, chunks[1]);
+    let regions = render_grid(app, theme, frame, chunks[1]);
+    app.set_card_regions(regions);
     render_drill(app, theme, frame, chunks[2]);
     render_hint_bar(app, theme, frame, chunks[3]);
 
@@ -122,12 +127,12 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
-fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Vec<Rect> {
     let snapshots = app.snapshots();
     if snapshots.is_empty() {
         let block = Block::default().borders(Borders::ALL).title(" layers ");
         frame.render_widget(block, area);
-        return;
+        return Vec::new();
     }
 
     let cols = grid_cols_for_width(area.width);
@@ -140,6 +145,7 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         .constraints(row_constraints)
         .split(area);
 
+    let mut regions: Vec<Rect> = vec![Rect::default(); snapshots.len()];
     for r in 0..rows {
         let col_constraints: Vec<Constraint> =
             std::iter::repeat_n(Constraint::Ratio(1, cols as u32), cols).collect();
@@ -148,7 +154,7 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             .constraints(col_constraints)
             .split(row_areas[r]);
         for c in 0..cols {
-            let idx = r * 3 + c;
+            let idx = r * cols + c;
             if idx >= snapshots.len() {
                 break;
             }
@@ -157,9 +163,11 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             } else {
                 continue;
             };
+            regions[idx] = cell;
             render_scorecard(app, idx, theme, frame, cell);
         }
     }
+    regions
 }
 
 /// Row height for one scorecard: top border + evidence line + sparkline +
@@ -253,12 +261,20 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             Style::default().fg(theme.muted),
         ))],
     };
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.drill_scroll(), 0)),
+        inner,
+    );
 }
 
 fn render_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let mouse = if app.mouse_capture() { "on" } else { "off" };
     let mut spans: Vec<Span> = vec![Span::styled(
-        " R:refresh  Space:pause  hjkl/arrows:focus  Enter:detail  ?:help  q:quit ",
+        format!(
+            " R:refresh  Space:pause  hjkl/arrows:focus  Enter:detail  M:mouse({mouse})  ?:help  q:quit "
+        ),
         Style::default().fg(theme.muted),
     )];
     if app.paused() {
@@ -295,7 +311,9 @@ fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect
         None => vec![],
     };
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.overlay_scroll(), 0)),
         inner.inner(Margin {
             horizontal: 1,
             vertical: 0,
@@ -501,7 +519,7 @@ mod tests {
         ]
     }
 
-    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+    fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(app, &DEFAULT, f)).unwrap();
@@ -534,7 +552,7 @@ mod tests {
             findings: vec![],
             duration_ms: 0,
         }]));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("NEW"), "NEW badge missing:\n{s}");
     }
 
@@ -549,7 +567,7 @@ mod tests {
             findings: vec![],
             duration_ms: 0,
         }]));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("FIXED"), "FIXED badge missing:\n{s}");
     }
 
@@ -557,7 +575,7 @@ mod tests {
     fn missing_baseline_renders_no_delta_badges() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(
             !s.contains("NEW"),
             "NEW unexpectedly present without baseline:\n{s}"
@@ -579,7 +597,7 @@ mod tests {
             findings: vec![],
             duration_ms: 0,
         }]));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(
             !s.contains("NEW"),
             "NEW unexpectedly shown for unchanged layer:\n{s}"
@@ -614,7 +632,7 @@ mod tests {
 
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(&app, &DEFAULT, f)).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let pip = pip_glyph(&Status::Warn);
         let mut found_reversed = false;
@@ -645,7 +663,7 @@ mod tests {
         }]));
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(&app, &DEFAULT, f)).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let pip = pip_glyph(&Status::Warn);
         for y in 0..buf.area.height {
@@ -674,7 +692,7 @@ mod tests {
         }]));
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(&app, &DEFAULT, f)).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
         // Find the 'N' of "NEW" and check fg is theme.error.
         for y in 0..buf.area.height {
@@ -716,7 +734,7 @@ mod tests {
     fn render_shows_title_and_all_layer_names() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         assert!(s.contains("nico ops"), "title missing:\n{s}");
         for name in ["cluster", "logs", "workflows", "health", "grpc", "postgres"] {
             assert!(s.contains(name), "layer {name} missing:\n{s}");
@@ -727,7 +745,7 @@ mod tests {
     fn render_shows_overall_verdict_word() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         assert!(s.contains("WARN"), "verdict missing:\n{s}");
     }
 
@@ -736,7 +754,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::Focus(Dir::Right));
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         // Focus marker is rendered as part of the focused scorecard's title.
         // We expect "▶ logs" but not "▶ cluster".
         assert!(s.contains("▶ logs"), "expected '▶ logs' in render:\n{s}");
@@ -751,7 +769,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::Focus(Dir::Right));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("findings — logs"), "drill title missing:\n{s}");
         assert!(s.contains("ERROR lines"), "finding text missing:\n{s}");
         assert!(s.contains("next:"), "next-cmd hint missing:\n{s}");
@@ -761,7 +779,7 @@ mod tests {
     fn render_hint_bar_lists_keybinds() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("R:refresh"), "hint missing:\n{s}");
         assert!(s.contains("?:help"), "hint missing:\n{s}");
         assert!(s.contains("q:quit"), "hint missing:\n{s}");
@@ -772,7 +790,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::OpenHelp);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("keybinds"), "overlay title missing:\n{s}");
         assert!(s.contains("refresh"), "overlay body missing:\n{s}");
     }
@@ -782,7 +800,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::TogglePause);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("PAUSED"), "PAUSED indicator missing:\n{s}");
     }
 
@@ -790,7 +808,7 @@ mod tests {
     fn render_hint_bar_omits_paused_when_running() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(!s.contains("PAUSED"), "PAUSED unexpectedly shown:\n{s}");
     }
 
@@ -798,7 +816,7 @@ mod tests {
     fn render_header_shows_done_glyph_after_completion() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("✓"), "expected ✓ in header after refresh:\n{s}");
     }
 
@@ -807,7 +825,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::OpenHelp);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(
             s.contains("pause"),
             "help overlay should mention pause keybind:\n{s}"
@@ -820,7 +838,7 @@ mod tests {
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::Focus(Dir::Right));
         app.handle(Action::OpenDetail);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("detail — logs"), "overlay title missing:\n{s}");
     }
 
@@ -847,7 +865,7 @@ mod tests {
     fn scorecard_sparkline_appears_after_two_or_more_runs() {
         let mut app = App::new();
         drive_runs(&mut app, &[0, 4, 8]);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         let has_spark = s
             .chars()
             .any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
@@ -858,7 +876,7 @@ mod tests {
     fn scorecard_sparkline_blank_after_first_run_only() {
         let mut app = App::new();
         drive_runs(&mut app, &[3]);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         let has_spark = s
             .chars()
             .any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
@@ -872,7 +890,7 @@ mod tests {
             drive_runs(&mut app, &[0, 4, 8, 2, 6, 1, 0, 7, 3, 5, 4, 6]);
             // No assertion beyond "renders cleanly" — this test guards against
             // panics or layout glitches on the narrow grid reflows.
-            let _ = render_to_string(&app, w, h);
+            let _ = render_to_string(&mut app, w, h);
         }
     }
 
@@ -881,7 +899,7 @@ mod tests {
         let mut app = App::new();
         // Drive enough varied runs to seed both widgets.
         drive_runs(&mut app, &[0, 4, 8, 2, 6]);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains('■'), "breadcrumb missing:\n{s}");
         let has_spark = s
             .chars()
@@ -901,7 +919,7 @@ mod tests {
                 duration_ms: 0,
             }]));
         }
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         let count = s.chars().filter(|c| *c == '■').count();
         assert!(
             count >= 3,
@@ -911,8 +929,8 @@ mod tests {
 
     #[test]
     fn header_breadcrumb_absent_before_any_run() {
-        let app = App::new();
-        let s = render_to_string(&app, 120, 20);
+        let mut app = App::new();
+        let s = render_to_string(&mut app, 120, 20);
         assert!(
             !s.contains('■'),
             "breadcrumb must not paint before any run:\n{s}"
@@ -931,7 +949,7 @@ mod tests {
                 duration_ms: 0,
             }]));
         }
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         let count = s.chars().filter(|c| *c == '■').count();
         assert_eq!(
             count, BREADCRUMB_CAP,
@@ -941,8 +959,8 @@ mod tests {
 
     #[test]
     fn loading_header_when_no_snapshots() {
-        let app = App::new();
-        let s = render_to_string(&app, 120, 20);
+        let mut app = App::new();
+        let s = render_to_string(&mut app, 120, 20);
         assert!(s.contains("loading"), "loading hint missing:\n{s}");
     }
 
@@ -957,7 +975,7 @@ mod tests {
         }]));
         let backend = TestBackend::new(120, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(&app, theme, f)).unwrap();
+        terminal.draw(|f| render(&mut app, theme, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let pip = pip_glyph(&status);
         for y in 0..buf.area.height {
@@ -991,4 +1009,113 @@ mod tests {
         let color = pip_color_for(&GRUVBOX, Status::Ok);
         assert_eq!(color, GRUVBOX.ok);
     }
+
+    #[test]
+    fn hint_bar_shows_mouse_on_by_default() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("M:mouse(on)"), "mouse hint missing:\n{s}");
+    }
+
+    #[test]
+    fn hint_bar_reflects_mouse_off_after_toggle() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::ToggleMouseCapture);
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("M:mouse(off)"), "mouse hint did not flip:\n{s}");
+    }
+
+    #[test]
+    fn render_publishes_card_regions_for_hit_testing() {
+        // Render once to populate card_regions, then locate the "logs"
+        // scorecard by scanning cells (column-counted, not byte-indexed,
+        // to avoid the multi-byte pip glyphs throwing off positions) and
+        // confirm a click on it focuses card #1.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let needle: Vec<&str> = vec!["l", "o", "g", "s"];
+        let mut hit: Option<(u16, u16)> = None;
+        'outer: for y in 0..buf.area.height {
+            for x in 0..buf.area.width.saturating_sub(needle.len() as u16) {
+                if (0..needle.len() as u16)
+                    .all(|i| buf.cell((x + i, y)).unwrap().symbol() == needle[i as usize])
+                {
+                    hit = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        let (col, row) = hit.expect("logs scorecard title not found in render");
+        app.handle(Action::Click { col, row });
+        assert_eq!(
+            app.focus(),
+            1,
+            "click on the logs scorecard at ({col}, {row}) should focus card #1"
+        );
+    }
+
+    #[test]
+    fn drill_scroll_offset_is_applied_to_drill_paragraph() {
+        let mut app = App::new();
+        let many = vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: "many".into(),
+            findings: (0..10)
+                .map(|i| Finding {
+                    status: Status::Warn,
+                    message: format!("finding number {i:02}"),
+                    next_command: None,
+                })
+                .collect(),
+            duration_ms: 0,
+        }];
+        app.handle(Action::Snapshots(many));
+        let baseline = render_to_string(&mut app, 120, 24);
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        let scrolled = render_to_string(&mut app, 120, 24);
+        assert_ne!(
+            baseline, scrolled,
+            "drill should redraw differently when drill_scroll changes"
+        );
+    }
+
+    #[test]
+    fn overlay_scroll_offset_is_applied_to_detail_overlay() {
+        let mut app = App::new();
+        let many = vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: "many".into(),
+            findings: (0..30)
+                .map(|i| Finding {
+                    status: Status::Warn,
+                    message: format!("overlay finding {i:02}"),
+                    next_command: None,
+                })
+                .collect(),
+            duration_ms: 0,
+        }];
+        app.handle(Action::Snapshots(many));
+        app.handle(Action::OpenDetail);
+        let baseline = render_to_string(&mut app, 120, 24);
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        let scrolled = render_to_string(&mut app, 120, 24);
+        assert_ne!(
+            baseline, scrolled,
+            "detail overlay should redraw differently when overlay_scroll changes"
+        );
+    }
+
+    use crate::action::ScrollDir;
 }

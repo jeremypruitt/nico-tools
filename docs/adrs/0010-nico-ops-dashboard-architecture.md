@@ -115,6 +115,33 @@ across scorecards. `q` / `Ctrl-C` exits cleanly.
 - **Theme integration.** `--theme` flag and `NICO_THEME` env var map
   through `nico_common::theme::resolve_theme`.
 
+### Mouse support — opt-in carve-out from ADR-007
+
+ADR-007 deferred mouse support across the TUI. `nico ops` carves out a
+narrow exception: it captures mouse events because the dashboard's
+scorecard grid + drill panel layout benefits substantially from
+click-to-focus and wheel-scroll interactions, and the carve-out is
+contained to this one subcommand.
+
+- **Click-to-focus.** A left-click anywhere inside a scorecard's
+  rectangle focuses that scorecard (same effect as `hjkl` / arrow keys).
+  The renderer publishes the rendered card rectangles back into `App`
+  via `set_card_regions(...)` so the reducer can hit-test
+  `Action::Click { col, row }` against what the operator sees.
+- **Wheel scrolling.** `MouseEventKind::ScrollUp` /
+  `MouseEventKind::ScrollDown` translate to `Action::Scroll(ScrollDir)`.
+  The reducer routes the offset to the drill panel when no overlay is
+  open, and to the detail overlay when one is.
+- **Toggle (`M`).** Mouse capture is on by default, but `M` flips it
+  through `Effect::EnableMouseCapture` /
+  `Effect::DisableMouseCapture`, which the host loop applies to the
+  underlying terminal. The footer hint reflects the current state
+  (`M:mouse(on)` / `M:mouse(off)`) so the operator can fall back to
+  terminal-native scrollback / text selection when they need to.
+- All mouse plumbing flows through the same pure `events::translate`
+  function, so the translation contract is unit-tested without a real
+  terminal.
+
 ## Consequences
 
 ### Positive
