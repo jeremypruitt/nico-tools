@@ -1,7 +1,7 @@
 # ADR-004: Color is semantic, not decorative
 
-- **Status:** Accepted
-- **Date:** 2026-05-03
+- **Status:** Accepted (amended by ADR-0013)
+- **Date:** 2026-05-03 (amended 2026-05-07)
 
 ## Context
 
@@ -18,10 +18,14 @@ Colors carry exactly one meaning each:
 | Green | OK |
 | Yellow | Warning (degraded but functional) |
 | Red | Failure (broken) |
-| Gray (dim) | Unknown / not-checked / skipped |
+| Gray (dim) | Unknown / not-checked / skipped / pending |
+| Accent | In-progress (the boot probe's currently-active step; see ADR-0013) |
 
 No other colors. No bold or underline as a substitute for color. Color is
-never used for emphasis, branding, or decoration.
+never used for emphasis, branding, or decoration. The `accent` role is
+reserved for "actively running right now" and is only used by the boot
+probe (ADR-0013); it is not available for layer-check status or any
+other static state.
 
 Color is automatically disabled when:
 - `NO_COLOR` environment variable is set (any value), per
@@ -36,13 +40,18 @@ to `--no-color`.
 
 Status icons (Unicode, with ASCII fallback under `--ascii`):
 
-| Icon | ASCII | Meaning | Color |
-|------|-------|---------|-------|
-| `✓` | `[ok]` | ok | green |
-| `!` | `[!!]` | warn | yellow |
-| `✗` | `[XX]` | fail | red |
-| `?` | `[??]` | unknown | gray |
-| `·` | `[--]` | skipped | dim |
+| Icon  | ASCII       | Meaning            | Color  |
+|-------|-------------|--------------------|--------|
+| `✓`   | `[ok]`      | ok                 | green  |
+| `!`   | `[!!]`      | warn               | yellow |
+| `✗`   | `[XX]`      | fail               | red    |
+| `?`   | `[??]`      | unknown            | gray   |
+| `─`   | `[--]`      | skipped            | dim    |
+| `○`   | `[..]`      | pending (boot probe only — ADR-0013)         | dim    |
+| `⠋…⠏` | `\|/-\\`    | in-progress (boot probe only — ADR-0013)     | accent |
+
+The skipped glyph was previously `·`; redefined to `─` by ADR-0013 for
+visual distinction from the in-progress braille frames.
 
 ## Consequences
 
@@ -68,3 +77,6 @@ Status icons (Unicode, with ASCII fallback under `--ascii`):
 ## Related
 
 - ADR-003 (output format) — color is part of the human format only.
+- ADR-0013 (boot probe) — adds the `accent` and `pending` roles and
+  redefines the skipped glyph; both additions are scoped to the boot
+  probe, not layer checks.

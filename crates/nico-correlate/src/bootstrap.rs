@@ -57,6 +57,7 @@ pub fn resolve_config(args: &CorrelateArgs) -> Result<CorrelateConfig, Bootstrap
         color: if args.no_color { Some(ColorMode::Never) } else { None },
         format: if args.json { Some(OutputFormat::Json) } else { None },
         reach_mode: mode_override,
+        bootstrap_timeouts_spec: args.timeouts.clone(),
         ..Default::default()
     };
 
@@ -201,9 +202,10 @@ pub async fn prepare_sources(
     };
 
     let mut pf_guards: Vec<nico_common::reach::ForwardedEndpoint> = vec![];
+    let pf_budget = cfg.config.bootstrap.timeouts.port_forward;
 
     let temporal_address = if let Some(ref mgr) = reach_mgr {
-        match mgr.temporal_address().await {
+        match mgr.temporal_address(pf_budget).await {
             Ok((addr, guard)) => {
                 pf_guards.extend(guard);
                 addr
@@ -218,7 +220,7 @@ pub async fn prepare_sources(
     };
 
     let postgres_url = if let Some(ref mgr) = reach_mgr {
-        match mgr.postgres_url(&cfg.config.postgres.url).await {
+        match mgr.postgres_url(&cfg.config.postgres.url, pf_budget).await {
             Ok((url, guard)) => {
                 pf_guards.extend(guard);
                 url
@@ -232,12 +234,22 @@ pub async fn prepare_sources(
         cfg.config.postgres.url.clone()
     };
 
+    if let Err(e) = nico_common::bootstrap::probe_postgres(
+        &postgres_url,
+        cfg.config.bootstrap.timeouts.postgres_reach,
+    ).await {
+        eprintln!("nico: warn: postgres reach probe: {e}");
+    }
+
     let pg_source: Box<dyn Source> = match SqlxPostgresClient::connect(&postgres_url).await {
         Ok(c) => Box::new(PostgresSource::new(Box::new(c))),
         Err(e) => Box::new(UnavailableSource::new("postgres", format!("connect failed: {e}"))),
     };
 
-    let k8s_source: Box<dyn Source> = match KubeRsK8sClient::try_default().await {
+    let k8s_source: Box<dyn Source> = match KubeRsK8sClient::try_new(
+        cfg.config.cluster.context.as_deref(),
+        cfg.config.bootstrap.timeouts.kube_client,
+    ).await {
         Ok(c) => Box::new(K8sSource::new(Arc::new(c))),
         Err(e) => Box::new(UnavailableSource::new("k8s", format!("kubeconfig unavailable: {e}"))),
     };
@@ -249,7 +261,7 @@ pub async fn prepare_sources(
         Ok(url) => Ok(Box::new(RealLokiClient::new(url))),
         Err(_) => {
             if let Some(ref mgr) = reach_mgr {
-                match mgr.loki_url().await {
+                match mgr.loki_url(pf_budget).await {
                     Ok((url, guard)) => {
                         pf_guards.extend(guard);
                         Ok(Box::new(RealLokiClient::new(url)))

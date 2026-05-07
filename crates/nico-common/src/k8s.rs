@@ -15,6 +15,8 @@ use k8s_openapi::api::core::v1::{Event as CoreEvent, Pod};
 use kube::api::{ListParams, LogParams};
 use kube::{Api, Client};
 
+use crate::bootstrap::{run_with_budget, BootstrapStepError};
+
 /// Where to look for pods.
 #[derive(Debug, Clone)]
 pub enum PodScope<'a> {
@@ -125,24 +127,28 @@ pub struct KubeRsK8sClient {
 }
 
 impl KubeRsK8sClient {
-    pub async fn try_new(context: Option<&str>) -> Result<Self> {
-        let client = if let Some(ctx) = context {
-            use kube::config::KubeConfigOptions;
-            let config = kube::Config::from_kubeconfig(&KubeConfigOptions {
-                context: Some(ctx.to_string()),
-                ..Default::default()
-            })
-            .await?;
-            Client::try_from(config)?
-        } else {
-            Client::try_default().await?
-        };
-        Ok(Self { client })
-    }
-
-    pub async fn try_default() -> Result<Self> {
-        let client = Client::try_default().await?;
-        Ok(Self { client })
+    /// Build a client from kubeconfig, bounded by `budget`. Exceeding the
+    /// budget surfaces `BootstrapStepError::TimedOut(budget)`; any other
+    /// error is wrapped in `BootstrapStepError::Other`.
+    pub async fn try_new(
+        context: Option<&str>,
+        budget: Duration,
+    ) -> Result<Self, BootstrapStepError> {
+        let context = context.map(str::to_owned);
+        run_with_budget(budget, async move {
+            let client = if let Some(ctx) = context {
+                use kube::config::KubeConfigOptions;
+                let config = kube::Config::from_kubeconfig(&KubeConfigOptions {
+                    context: Some(ctx),
+                    ..Default::default()
+                })
+                .await?;
+                Client::try_from(config)?
+            } else {
+                Client::try_default().await?
+            };
+            Ok(Self { client })
+        }).await
     }
 
     pub fn raw_client(&self) -> &Client {

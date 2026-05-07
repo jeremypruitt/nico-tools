@@ -17,6 +17,15 @@ pub struct DoctorArgs {
     #[arg(long, default_value = "5s", help = "Per-check timeout")]
     pub timeout: String,
 
+    #[arg(
+        long,
+        value_name = "step=Xs,...",
+        help = "Override bootstrap-step timeout budgets. \
+                Steps: kube_client, reach_api, preflight, port_forward, postgres_reach. \
+                Example: --timeouts kube_client=10s,port_forward=2s"
+    )]
+    pub timeouts: Option<String>,
+
     #[arg(short, long, help = "Output JSON")]
     pub json: bool,
 

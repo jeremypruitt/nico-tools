@@ -391,6 +391,7 @@ fn correlate_args(workflow_id: &str) -> nico_correlate::CorrelateArgs {
         theme: None,
         config: None,
         mode: None,
+        timeouts: None,
     }
 }
 

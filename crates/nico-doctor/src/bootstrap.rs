@@ -226,6 +226,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         color: if args.no_color { Some(ColorMode::Never) } else { None },
         format: if args.json { Some(OutputFormat::Json) } else { None },
         reach_mode: mode_override,
+        bootstrap_timeouts_spec: args.timeouts.clone(),
         ..Default::default()
     };
 
@@ -264,7 +265,10 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         timeout,
     };
 
-    let k8s_result = nico_common::k8s::KubeRsK8sClient::try_new(config.cluster.context.as_deref()).await;
+    let k8s_result = nico_common::k8s::KubeRsK8sClient::try_new(
+        config.cluster.context.as_deref(),
+        config.bootstrap.timeouts.kube_client,
+    ).await;
     let (k8s_client, raw_k8s, reach_mgr): (
         Option<Arc<dyn nico_common::k8s::K8sClient>>,
         Option<kube::Client>,
@@ -284,12 +288,21 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
                 Some(mgr),
             )
         }
-        Err(_) => (None, None, None),
+        Err(e) => {
+            if e.is_timed_out() {
+                eprintln!("nico: warn: kube client setup {e}");
+            }
+            (None, None, None)
+        }
     };
 
     if let Some(raw) = raw_k8s.as_ref() {
         let pf = preflight::KubePreflightClient::new(raw.clone());
-        if let preflight::Outcome::Failed(failure) = preflight::run(&pf, &config.cluster.namespace).await {
+        if let preflight::Outcome::Failed(failure) = preflight::run(
+            &pf,
+            &config.cluster.namespace,
+            &config.bootstrap.timeouts,
+        ).await {
             let json_payload = preflight::format_failure_json(&failure, &config.cluster.namespace);
             let human_message = format!(
                 "error: pre-flight check failed [{}]: {}\n  → {}",
@@ -306,9 +319,10 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
     }
 
     let mut pf_guards: Vec<nico_common::reach::ForwardedEndpoint> = vec![];
+    let pf_budget = config.bootstrap.timeouts.port_forward;
 
     let temporal_address = if let Some(ref mgr) = reach_mgr {
-        match mgr.temporal_address().await {
+        match mgr.temporal_address(pf_budget).await {
             Ok((addr, guard)) => {
                 pf_guards.extend(guard);
                 addr
@@ -323,7 +337,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
     };
 
     let postgres_url = if let Some(ref mgr) = reach_mgr {
-        match mgr.postgres_url(&config.postgres.url).await {
+        match mgr.postgres_url(&config.postgres.url, pf_budget).await {
             Ok((url, guard)) => {
                 pf_guards.extend(guard);
                 url
@@ -337,12 +351,19 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         config.postgres.url.clone()
     };
 
+    if let Err(e) = nico_common::bootstrap::probe_postgres(
+        &postgres_url,
+        config.bootstrap.timeouts.postgres_reach,
+    ).await {
+        eprintln!("nico: warn: postgres reach probe: {e}");
+    }
+
     let (loki_url, loki_client): (Option<String>, Arc<dyn loki::LokiClient>) = {
         if let Ok(url) = std::env::var("LOKI_URL") {
             let client = Arc::new(loki::RealLokiClient::new(url.clone())) as Arc<dyn loki::LokiClient>;
             (Some(url), client)
         } else if let Some(ref mgr) = reach_mgr {
-            match mgr.loki_url().await {
+            match mgr.loki_url(pf_budget).await {
                 Ok((url, guard)) => {
                     pf_guards.extend(guard);
                     let client = Arc::new(loki::RealLokiClient::new(url.clone())) as Arc<dyn loki::LokiClient>;
@@ -381,7 +402,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
                 .collect();
             Some(endpoints)
         } else if let Some(ref mgr) = reach_mgr {
-            match mgr.http_endpoints().await {
+            match mgr.http_endpoints(pf_budget).await {
                 Ok((discovered, guards)) => {
                     pf_guards.extend(guards);
                     if discovered.is_empty() {

@@ -79,6 +79,7 @@ impl OpsArgs {
             config: self.config.clone(),
             mode: self.mode.clone(),
             theme: self.theme.clone(),
+            timeouts: None,
         }
     }
 }

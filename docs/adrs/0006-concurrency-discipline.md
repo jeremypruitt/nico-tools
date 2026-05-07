@@ -1,7 +1,7 @@
 # ADR-006: Concurrency — bounded parallelism, layered timeouts
 
-- **Status:** Accepted
-- **Date:** 2026-05-03
+- **Status:** Accepted (amended by ADR-0013)
+- **Date:** 2026-05-03 (amended 2026-05-07)
 
 ## Context
 
@@ -19,8 +19,11 @@ Three concurrency rules, all enforced by shared infrastructure:
    apiserver from misuse that fans out to hundreds of pods.
 
 2. **Per-check timeout.** Every individual check has a timeout (default
-   5 seconds, configurable via `--timeout`). A timed-out check reports
-   `unknown`, not `fail` — these are distinct signals (see ADR-001).
+   5 seconds, configurable via `--timeout`). A timed-out **layer check**
+   reports `unknown`, not `fail` — these are distinct signals (see ADR-001).
+   This rule is scoped to layer checks. A timed-out **boot probe** step
+   reports `fail` (red `✗`), not `unknown`, because a bootstrap I/O
+   timeout is conclusive: the boot can't proceed. See ADR-0013.
 
 3. **Global wall-clock timeout.** The whole tool run is wrapped in a single
    `tokio::time::timeout` (default 30 seconds). If the whole run exceeds it,
@@ -65,3 +68,5 @@ production code paths.
   timeout behavior meaningful.
 - ADR-005 (reach mode) — port-forward setup is part of what the per-check
   timeout has to accommodate.
+- ADR-0013 (boot probe) — scopes the timeout-as-unknown rule to layer
+  checks; boot probe steps treat timeout as failure.

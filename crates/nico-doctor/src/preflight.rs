@@ -8,6 +8,9 @@ use k8s_openapi::api::authorization::v1::{
     SelfSubjectAccessReview, SelfSubjectAccessReviewSpec, ResourceAttributes,
 };
 
+use nico_common::bootstrap::{run_with_budget, BootstrapStepError};
+use nico_common::config::BootstrapTimeouts;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Reachability,
@@ -31,6 +34,10 @@ pub struct Failure {
     pub step: Step,
     pub message: String,
     pub next_command: String,
+    /// `true` when the step exceeded its budget (an underlying I/O hang).
+    /// Boot probe renderer surfaces this as `timed out after Xs` rather
+    /// than the inner error string. See ADR-0013.
+    pub timed_out: bool,
 }
 
 pub enum Outcome {
@@ -120,40 +127,41 @@ impl PreflightChecks for KubePreflightClient {
     }
 }
 
-pub async fn run(checks: &dyn PreflightChecks, namespace: &str) -> Outcome {
-    if let Err(e) = checks.check_reachability().await {
-        return Outcome::Failed(Failure {
-            step: Step::Reachability,
-            message: e.to_string(),
-            next_command: "kubectl cluster-info".to_string(),
-        });
+pub async fn run(
+    checks: &dyn PreflightChecks,
+    namespace: &str,
+    timeouts: &BootstrapTimeouts,
+) -> Outcome {
+    if let Err(e) = run_with_budget(timeouts.reach_api, checks.check_reachability()).await {
+        return failed(Step::Reachability, e, "kubectl cluster-info".to_string());
     }
 
-    if let Err(e) = checks.check_token_valid().await {
-        return Outcome::Failed(Failure {
-            step: Step::TokenExpiry,
-            message: e.to_string(),
-            next_command: "kubectl auth whoami".to_string(),
-        });
+    if let Err(e) = run_with_budget(timeouts.preflight, checks.check_token_valid()).await {
+        return failed(Step::TokenExpiry, e, "kubectl auth whoami".to_string());
     }
 
-    if let Err(e) = checks.check_namespace_exists(namespace).await {
-        return Outcome::Failed(Failure {
-            step: Step::NamespaceExists,
-            message: e.to_string(),
-            next_command: format!("kubectl get ns {namespace}"),
-        });
+    if let Err(e) = run_with_budget(timeouts.preflight, checks.check_namespace_exists(namespace)).await {
+        return failed(Step::NamespaceExists, e, format!("kubectl get ns {namespace}"));
     }
 
-    if let Err(e) = checks.check_rbac(namespace).await {
-        return Outcome::Failed(Failure {
-            step: Step::Rbac,
-            message: e.to_string(),
-            next_command: format!("kubectl auth can-i list pods -n {namespace}"),
-        });
+    if let Err(e) = run_with_budget(timeouts.preflight, checks.check_rbac(namespace)).await {
+        return failed(
+            Step::Rbac,
+            e,
+            format!("kubectl auth can-i list pods -n {namespace}"),
+        );
     }
 
     Outcome::Ok
+}
+
+fn failed(step: Step, err: BootstrapStepError, next_command: String) -> Outcome {
+    Outcome::Failed(Failure {
+        step,
+        message: err.to_string(),
+        next_command,
+        timed_out: err.is_timed_out(),
+    })
 }
 
 pub fn format_failure_json(failure: &Failure, namespace: &str) -> String {
@@ -165,6 +173,7 @@ pub fn format_failure_json(failure: &Failure, namespace: &str) -> String {
             "failed_step": failure.step.as_str(),
             "message": failure.message,
             "next_command": failure.next_command,
+            "timed_out": failure.timed_out,
         }
     }))
     .unwrap()
@@ -177,32 +186,53 @@ pub fn ok_section() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     struct MockChecks {
         reachability: Option<&'static str>,
         token: Option<&'static str>,
         namespace: Option<&'static str>,
         rbac: Option<&'static str>,
+        delay: Option<Duration>,
     }
 
     impl MockChecks {
         fn all_ok() -> Self {
-            Self { reachability: None, token: None, namespace: None, rbac: None }
+            Self { reachability: None, token: None, namespace: None, rbac: None, delay: None }
+        }
+
+        async fn maybe_delay(&self) {
+            if let Some(d) = self.delay {
+                tokio::time::sleep(d).await;
+            }
+        }
+    }
+
+    fn fast() -> BootstrapTimeouts {
+        // Generous budget — for tests that don't want to time out.
+        BootstrapTimeouts {
+            reach_api: Duration::from_secs(5),
+            preflight: Duration::from_secs(5),
+            ..Default::default()
         }
     }
 
     #[async_trait]
     impl PreflightChecks for MockChecks {
         async fn check_reachability(&self) -> Result<()> {
+            self.maybe_delay().await;
             self.reachability.map(|e| Err(anyhow::anyhow!("{e}"))).unwrap_or(Ok(()))
         }
         async fn check_token_valid(&self) -> Result<()> {
+            self.maybe_delay().await;
             self.token.map(|e| Err(anyhow::anyhow!("{e}"))).unwrap_or(Ok(()))
         }
         async fn check_namespace_exists(&self, _ns: &str) -> Result<()> {
+            self.maybe_delay().await;
             self.namespace.map(|e| Err(anyhow::anyhow!("{e}"))).unwrap_or(Ok(()))
         }
         async fn check_rbac(&self, _ns: &str) -> Result<()> {
+            self.maybe_delay().await;
             self.rbac.map(|e| Err(anyhow::anyhow!("{e}"))).unwrap_or(Ok(()))
         }
     }
@@ -210,11 +240,12 @@ mod tests {
     #[tokio::test]
     async fn reachability_failure_returns_step_and_hint() {
         let mock = MockChecks { reachability: Some("connection refused"), ..MockChecks::all_ok() };
-        match run(&mock, "nico").await {
+        match run(&mock, "nico", &fast()).await {
             Outcome::Failed(f) => {
                 assert_eq!(f.step, Step::Reachability);
                 assert_eq!(f.next_command, "kubectl cluster-info");
                 assert!(f.message.contains("connection refused"));
+                assert!(!f.timed_out);
             }
             Outcome::Ok => panic!("expected failure"),
         }
@@ -223,10 +254,11 @@ mod tests {
     #[tokio::test]
     async fn token_failure_returns_step_and_hint() {
         let mock = MockChecks { token: Some("401 Unauthorized"), ..MockChecks::all_ok() };
-        match run(&mock, "nico").await {
+        match run(&mock, "nico", &fast()).await {
             Outcome::Failed(f) => {
                 assert_eq!(f.step, Step::TokenExpiry);
                 assert_eq!(f.next_command, "kubectl auth whoami");
+                assert!(!f.timed_out);
             }
             Outcome::Ok => panic!("expected failure"),
         }
@@ -235,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn namespace_failure_returns_step_and_hint() {
         let mock = MockChecks { namespace: Some("namespace 'nico' not found"), ..MockChecks::all_ok() };
-        match run(&mock, "nico").await {
+        match run(&mock, "nico", &fast()).await {
             Outcome::Failed(f) => {
                 assert_eq!(f.step, Step::NamespaceExists);
                 assert!(f.next_command.contains("kubectl get ns nico"));
@@ -247,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn rbac_failure_returns_step_and_hint() {
         let mock = MockChecks { rbac: Some("cannot list pods"), ..MockChecks::all_ok() };
-        match run(&mock, "nico").await {
+        match run(&mock, "nico", &fast()).await {
             Outcome::Failed(f) => {
                 assert_eq!(f.step, Step::Rbac);
                 assert!(f.next_command.contains("kubectl auth can-i list pods -n nico"));
@@ -259,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn all_ok_returns_outcome_ok() {
         let mock = MockChecks::all_ok();
-        assert!(matches!(run(&mock, "nico").await, Outcome::Ok));
+        assert!(matches!(run(&mock, "nico", &fast()).await, Outcome::Ok));
     }
 
     #[tokio::test]
@@ -270,8 +302,9 @@ mod tests {
             token: Some("should not be called"),
             namespace: Some("should not be called"),
             rbac: Some("should not be called"),
+            delay: None,
         };
-        match run(&mock, "nico").await {
+        match run(&mock, "nico", &fast()).await {
             Outcome::Failed(f) => assert_eq!(f.step, Step::Reachability),
             Outcome::Ok => panic!("expected failure"),
         }
@@ -284,8 +317,9 @@ mod tests {
             token: Some("401 Unauthorized"),
             namespace: Some("should not be called"),
             rbac: Some("should not be called"),
+            delay: None,
         };
-        match run(&mock, "nico").await {
+        match run(&mock, "nico", &fast()).await {
             Outcome::Failed(f) => assert_eq!(f.step, Step::TokenExpiry),
             Outcome::Ok => panic!("expected failure"),
         }
@@ -298,19 +332,77 @@ mod tests {
             token: None,
             namespace: Some("namespace 'nico' not found"),
             rbac: Some("should not be called"),
+            delay: None,
         };
-        match run(&mock, "nico").await {
+        match run(&mock, "nico", &fast()).await {
             Outcome::Failed(f) => assert_eq!(f.step, Step::NamespaceExists),
             Outcome::Ok => panic!("expected failure"),
         }
     }
 
     #[tokio::test]
-    async fn failure_json_contains_preflight_section() {
+    async fn reachability_timeout_surfaces_timed_out_failure() {
+        // Inner check would block for 1s; budget is 20ms.
+        let mock = MockChecks {
+            delay: Some(Duration::from_secs(1)),
+            ..MockChecks::all_ok()
+        };
+        let mut t = fast();
+        t.reach_api = Duration::from_millis(20);
+        match run(&mock, "nico", &t).await {
+            Outcome::Failed(f) => {
+                assert_eq!(f.step, Step::Reachability);
+                assert!(f.timed_out, "expected timed_out=true, got message {:?}", f.message);
+                assert!(f.message.contains("timed out"));
+            }
+            Outcome::Ok => panic!("expected failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rbac_timeout_surfaces_timed_out_failure_at_rbac_step() {
+        // Reachability/token/namespace pass instantly; rbac hangs.
+        struct SlowRbac;
+        #[async_trait]
+        impl PreflightChecks for SlowRbac {
+            async fn check_reachability(&self) -> Result<()> { Ok(()) }
+            async fn check_token_valid(&self) -> Result<()> { Ok(()) }
+            async fn check_namespace_exists(&self, _ns: &str) -> Result<()> { Ok(()) }
+            async fn check_rbac(&self, _ns: &str) -> Result<()> {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(())
+            }
+        }
+        let mut t = fast();
+        t.preflight = Duration::from_millis(30);
+        match run(&SlowRbac, "nico", &t).await {
+            Outcome::Failed(f) => {
+                assert_eq!(f.step, Step::Rbac);
+                assert!(f.timed_out);
+            }
+            Outcome::Ok => panic!("expected failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_timeout_failure_has_timed_out_false() {
+        let mock = MockChecks { rbac: Some("nope"), ..MockChecks::all_ok() };
+        match run(&mock, "nico", &fast()).await {
+            Outcome::Failed(f) => {
+                assert_eq!(f.step, Step::Rbac);
+                assert!(!f.timed_out);
+            }
+            Outcome::Ok => panic!("expected failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_json_contains_preflight_section_with_timed_out_flag() {
         let failure = Failure {
             step: Step::NamespaceExists,
             message: "namespace 'nico' not found".to_string(),
             next_command: "kubectl get ns nico".to_string(),
+            timed_out: false,
         };
         let json_str = format_failure_json(&failure, "nico");
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
@@ -320,5 +412,6 @@ mod tests {
         assert_eq!(json["preflight"]["failed_step"], "namespace_exists");
         assert_eq!(json["preflight"]["next_command"], "kubectl get ns nico");
         assert_eq!(json["preflight"]["message"], "namespace 'nico' not found");
+        assert_eq!(json["preflight"]["timed_out"], false);
     }
 }

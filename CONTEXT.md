@@ -49,14 +49,29 @@ every output line points at where to dig deeper.
   `Skipped` (the layer sat out — `--skip` flag or layer not enabled). The
   default `Layer::run` impl maps a `LayerOutcome` to a `LayerResult` and
   handles timing.
-- **Pre-flight check** (nico-doctor specific) — a serial check that runs
-  before all Layers. If a pre-flight check fails the tool exits immediately
-  with code 3 (can't-run); the diagnostic ladder never starts. Pre-flight
-  checks are not skippable. Auth pre-flight runs four sub-checks in dependency
-  order — reachability → token expiry → namespace exists → RBAC — and
-  short-circuits at the first failure. Each failure message includes the next
-  command for the operator to run. Running RBAC checks against an unreachable
-  apiserver is vacuous; the chain ensures each sub-check's preconditions are met.
+- **Pre-flight check** (nico-doctor specific) — a check that runs before
+  all Layers as part of the **Boot probe**. If pre-flight fails the tool
+  exits immediately with code 3 (can't-run); the diagnostic ladder never
+  starts. Pre-flight checks are not skippable. Auth pre-flight runs four
+  sub-checks: reachability is a sequential gate; if reachability passes,
+  the remaining three (token expiry, namespace exists, list-pods RBAC)
+  run in parallel and are **fail-aware** — siblings that are already in
+  flight when one fails are allowed to complete, so the user sees all
+  diagnostic results in one boot. Each failure message includes the next
+  command for the operator to run. Running other checks against an
+  unreachable apiserver is vacuous; the reachability gate ensures
+  preconditions are met before fan-out. See ADR-0013 for the broader
+  Boot probe design.
+- **Boot probe** — the unified, multi-line, themed status visualization
+  for all bootstrap I/O between `nico` starting and the TUI being entered
+  (or the error card printing on failure). Owns three sections in
+  topological order: `connecting` (kubeconfig load + reachability gate),
+  `validating` (the four pre-flight auth checks), and `serving`
+  (per-service port-forwards + postgres reachability). After the
+  reachability gate, `validating` and `serving` run concurrently with
+  each other, with parallel fail-aware semantics within each section.
+  Replaces the previous behavior of a `nico: reach mode: …` line followed
+  by a blinking cursor for up to ~20s. See ADR-0013.
 - **Finding** — a single warning or failure produced by a layer.
 - **Baseline** (nico-doctor specific) — the Layer-level status snapshot persisted from the most recent completed run (`~/.local/share/nico-doctor/last-run.json`). Keyed by layer name; value is the aggregate status (ok / warn / fail / unknown / skipped). Written only on exit codes 0, 1, or 2 (diagnostic ladder completed). Exit code 3 (can't-run) leaves the existing baseline untouched — a failed auth pre-flight must not overwrite a good baseline with an empty record.
 - **Delta** (nico-doctor specific) — the per-layer comparison between the current run and the Baseline. Three states: `new` (layer was ok/skipped last run, now warn/fail), `fixed` (layer was warn/fail last run, now ok/skipped), `unchanged`. Computed at Layer granularity, not Finding granularity — dynamic Finding text (pod names, timestamps) makes Finding-level identity brittle. Interaction rule: `--spotlight` hides ok/skipped layers, but layers carrying a `new` or `fixed` Delta badge are always shown regardless of `--spotlight` — delta signal takes priority over spotlight suppression.

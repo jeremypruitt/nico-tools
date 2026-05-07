@@ -48,4 +48,10 @@ pub struct CorrelateArgs {
     /// Reach mode: port-forward or in-cluster (default: auto-detect from KUBERNETES_SERVICE_HOST)
     #[arg(long, value_name = "MODE")]
     pub mode: Option<String>,
+
+    /// Override bootstrap-step timeout budgets.
+    /// Steps: kube_client, reach_api, preflight, port_forward, postgres_reach.
+    /// Example: --timeouts kube_client=10s,port_forward=2s
+    #[arg(long, value_name = "step=Xs,...")]
+    pub timeouts: Option<String>,
 }

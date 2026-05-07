@@ -8,6 +8,77 @@ pub struct Config {
     pub postgres: PostgresConfig,
     pub temporal: TemporalConfig,
     pub output: OutputConfig,
+    pub bootstrap: BootstrapConfig,
+}
+
+pub struct BootstrapConfig {
+    pub timeouts: BootstrapTimeouts,
+}
+
+/// Per-step timeout budgets for every awaitable operation in the nico
+/// bootstrap path (see ADR-0013 and issue #171). Each duration is a hard
+/// upper bound; exceeding it surfaces a `TimedOut` error distinguishable
+/// from a non-timeout failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapTimeouts {
+    /// Building `kube::Client` from kubeconfig.
+    pub kube_client: Duration,
+    /// API-server reachability probe (`apiserver_version()`).
+    pub reach_api: Duration,
+    /// Each preflight sub-check (token, namespace, RBAC).
+    pub preflight: Duration,
+    /// Each port-forward setup (Temporal, Postgres, Loki, HTTP discovery).
+    pub port_forward: Duration,
+    /// Postgres reachability probe (TCP connect + handshake).
+    pub postgres_reach: Duration,
+}
+
+impl Default for BootstrapTimeouts {
+    fn default() -> Self {
+        Self {
+            kube_client: Duration::from_secs(5),
+            reach_api: Duration::from_secs(5),
+            preflight: Duration::from_secs(5),
+            port_forward: Duration::from_secs(3),
+            postgres_reach: Duration::from_secs(2),
+        }
+    }
+}
+
+impl BootstrapTimeouts {
+    /// Apply a comma-separated list of `step=duration` overrides on top
+    /// of `self`. Recognized step names: `kube_client`, `reach_api`,
+    /// `preflight`, `port_forward`, `postgres_reach`.
+    pub fn apply_overrides(&mut self, spec: &str) -> Result<()> {
+        for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (key, val) = entry.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid timeouts entry {entry:?}; expected step=duration"
+                )
+            })?;
+            let dur = humantime::parse_duration(val.trim())
+                .with_context(|| format!("invalid duration in {entry:?}"))?;
+            self.set_step(key.trim(), dur)?;
+        }
+        Ok(())
+    }
+
+    fn set_step(&mut self, name: &str, dur: Duration) -> Result<()> {
+        match name {
+            "kube_client" => self.kube_client = dur,
+            "reach_api" => self.reach_api = dur,
+            "preflight" => self.preflight = dur,
+            "port_forward" => self.port_forward = dur,
+            "postgres_reach" => self.postgres_reach = dur,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unknown bootstrap timeout step {other:?}; \
+                     valid: kube_client, reach_api, preflight, port_forward, postgres_reach"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct ClusterConfig {
@@ -81,6 +152,8 @@ pub struct ConfigOverrides {
     pub format: Option<OutputFormat>,
     pub reach_mode: Option<ReachMode>,
     pub tui_refresh: Option<Duration>,
+    /// CLI `--timeouts step=Xs,...` spec, applied last (highest precedence).
+    pub bootstrap_timeouts_spec: Option<String>,
 }
 
 /// Intermediate deserialization shape — all fields optional so missing fields fall back to defaults.
@@ -90,6 +163,21 @@ struct FileConfig {
     postgres: Option<FilePostgresConfig>,
     temporal: Option<FileTemporalConfig>,
     output: Option<FileOutputConfig>,
+    bootstrap: Option<FileBootstrapConfig>,
+}
+
+#[derive(Deserialize, Default)]
+struct FileBootstrapConfig {
+    timeouts: Option<FileBootstrapTimeouts>,
+}
+
+#[derive(Deserialize, Default)]
+struct FileBootstrapTimeouts {
+    kube_client: Option<String>,
+    reach_api: Option<String>,
+    preflight: Option<String>,
+    port_forward: Option<String>,
+    postgres_reach: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -135,6 +223,7 @@ impl Config {
         let postgres = file.postgres.unwrap_or_default();
         let temporal = file.temporal.unwrap_or_default();
         let output = file.output.unwrap_or_default();
+        let bootstrap_file = file.bootstrap.unwrap_or_default();
 
         // Env var layer — overrides file values
         let context = env.get("NICO_CONTEXT").cloned().or(cluster.context);
@@ -193,6 +282,41 @@ impl Config {
 
         let grpc_address = env.get("NICO_GRPC_ADDRESS").cloned().or(cluster.grpc_address);
 
+        // Bootstrap timeouts — defaults < file < env < CLI override spec.
+        let mut timeouts = BootstrapTimeouts::default();
+        let file_t = bootstrap_file.timeouts.unwrap_or_default();
+        for (name, val) in [
+            ("kube_client", file_t.kube_client),
+            ("reach_api", file_t.reach_api),
+            ("preflight", file_t.preflight),
+            ("port_forward", file_t.port_forward),
+            ("postgres_reach", file_t.postgres_reach),
+        ] {
+            if let Some(s) = val {
+                let dur = humantime::parse_duration(&s).with_context(|| {
+                    format!("invalid bootstrap.timeouts.{name} = {s:?}")
+                })?;
+                timeouts.set_step(name, dur)?;
+            }
+        }
+        for (name, env_key) in [
+            ("kube_client", "NICO_TIMEOUT_KUBE_CLIENT"),
+            ("reach_api", "NICO_TIMEOUT_REACH_API"),
+            ("preflight", "NICO_TIMEOUT_PREFLIGHT"),
+            ("port_forward", "NICO_TIMEOUT_PORT_FORWARD"),
+            ("postgres_reach", "NICO_TIMEOUT_POSTGRES_REACH"),
+        ] {
+            if let Some(s) = env.get(env_key) {
+                let dur = humantime::parse_duration(s).with_context(|| {
+                    format!("invalid {env_key} = {s:?}")
+                })?;
+                timeouts.set_step(name, dur)?;
+            }
+        }
+        if let Some(spec) = overrides.bootstrap_timeouts_spec.as_deref() {
+            timeouts.apply_overrides(spec)?;
+        }
+
         // Flag override layer — highest precedence
         let context = overrides.context.clone().or(context);
         let namespace = overrides.namespace.clone().unwrap_or(namespace);
@@ -214,6 +338,7 @@ impl Config {
                 stuck_threshold,
             },
             output: OutputConfig { color, format, tui_refresh },
+            bootstrap: BootstrapConfig { timeouts },
         })
     }
 }
@@ -414,6 +539,76 @@ url = "postgres://prod:secret@db:5432/prod"
         env.insert("NICO_POSTGRES_NAMESPACE".to_string(), "from-env".to_string());
         let config = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
         assert_eq!(config.cluster.postgres_namespace, "from-env");
+    }
+
+    #[test]
+    fn bootstrap_timeouts_defaults_match_adr_0013_table() {
+        let t = BootstrapTimeouts::default();
+        assert_eq!(t.kube_client, Duration::from_secs(5));
+        assert_eq!(t.reach_api, Duration::from_secs(5));
+        assert_eq!(t.preflight, Duration::from_secs(5));
+        assert_eq!(t.port_forward, Duration::from_secs(3));
+        assert_eq!(t.postgres_reach, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bootstrap_timeouts_loaded_from_file() {
+        let toml = r#"
+[bootstrap.timeouts]
+kube_client = "9s"
+preflight = "2s"
+port_forward = "1s"
+"#;
+        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(cfg.bootstrap.timeouts.kube_client, Duration::from_secs(9));
+        assert_eq!(cfg.bootstrap.timeouts.preflight, Duration::from_secs(2));
+        assert_eq!(cfg.bootstrap.timeouts.port_forward, Duration::from_secs(1));
+        // unspecified fields keep defaults
+        assert_eq!(cfg.bootstrap.timeouts.reach_api, Duration::from_secs(5));
+        assert_eq!(cfg.bootstrap.timeouts.postgres_reach, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bootstrap_timeouts_env_overrides_file() {
+        let toml = "[bootstrap.timeouts]\npreflight = \"7s\"";
+        let mut env = HashMap::new();
+        env.insert("NICO_TIMEOUT_PREFLIGHT".to_string(), "1s".to_string());
+        let cfg = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(cfg.bootstrap.timeouts.preflight, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bootstrap_timeouts_cli_spec_overrides_env_and_file() {
+        let toml = "[bootstrap.timeouts]\npreflight = \"7s\"";
+        let mut env = HashMap::new();
+        env.insert("NICO_TIMEOUT_PREFLIGHT".to_string(), "6s".to_string());
+        let overrides = ConfigOverrides {
+            bootstrap_timeouts_spec: Some("preflight=500ms,port_forward=250ms".to_string()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &env, &overrides).unwrap();
+        assert_eq!(cfg.bootstrap.timeouts.preflight, Duration::from_millis(500));
+        assert_eq!(cfg.bootstrap.timeouts.port_forward, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn bootstrap_timeouts_unknown_step_in_spec_errors() {
+        let overrides = ConfigOverrides {
+            bootstrap_timeouts_spec: Some("nonsense=1s".to_string()),
+            ..Default::default()
+        };
+        let err = Config::load(None, &HashMap::new(), &overrides).err().expect("expected err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nonsense"), "msg = {msg}");
+    }
+
+    #[test]
+    fn bootstrap_timeouts_invalid_duration_in_spec_errors() {
+        let overrides = ConfigOverrides {
+            bootstrap_timeouts_spec: Some("preflight=NOTADURATION".to_string()),
+            ..Default::default()
+        };
+        assert!(Config::load(None, &HashMap::new(), &overrides).is_err());
     }
 
     #[test]

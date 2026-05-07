@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::{Api, Client};
@@ -5,6 +7,7 @@ use kube::api::ListParams;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
 
+use crate::bootstrap::{run_with_budget, BootstrapStepError};
 use crate::config::ReachMode;
 
 /// A live port-forward endpoint backed by a local TCP listener.
@@ -42,17 +45,25 @@ impl ReachManager {
     /// Resolve the Temporal gRPC address (`host:port`).
     ///
     /// Returns the address and, in port-forward mode, a guard that keeps the
-    /// forward alive for the duration of the tool run.
-    pub async fn temporal_address(&self) -> Result<(String, Option<ForwardedEndpoint>)> {
+    /// forward alive for the duration of the tool run. The port-forward
+    /// setup is bounded by `budget`; exceeding it surfaces
+    /// `BootstrapStepError::TimedOut(budget)`.
+    pub async fn temporal_address(
+        &self,
+        budget: Duration,
+    ) -> Result<(String, Option<ForwardedEndpoint>), BootstrapStepError> {
         match self.mode {
             ReachMode::InCluster => {
                 let addr = format!("temporal-frontend.{}.svc.cluster.local:7233", self.namespace);
                 Ok((addr, None))
             }
             ReachMode::PortForward => {
-                let ep = self.forward_by_port(7233, &self.namespace.clone())
-                    .await
-                    .context("port-forward for Temporal gRPC (port 7233)")?;
+                let ns = self.namespace.clone();
+                let ep = run_with_budget(budget, async {
+                    self.forward_by_port(7233, &ns)
+                        .await
+                        .context("port-forward for Temporal gRPC (port 7233)")
+                }).await?;
                 Ok((format!("localhost:{}", ep.local_port), Some(ep)))
             }
         }
@@ -61,8 +72,13 @@ impl ReachManager {
     /// Resolve the Postgres DSN.
     ///
     /// Credentials come from `base_url`; only host:port is replaced so that
-    /// config-supplied user/password/dbname flow through unchanged.
-    pub async fn postgres_url(&self, base_url: &str) -> Result<(String, Option<ForwardedEndpoint>)> {
+    /// config-supplied user/password/dbname flow through unchanged. The
+    /// port-forward setup is bounded by `budget`.
+    pub async fn postgres_url(
+        &self,
+        base_url: &str,
+        budget: Duration,
+    ) -> Result<(String, Option<ForwardedEndpoint>), BootstrapStepError> {
         match self.mode {
             ReachMode::InCluster => {
                 let host = format!("postgresql.{}.svc.cluster.local", self.postgres_namespace);
@@ -70,26 +86,35 @@ impl ReachManager {
                 Ok((url, None))
             }
             ReachMode::PortForward => {
-                let ep = self.forward_by_port(5432, &self.postgres_namespace.clone())
-                    .await
-                    .context("port-forward for Postgres (port 5432)")?;
+                let ns = self.postgres_namespace.clone();
+                let ep = run_with_budget(budget, async {
+                    self.forward_by_port(5432, &ns)
+                        .await
+                        .context("port-forward for Postgres (port 5432)")
+                }).await?;
                 let url = replace_pg_host(base_url, "localhost", ep.local_port)?;
                 Ok((url, Some(ep)))
             }
         }
     }
 
-    /// Resolve the Loki base URL.
-    pub async fn loki_url(&self) -> Result<(String, Option<ForwardedEndpoint>)> {
+    /// Resolve the Loki base URL. Port-forward setup is bounded by `budget`.
+    pub async fn loki_url(
+        &self,
+        budget: Duration,
+    ) -> Result<(String, Option<ForwardedEndpoint>), BootstrapStepError> {
         match self.mode {
             ReachMode::InCluster => {
                 let url = format!("http://loki.{}.svc.cluster.local:3100", self.namespace);
                 Ok((url, None))
             }
             ReachMode::PortForward => {
-                let ep = self.forward_by_port(3100, &self.namespace.clone())
-                    .await
-                    .context("port-forward for Loki (port 3100)")?;
+                let ns = self.namespace.clone();
+                let ep = run_with_budget(budget, async {
+                    self.forward_by_port(3100, &ns)
+                        .await
+                        .context("port-forward for Loki (port 3100)")
+                }).await?;
                 Ok((format!("http://localhost:{}", ep.local_port), Some(ep)))
             }
         }
@@ -97,11 +122,14 @@ impl ReachManager {
 
     /// Discover HTTP application services and return `(name, base_url)` pairs.
     ///
-    /// In port-forward mode a `ForwardedEndpoint` guard is returned per service.
-    /// Services are identified by having a port in [80, 8080, 8443, 443] or a
-    /// port named `http`/`web`.  Well-known non-HTTP ports (5432, 7233, 3100)
-    /// are excluded.
-    pub async fn http_endpoints(&self) -> Result<(Vec<(String, String)>, Vec<ForwardedEndpoint>)> {
+    /// In port-forward mode a `ForwardedEndpoint` guard is returned per
+    /// service; each individual port-forward is bounded by `budget`. A
+    /// timed-out PF is logged as a warning and the service is skipped —
+    /// matching the prior best-effort behaviour for non-timeout errors.
+    pub async fn http_endpoints(
+        &self,
+        budget: Duration,
+    ) -> Result<(Vec<(String, String)>, Vec<ForwardedEndpoint>)> {
         let svcs = self.discover_http_services().await?;
         let mut endpoints = vec![];
         let mut guards = vec![];
@@ -116,7 +144,11 @@ impl ReachManager {
                     endpoints.push((name, url));
                 }
                 ReachMode::PortForward => {
-                    match self.forward_service_port(&name, port, &self.namespace.clone()).await {
+                    let ns = self.namespace.clone();
+                    let result = run_with_budget(budget, async {
+                        self.forward_service_port(&name, port, &ns).await
+                    }).await;
+                    match result {
                         Ok(ep) => {
                             let url = format!("http://localhost:{}", ep.local_port);
                             endpoints.push((name, url));
