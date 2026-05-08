@@ -365,8 +365,9 @@ async fn run_correlate_collect(workflow_id: &str) -> (Vec<PopoverEvent>, Vec<Sou
         }
     };
     let prepared = nico_correlate::prepare_sources(&args, &cfg).await;
+    let id_str = args.id.clone().unwrap_or_default();
     let results =
-        nico_correlate::collect_all(&prepared.named_sources, &args.id, &cfg.id_type).await;
+        nico_correlate::collect_all(&prepared.named_sources, &id_str, &cfg.id_type).await;
     drop(prepared._pf_guards);
 
     let mut events: Vec<PopoverEvent> = Vec::new();
@@ -406,7 +407,8 @@ fn severity_to_popover(s: &nico_correlate::event::Severity) -> PopoverSeverity {
 
 fn correlate_args(workflow_id: &str) -> nico_correlate::CorrelateArgs {
     nico_correlate::CorrelateArgs {
-        id: workflow_id.to_string(),
+        command: None,
+        id: Some(workflow_id.to_string()),
         r#type: Some("workflow".to_string()),
         sources: vec![],
         pod: None,
@@ -418,6 +420,7 @@ fn correlate_args(workflow_id: &str) -> nico_correlate::CorrelateArgs {
         theme: None,
         config: None,
         mode: None,
+        postgres_url: None,
         timeouts: None,
     }
 }

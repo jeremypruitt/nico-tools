@@ -128,6 +128,16 @@ pub fn resolve_config(args: &CorrelateArgs) -> Result<CorrelateConfig, Bootstrap
         .filter(|name| !restricted_names.contains(name))
         .collect();
 
+    let id_str = match args.id.as_deref() {
+        Some(s) => s,
+        None => {
+            return Err(BootstrapErr::Fatal {
+                message: "error: missing entity ID; usage: nico correlate <id> [or a subcommand]".into(),
+                code: 2,
+            });
+        }
+    };
+
     let id_type = if let Some(ref t) = args.r#type {
         match IdType::from_cli_name(t) {
             Some(it) => it,
@@ -139,13 +149,12 @@ pub fn resolve_config(args: &CorrelateArgs) -> Result<CorrelateConfig, Bootstrap
             }
         }
     } else {
-        match crate::id::detect_id_type(&args.id) {
+        match crate::id::detect_id_type(id_str) {
             Some(it) => it,
             None => {
                 return Err(BootstrapErr::Fatal {
                     message: format!(
-                        "error: could not detect ID type for {:?}\nHint: re-run with --type workflow|host|dpu|request",
-                        args.id
+                        "error: could not detect ID type for {id_str:?}\nHint: re-run with --type workflow|host|dpu|request"
                     ),
                     code: 1,
                 });
