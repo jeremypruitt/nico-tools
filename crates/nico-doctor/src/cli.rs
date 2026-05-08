@@ -66,8 +66,8 @@ pub struct DoctorArgs {
 
 /// Optional subcommand under `nico doctor`. When absent, doctor runs the
 /// full multi-layer ladder (cluster, logs, workflows, health, grpc,
-/// postgres). When present, doctor runs the focused single-target check
-/// the subcommand specifies.
+/// postgres, dpu). When present, doctor runs the focused single-target
+/// check the subcommand specifies.
 #[derive(Subcommand, Debug, Clone)]
 pub enum DoctorCommand {
     /// Single-DPU HBN (Host-Based Networking) verdict (issue #205).

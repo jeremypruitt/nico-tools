@@ -11,6 +11,7 @@ use nico_common::output::OutputMode;
 use nico_common::reach::ReachManager;
 
 use crate::cli::DoctorArgs;
+use crate::dpu::DpuConfig;
 use crate::layer::{self, Layer, RunOpts};
 use crate::layers;
 use crate::log_collector::LogCollectorStage;
@@ -31,6 +32,7 @@ const LAYER_REGISTRY: &[(&str, LayerFactory)] = &[
     (layers::health::NAME, layers::health::register),
     (layers::grpc::NAME, layers::grpc::register),
     (layers::postgres::NAME, layers::postgres::register),
+    (layers::dpu::NAME, layers::dpu::register),
 ];
 
 struct Unavailable {
@@ -121,6 +123,7 @@ pub struct LayerInputs {
     pub grpc_address: Option<String>,
     pub reach_mgr_present: bool,
     pub skip: Vec<String>,
+    pub dpu_config: DpuConfig,
 }
 
 /// Build the best-effort log source chain (Loki preferred, k8s fallback)
@@ -338,6 +341,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         grpc_address: config.cluster.grpc_address.clone(),
         reach_mgr_present: reach_mgr.is_some(),
         skip: args.skip.clone(),
+        dpu_config: config.dpu,
     };
 
     let log_source = build_log_source(&inputs);
@@ -826,6 +830,7 @@ mod tests {
             grpc_address: None,
             reach_mgr_present: false,
             skip: vec![],
+            dpu_config: DpuConfig::default(),
         }
     }
 
@@ -835,19 +840,19 @@ mod tests {
         let names: Vec<&str> = layers.iter().map(|l| l.name()).collect();
         assert_eq!(
             names,
-            vec!["cluster", "logs", "workflows", "health", "grpc", "postgres"]
+            vec!["cluster", "logs", "workflows", "health", "grpc", "postgres", "dpu"]
         );
     }
 
     #[tokio::test]
     async fn prepare_layers_honours_skip_at_any_position() {
         let mut inputs = empty_inputs();
-        inputs.skip = vec!["workflows".to_string(), "postgres".to_string()];
+        inputs.skip = vec!["workflows".to_string(), "dpu".to_string()];
         let layers = prepare_layers(&inputs);
         let names: Vec<&str> = layers.iter().map(|l| l.name()).collect();
         assert_eq!(
             names,
-            vec!["cluster", "logs", "workflows", "health", "grpc", "postgres"]
+            vec!["cluster", "logs", "workflows", "health", "grpc", "postgres", "dpu"]
         );
     }
 }

@@ -17,7 +17,7 @@ struct Cli {
 enum Command {
     /// Live ops dashboard.
     Ops(nico_ops::OpsArgs),
-    /// Read-only health check across cluster, logs, workflows, gRPC, postgres.
+    /// Read-only health check across cluster, logs, workflows, health, gRPC, postgres, dpu.
     Doctor(nico_doctor::DoctorArgs),
     /// Correlate every event for a given entity ID across all sources.
     Correlate(nico_correlate::CorrelateArgs),

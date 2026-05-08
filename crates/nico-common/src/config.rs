@@ -9,6 +9,40 @@ pub struct Config {
     pub temporal: TemporalConfig,
     pub output: OutputConfig,
     pub bootstrap: BootstrapConfig,
+    pub dpu: DpuConfig,
+}
+
+/// Thresholds for the seven-layer doctor's `dpu` sub-checks
+/// (issue #214). Each field is separately overridable from `[dpu]` in
+/// `config.toml` (or via `NICO_DPU_*` env vars) so operators can tune
+/// fleet-specific noise floors.
+#[derive(Debug, Clone, Copy)]
+pub struct DpuConfig {
+    pub drift_managed_host_warn: Duration,
+    pub drift_managed_host_fail: Duration,
+    pub drift_instance_warn: Duration,
+    pub drift_instance_fail: Duration,
+    pub cert_warn: Duration,
+    pub cert_fail: Duration,
+    pub lost_connection_warn: Duration,
+    pub lost_connection_fail_age: Duration,
+    pub lost_connection_fail_pct: f64,
+}
+
+impl Default for DpuConfig {
+    fn default() -> Self {
+        Self {
+            drift_managed_host_warn: Duration::from_secs(15 * 60),
+            drift_managed_host_fail: Duration::from_secs(60 * 60),
+            drift_instance_warn: Duration::from_secs(2 * 60),
+            drift_instance_fail: Duration::from_secs(30 * 60),
+            cert_warn: Duration::from_secs(30 * 24 * 60 * 60),
+            cert_fail: Duration::from_secs(7 * 24 * 60 * 60),
+            lost_connection_warn: Duration::from_secs(5 * 60),
+            lost_connection_fail_age: Duration::from_secs(30 * 60),
+            lost_connection_fail_pct: 0.05,
+        }
+    }
 }
 
 pub struct BootstrapConfig {
@@ -164,6 +198,20 @@ struct FileConfig {
     temporal: Option<FileTemporalConfig>,
     output: Option<FileOutputConfig>,
     bootstrap: Option<FileBootstrapConfig>,
+    dpu: Option<FileDpuConfig>,
+}
+
+#[derive(Deserialize, Default)]
+struct FileDpuConfig {
+    drift_managed_host_warn: Option<String>,
+    drift_managed_host_fail: Option<String>,
+    drift_instance_warn: Option<String>,
+    drift_instance_fail: Option<String>,
+    cert_warn: Option<String>,
+    cert_fail: Option<String>,
+    lost_connection_warn: Option<String>,
+    lost_connection_fail_age: Option<String>,
+    lost_connection_fail_pct: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -224,6 +272,7 @@ impl Config {
         let temporal = file.temporal.unwrap_or_default();
         let output = file.output.unwrap_or_default();
         let bootstrap_file = file.bootstrap.unwrap_or_default();
+        let dpu_file = file.dpu.unwrap_or_default();
 
         // Env var layer — overrides file values
         let context = env.get("NICO_CONTEXT").cloned().or(cluster.context);
@@ -317,6 +366,49 @@ impl Config {
             timeouts.apply_overrides(spec)?;
         }
 
+        // [dpu] block — file < env. Only known step names are honored.
+        let mut dpu = DpuConfig::default();
+        for (name, val) in [
+            ("drift_managed_host_warn", dpu_file.drift_managed_host_warn),
+            ("drift_managed_host_fail", dpu_file.drift_managed_host_fail),
+            ("drift_instance_warn", dpu_file.drift_instance_warn),
+            ("drift_instance_fail", dpu_file.drift_instance_fail),
+            ("cert_warn", dpu_file.cert_warn),
+            ("cert_fail", dpu_file.cert_fail),
+            ("lost_connection_warn", dpu_file.lost_connection_warn),
+            ("lost_connection_fail_age", dpu_file.lost_connection_fail_age),
+        ] {
+            if let Some(s) = val {
+                let d = humantime::parse_duration(&s)
+                    .with_context(|| format!("invalid dpu.{name} = {s:?}"))?;
+                dpu.set_duration(name, d);
+            }
+        }
+        if let Some(pct) = dpu_file.lost_connection_fail_pct {
+            dpu.lost_connection_fail_pct = pct;
+        }
+        for (name, env_key) in [
+            ("drift_managed_host_warn", "NICO_DPU_DRIFT_MANAGED_HOST_WARN"),
+            ("drift_managed_host_fail", "NICO_DPU_DRIFT_MANAGED_HOST_FAIL"),
+            ("drift_instance_warn", "NICO_DPU_DRIFT_INSTANCE_WARN"),
+            ("drift_instance_fail", "NICO_DPU_DRIFT_INSTANCE_FAIL"),
+            ("cert_warn", "NICO_DPU_CERT_WARN"),
+            ("cert_fail", "NICO_DPU_CERT_FAIL"),
+            ("lost_connection_warn", "NICO_DPU_LOST_CONNECTION_WARN"),
+            ("lost_connection_fail_age", "NICO_DPU_LOST_CONNECTION_FAIL_AGE"),
+        ] {
+            if let Some(s) = env.get(env_key) {
+                let d = humantime::parse_duration(s)
+                    .with_context(|| format!("invalid {env_key} = {s:?}"))?;
+                dpu.set_duration(name, d);
+            }
+        }
+        if let Some(s) = env.get("NICO_DPU_LOST_CONNECTION_FAIL_PCT") {
+            dpu.lost_connection_fail_pct = s
+                .parse::<f64>()
+                .with_context(|| format!("invalid NICO_DPU_LOST_CONNECTION_FAIL_PCT = {s:?}"))?;
+        }
+
         // Flag override layer — highest precedence
         let context = overrides.context.clone().or(context);
         let namespace = overrides.namespace.clone().unwrap_or(namespace);
@@ -339,7 +431,24 @@ impl Config {
             },
             output: OutputConfig { color, format, tui_refresh },
             bootstrap: BootstrapConfig { timeouts },
+            dpu,
         })
+    }
+}
+
+impl DpuConfig {
+    fn set_duration(&mut self, name: &str, d: Duration) {
+        match name {
+            "drift_managed_host_warn" => self.drift_managed_host_warn = d,
+            "drift_managed_host_fail" => self.drift_managed_host_fail = d,
+            "drift_instance_warn" => self.drift_instance_warn = d,
+            "drift_instance_fail" => self.drift_instance_fail = d,
+            "cert_warn" => self.cert_warn = d,
+            "cert_fail" => self.cert_fail = d,
+            "lost_connection_warn" => self.lost_connection_warn = d,
+            "lost_connection_fail_age" => self.lost_connection_fail_age = d,
+            _ => unreachable!("unknown dpu duration field {name}"),
+        }
     }
 }
 
