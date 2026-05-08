@@ -33,3 +33,24 @@ fn no_subcommand_defaults_to_ops() {
         .code(3)
         .stderr(predicate::str::contains("interactive terminal"));
 }
+
+#[test]
+fn correlate_hbn_config_drift_help_lists_machine_id() {
+    Command::cargo_bin("nico")
+        .unwrap()
+        .args(["correlate", "hbn-config-drift", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MACHINE_ID"))
+        .stdout(predicate::str::contains("freshness"));
+}
+
+#[test]
+fn correlate_help_lists_hbn_config_drift_subcommand() {
+    Command::cargo_bin("nico")
+        .unwrap()
+        .args(["correlate", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hbn-config-drift"));
+}

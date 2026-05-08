@@ -19,6 +19,7 @@ temporal-sdk-core-protos = "0.1"
 tonic = { version = "0.13", default-features = false, features = ["channel", "codegen"] }
 prost-wkt-types = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+humantime = "2"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
