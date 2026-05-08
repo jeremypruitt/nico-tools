@@ -8,6 +8,7 @@ use nico_common::theme;
 pub mod baseline;
 pub mod bootstrap;
 pub mod cli;
+pub mod dpu;
 pub mod dpu_cert;
 pub mod dpu_isolation;
 pub mod formatter;
