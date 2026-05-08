@@ -3,10 +3,22 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nico_common::output::Status;
-use nico_common::temporal::TemporalClient;
+use nico_common::temporal::{GrpcTemporalClient, TemporalClient};
 use temporal_sdk_core_protos::temporal::api::workflow::v1::WorkflowExecutionInfo;
 
+use crate::bootstrap::LayerInputs;
 use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
+
+pub const NAME: &str = "workflows";
+
+/// Factory consumed by `bootstrap::prepare_layers`.
+pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
+    Box::new(WorkflowsLayer::new(
+        Arc::new(GrpcTemporalClient::new(inputs.temporal_address.clone())),
+        inputs.temporal_namespace.clone(),
+        inputs.stuck_threshold,
+    ))
+}
 
 /// Doctor's view of a running workflow that has exceeded the stuck
 /// threshold. Built from a `WorkflowExecutionInfo` returned by the

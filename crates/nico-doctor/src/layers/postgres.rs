@@ -1,8 +1,25 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use nico_common::output::Status;
-use crate::postgres::{LockWait, PoolStats, PostgresClient};
-use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
+use crate::bootstrap::LayerInputs;
+use crate::postgres::{LockWait, PoolStats, PostgresClient, SqlxPostgresClient};
+use crate::layer::{self, Check, CheckKind, Layer, LayerOutcome, RunOpts};
+
+pub const NAME: &str = "postgres";
+
+/// Factory consumed by `bootstrap::prepare_layers`.
+pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
+    match SqlxPostgresClient::new(&inputs.postgres_url) {
+        Ok(pg) => Box::new(PostgresLayer::new(Arc::new(pg))),
+        Err(e) => {
+            eprintln!("warning: postgres URL invalid: {e}");
+            eprintln!(
+                "  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url"
+            );
+            layer::UnconfiguredLayer::new(NAME, "invalid postgres URL")
+        }
+    }
+}
 
 const POOL_WARN_RATIO: f64 = 0.90;
 const LOCK_WARN_SECS: f64 = 5.0;

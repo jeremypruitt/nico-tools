@@ -1,8 +1,22 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use nico_common::output::Status;
-use crate::grpc::{GrpcInspectResult, GrpcInspector};
-use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
+use crate::bootstrap::LayerInputs;
+use crate::grpc::{GrpcInspectResult, GrpcInspector, TonicGrpcInspector};
+use crate::layer::{self, Check, CheckKind, Layer, LayerOutcome, RunOpts};
+
+pub const NAME: &str = "grpc";
+
+/// Factory consumed by `bootstrap::prepare_layers`.
+pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
+    match inputs.grpc_address.clone() {
+        Some(addr) => Box::new(GrpcLayer::new(Arc::new(TonicGrpcInspector), addr)),
+        None => layer::UnconfiguredLayer::new(
+            NAME,
+            "set NICO_GRPC_ADDRESS or cluster.grpc_address in config to enable",
+        ),
+    }
+}
 
 pub struct GrpcLayer {
     inspector: Arc<dyn GrpcInspector>,

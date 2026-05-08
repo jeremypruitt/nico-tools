@@ -1,8 +1,31 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use nico_common::output::Status;
-use crate::http::{HttpClient, ServiceEndpoint};
-use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
+use crate::bootstrap::LayerInputs;
+use crate::http::{HttpClient, ReqwestHttpClient, ServiceEndpoint};
+use crate::layer::{self, Check, CheckKind, Layer, LayerOutcome, RunOpts};
+
+pub const NAME: &str = "health";
+
+/// Factory consumed by `bootstrap::prepare_layers`.
+pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
+    match inputs.http_endpoints.as_ref() {
+        Some(endpoints) if !endpoints.is_empty() => Box::new(HealthLayer::new(
+            Arc::new(ReqwestHttpClient::new()),
+            endpoints.clone(),
+        )),
+        _ => {
+            if inputs.reach_mgr_present {
+                layer::SkippedLayer::new(NAME)
+            } else {
+                layer::UnconfiguredLayer::new(
+                    NAME,
+                    "set NICO_HEALTH_ENDPOINTS=name=http://host:port to enable",
+                )
+            }
+        }
+    }
+}
 
 enum ProbeOutcome { Healthy, Degraded, Failed }
 

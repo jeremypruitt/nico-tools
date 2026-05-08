@@ -17,12 +17,21 @@ use crate::log_collector::LogCollectorStage;
 use crate::log_source;
 use crate::loki;
 use crate::http;
-use crate::grpc;
-use crate::postgres;
 use crate::preflight;
 use crate::preflight::PreflightChecks;
 
-const LAYER_ORDER: &[&str] = &["cluster", "logs", "workflows", "health", "grpc", "postgres"];
+/// Registry of layer factories, in canonical run order. Adding a new
+/// layer is a single-line edit here plus a `register` fn in the new
+/// module.
+type LayerFactory = fn(&LayerInputs) -> Box<dyn Layer>;
+const LAYER_REGISTRY: &[(&str, LayerFactory)] = &[
+    (layers::cluster::NAME, layers::cluster::register),
+    (layers::logs::NAME, layers::logs::register),
+    (layers::workflows::NAME, layers::workflows::register),
+    (layers::health::NAME, layers::health::register),
+    (layers::grpc::NAME, layers::grpc::register),
+    (layers::postgres::NAME, layers::postgres::register),
+];
 
 struct Unavailable {
     reason: &'static str,
@@ -134,87 +143,20 @@ pub fn build_log_source(inputs: &LayerInputs) -> Option<Arc<dyn log_source::LogS
     }
 }
 
-/// Build the ordered layer set from prepared inputs.
+/// Build the ordered layer set from prepared inputs by iterating
+/// [`LAYER_REGISTRY`]. Each registry entry is `(name, factory)`; the
+/// factory is consulted only when the layer is not in `inputs.skip`.
 pub fn prepare_layers(inputs: &LayerInputs) -> Vec<Box<dyn Layer>> {
-    let mut out: Vec<Box<dyn Layer>> = vec![];
-
-    for &name in LAYER_ORDER {
-        if inputs.skip.iter().any(|s| s.as_str() == name) {
-            out.push(layer::SkippedLayer::new(name));
-            continue;
-        }
-        match name {
-            "cluster" => match inputs.k8s_client.as_ref() {
-                Some(k8s) => out.push(Box::new(layers::cluster::ClusterLayer::new(k8s.clone()))),
-                None => out.push(layer::UnconfiguredLayer::new(
-                    "cluster",
-                    "kubeconfig not found; set --context or cluster.context in config",
-                )),
-            },
-            "logs" => match build_log_source(inputs) {
-                Some(chain) => {
-                    out.push(Box::new(layers::logs::LogsLayer::new(chain)));
-                }
-                None => {
-                    out.push(layer::UnconfiguredLayer::new(
-                        "logs", "set LOKI_URL or ensure kubeconfig is accessible",
-                    ));
-                }
-            },
-            "workflows" => {
-                out.push(Box::new(layers::workflows::WorkflowsLayer::new(
-                    Arc::new(nico_common::temporal::GrpcTemporalClient::new(
-                        inputs.temporal_address.clone(),
-                    )),
-                    inputs.temporal_namespace.clone(),
-                    inputs.stuck_threshold,
-                )));
+    LAYER_REGISTRY
+        .iter()
+        .map(|(name, factory)| {
+            if inputs.skip.iter().any(|s| s.as_str() == *name) {
+                layer::SkippedLayer::new(name)
+            } else {
+                factory(inputs)
             }
-            "health" => match inputs.http_endpoints.as_ref() {
-                Some(endpoints) if !endpoints.is_empty() => {
-                    out.push(Box::new(layers::health::HealthLayer::new(
-                        Arc::new(http::ReqwestHttpClient::new()),
-                        endpoints.clone(),
-                    )));
-                }
-                _ => {
-                    if inputs.reach_mgr_present {
-                        out.push(layer::SkippedLayer::new("health"));
-                    } else {
-                        out.push(layer::UnconfiguredLayer::new(
-                            "health",
-                            "set NICO_HEALTH_ENDPOINTS=name=http://host:port to enable",
-                        ));
-                    }
-                }
-            },
-            "grpc" => match inputs.grpc_address.clone() {
-                Some(addr) => {
-                    out.push(Box::new(layers::grpc::GrpcLayer::new(
-                        Arc::new(grpc::TonicGrpcInspector),
-                        addr,
-                    )));
-                }
-                None => {
-                    out.push(layer::UnconfiguredLayer::new(
-                        "grpc",
-                        "set NICO_GRPC_ADDRESS or cluster.grpc_address in config to enable",
-                    ));
-                }
-            },
-            "postgres" => match postgres::SqlxPostgresClient::new(&inputs.postgres_url) {
-                Ok(pg) => out.push(Box::new(layers::postgres::PostgresLayer::new(Arc::new(pg)))),
-                Err(e) => {
-                    eprintln!("warning: postgres URL invalid: {e}");
-                    eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
-                    out.push(layer::UnconfiguredLayer::new("postgres", "invalid postgres URL"));
-                }
-            },
-            _ => {}
-        }
-    }
-
-    out
+        })
+        .collect()
 }
 
 /// Build a runnable doctor configuration from CLI args. Reads the user's config
@@ -864,5 +806,48 @@ async fn probe_to_preflight_err(probe: BootProbe, config: &Config) -> BootstrapE
         json_payload: serde_json::to_string_pretty(&json)
             .unwrap_or_else(|_| "{}".to_string()),
         format: config.output.format,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_inputs() -> LayerInputs {
+        LayerInputs {
+            k8s_client: None,
+            loki_url: None,
+            loki_client: Arc::new(Unavailable { reason: "test" }),
+            temporal_address: "127.0.0.1:7233".to_string(),
+            temporal_namespace: "default".to_string(),
+            stuck_threshold: Duration::from_secs(600),
+            http_endpoints: None,
+            postgres_url: "postgres://localhost/test".to_string(),
+            grpc_address: None,
+            reach_mgr_present: false,
+            skip: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_layers_returns_canonical_order() {
+        let layers = prepare_layers(&empty_inputs());
+        let names: Vec<&str> = layers.iter().map(|l| l.name()).collect();
+        assert_eq!(
+            names,
+            vec!["cluster", "logs", "workflows", "health", "grpc", "postgres"]
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_layers_honours_skip_at_any_position() {
+        let mut inputs = empty_inputs();
+        inputs.skip = vec!["workflows".to_string(), "postgres".to_string()];
+        let layers = prepare_layers(&inputs);
+        let names: Vec<&str> = layers.iter().map(|l| l.name()).collect();
+        assert_eq!(
+            names,
+            vec!["cluster", "logs", "workflows", "health", "grpc", "postgres"]
+        );
     }
 }

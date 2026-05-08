@@ -5,8 +5,22 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nico_common::k8s::{K8sClient, PodScope, RawEvent, RawPod};
 use nico_common::output::Status;
-use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
+use crate::bootstrap::LayerInputs;
+use crate::layer::{self, Check, CheckKind, Layer, LayerOutcome, RunOpts};
 use crate::log_source::is_error_or_warn_line;
+
+pub const NAME: &str = "cluster";
+
+/// Factory consumed by `bootstrap::prepare_layers`.
+pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
+    match inputs.k8s_client.as_ref() {
+        Some(k8s) => Box::new(ClusterLayer::new(k8s.clone())),
+        None => layer::UnconfiguredLayer::new(
+            NAME,
+            "kubeconfig not found; set --context or cluster.context in config",
+        ),
+    }
+}
 
 /// Number of most-restarted pods that get a `pod_log_tail` detail Check.
 /// Bounded so a 50-pod crash storm cannot stall the cluster layer on

@@ -1,10 +1,24 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use nico_common::output::Status;
+use crate::bootstrap::{build_log_source, LayerInputs};
 use crate::log_source::LogSource;
-use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
+use crate::layer::{self, Check, CheckKind, Layer, LayerOutcome, RunOpts};
 
 const LOG_LINE_LIMIT: usize = 500;
+
+pub const NAME: &str = "logs";
+
+/// Factory consumed by `bootstrap::prepare_layers`.
+pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
+    match build_log_source(inputs) {
+        Some(chain) => Box::new(LogsLayer::new(chain)),
+        None => layer::UnconfiguredLayer::new(
+            NAME,
+            "set LOKI_URL or ensure kubeconfig is accessible",
+        ),
+    }
+}
 
 pub struct LogsLayer {
     source: Arc<dyn LogSource>,
