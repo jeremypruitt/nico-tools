@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use nico_common::config::OutputFormat;
+use nico_common::config::{Config, ConfigOverrides, OutputFormat};
 use nico_common::output::Status;
 use nico_common::theme;
 
@@ -9,6 +10,7 @@ pub mod bootstrap;
 pub mod cli;
 pub mod formatter;
 pub mod grpc;
+pub mod hbn;
 pub mod http;
 pub mod layer;
 pub mod layers;
@@ -20,7 +22,7 @@ pub mod preflight;
 pub mod runner;
 
 pub use bootstrap::{bootstrap, prepare_layers, Bootstrapped, BootstrapErr, LayerInputs};
-pub use cli::DoctorArgs;
+pub use cli::{DoctorArgs, DoctorCommand, HbnArgs};
 pub use runner::Report;
 
 /// Run all layers once, returning a [`Report`]. Equivalent to
@@ -105,6 +107,10 @@ pub async fn run_doctor(args: DoctorArgs) -> i32 {
         }
     };
 
+    if let Some(DoctorCommand::Hbn(hbn_args)) = args.command.clone() {
+        return run_hbn(&args, hbn_args).await;
+    }
+
     let bootstrapped = match bootstrap(&args).await {
         Ok(b) => b,
         Err(BootstrapErr::Preflight { human_message: _, json_payload, format }) => {
@@ -166,4 +172,116 @@ pub async fn run_doctor(args: DoctorArgs) -> i32 {
     }
 
     code
+}
+
+/// `nico doctor hbn <dpu-id>` flow. Bypasses the multi-layer ladder and
+/// the boot probe — the HBN verdict only needs forgedb (Postgres). It
+/// reuses the same config resolution (so `--postgres-url`, the
+/// `postgres.url` config key, and the standard output flags all work)
+/// and the same headline-vs-detail formatter, so output is consistent
+/// with the rest of `nico doctor`.
+pub async fn run_hbn(args: &DoctorArgs, hbn_args: HbnArgs) -> i32 {
+    let config = match load_minimal_config(args) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 1;
+        }
+    };
+
+    let output_mode = nico_common::output::OutputMode {
+        color: match config.output.color {
+            nico_common::config::ColorMode::Always => true,
+            nico_common::config::ColorMode::Never => false,
+            nico_common::config::ColorMode::Auto => std::env::var("NO_COLOR").is_err(),
+        },
+        ascii: args.ascii,
+    };
+
+    let freshness = match hbn_args.freshness.as_deref() {
+        Some(s) => match humantime::parse_duration(s) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("error: invalid --freshness {s:?}: {e}");
+                return 1;
+            }
+        },
+        None => hbn::DEFAULT_FRESHNESS_THRESHOLD,
+    };
+
+    let client: Arc<dyn hbn::HbnClient> = match hbn::SqlxHbnClient::new(&config.postgres.url) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("error: invalid postgres URL: {e}");
+            eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
+            return 1;
+        }
+    };
+
+    let layer = layers::hbn::HbnLayer::new(client, hbn_args.dpu_id.clone())
+        .with_freshness_threshold(freshness);
+    let layers: Vec<Box<dyn layer::Layer>> = vec![Box::new(layer)];
+
+    let opts = layer::RunOpts {
+        namespace: config.cluster.namespace.clone(),
+        since: Duration::from_secs(600),
+        timeout: humantime::parse_duration(&args.timeout).unwrap_or(Duration::from_secs(5)),
+        ..Default::default()
+    };
+
+    let report = run_once(&layers, &opts).await;
+
+    if matches!(config.output.format, OutputFormat::Json) {
+        println!(
+            "{}",
+            formatter::format_json(
+                &report,
+                &config.cluster.namespace,
+                preflight::ok_section(),
+                &std::collections::HashMap::new(),
+            )
+        );
+    } else {
+        print!(
+            "{}",
+            formatter::format_report(
+                &report,
+                &output_mode,
+                args.verbose,
+                &std::collections::HashMap::new(),
+                args.spotlight,
+            )
+        );
+    }
+
+    exit_code(&report)
+}
+
+fn load_minimal_config(args: &DoctorArgs) -> Result<Config, String> {
+    let config_path = args
+        .config
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".config/nico-tools/config.toml")
+        });
+    let file_toml = std::fs::read_to_string(&config_path).ok();
+
+    let overrides = ConfigOverrides {
+        namespace: args.namespace.clone(),
+        context: args.context.clone(),
+        postgres_url: args.postgres_url.clone(),
+        color: if args.no_color {
+            Some(nico_common::config::ColorMode::Never)
+        } else {
+            None
+        },
+        format: if args.json { Some(OutputFormat::Json) } else { None },
+        ..Default::default()
+    };
+
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    Config::load(file_toml.as_deref(), &env, &overrides)
+        .map_err(|e| format!("error loading config: {e}"))
 }

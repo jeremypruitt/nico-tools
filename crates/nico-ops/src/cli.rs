@@ -65,6 +65,7 @@ impl OpsArgs {
     /// `--ascii`, `--no-color`) are forced to off.
     pub fn to_doctor_args(&self) -> nico_doctor::DoctorArgs {
         nico_doctor::DoctorArgs {
+            command: None,
             namespace: self.namespace.clone(),
             context: self.context.clone(),
             skip: self.skip.clone(),
