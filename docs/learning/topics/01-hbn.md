@@ -33,7 +33,7 @@
 
 **Why this matters operationally:** a leaf swap is a hardware swap, not a config event. A new tenant is a config push to N DPUs, not a switch change-window. Multi-tenancy scales with VNI space (16M), not VLAN space (4K).
 
-**My background hooks (Juniper):** think of HBN as the EVPN-VXLAN PE function pushed onto the host's NIC instead of QFX/MX, with NVUE as the (proprietary) JUNOS analogue and FRR underneath. The route server is your route reflector. The TOR is now MPLS-style P-only.
+**Juniper Comparison:** think of HBN as the EVPN-VXLAN PE function pushed onto the host's NIC instead of QFX/MX, with NVUE as the (proprietary) JUNOS analogue and FRR underneath. The route server is your route reflector. The TOR is now MPLS-style P-only.
 
 ```
                         ┌───────────────────────┐
@@ -45,15 +45,15 @@
                 ┌───────────────────┼───────────────────┐
                 ▼                   ▼                   ▼
          ┌────────────┐      ┌────────────┐      ┌────────────┐
-         │ DPU agent  │      │ DPU agent  │      │ DPU agent  │   (one per BF on each compute host)
+         │ DPU agent  │      │ DPU agent  │      │ DPU agent  │  (one per BF on each compute host)
          │  (mTLS)    │      │            │      │            │
          │  applies → │      │            │      │            │
-         │  doca-hbn  │      │  doca-hbn  │      │  doca-hbn  │   container; NVUE config
+         │  doca-hbn  │      │  doca-hbn  │      │  doca-hbn  │  container; NVUE config
          │  + FRR     │      │  + FRR     │      │  + FRR     │
          └─────┬──────┘      └─────┬──────┘      └─────┬──────┘
                │  underlay BGP-EVPN to route server / TOR
                ▼                   ▼                   ▼
-                   ─── plain L3 underlay (TOR is dumb) ───
+                ─── plain L3 underlay (TOR is dumb) ───
 ```
 
 ### Data path for one tenant packet
