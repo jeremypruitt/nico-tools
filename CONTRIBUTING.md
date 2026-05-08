@@ -23,3 +23,7 @@ On merge to `main`, GitHub automatically closes the referenced issue.
 ### Commit messages
 
 Follow the conventional-commits style used in this repo: `type(scope): short description`. See recent commits for examples.
+
+### Editing `.github/workflows/claude-code-review.yml`
+
+The `claude-code-review` GitHub App enforces that the workflow file on the PR branch is byte-identical to the version on `main`. A PR that modifies that file will fail OIDC token exchange with `401 Workflow validation failed` and `claude-review` will go red. This is expected. Merge the workflow change first, then validate the new behavior on a follow-up PR that does not touch the workflow file.
