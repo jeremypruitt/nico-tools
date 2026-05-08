@@ -88,6 +88,15 @@ pub enum DoctorCommand {
     /// `DpuNetworkStatus.last_seen_at` to pick exactly one verdict
     /// (or `healthy`).
     DpuIsolation(DpuIsolationArgs),
+
+    /// Single-DPU client-certificate days-to-expiry verdict (issue
+    /// #206).
+    ///
+    /// Reads `client_certificate_expiry_unix_epoch_secs` from the
+    /// most recent `DpuNetworkStatus` row and reports `expired`,
+    /// `expiring-soon`, `healthy`, or `no-recent-status`. Default
+    /// warning threshold is 30 days.
+    DpuCert(DpuCertArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -108,4 +117,15 @@ pub struct DpuIsolationArgs {
     /// Override the `last_seen_at` freshness threshold (default 90s).
     #[arg(long, value_name = "DURATION")]
     pub freshness: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DpuCertArgs {
+    /// DPU ID to inspect.
+    pub dpu_id: String,
+
+    /// Override the cert-expiry warning window (default 30 days).
+    /// Accepts any humantime duration, e.g. `7d`, `336h`, `60m`.
+    #[arg(long, value_name = "DURATION")]
+    pub warn: Option<String>,
 }
