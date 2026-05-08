@@ -77,12 +77,33 @@ pub enum DoctorCommand {
     /// runs the fixed HBN check set, and renders a headline-vs-detail
     /// report. Read-only.
     Hbn(HbnArgs),
+
+    /// Single-DPU isolation verdict (issue #207).
+    ///
+    /// "DPU has no traffic" has three very different root causes —
+    /// `not-yet-known`, `quarantined`, and `lost-connection`. This
+    /// command does that triage in one step, reading the machine
+    /// registration row, scout-discovery state,
+    /// `MachineQuarantineState`, and most recent
+    /// `DpuNetworkStatus.last_seen_at` to pick exactly one verdict
+    /// (or `healthy`).
+    DpuIsolation(DpuIsolationArgs),
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct HbnArgs {
     /// DPU ID to inspect.
     pub dpu_id: String,
+
+    /// Override the `last_seen_at` freshness threshold (default 90s).
+    #[arg(long, value_name = "DURATION")]
+    pub freshness: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DpuIsolationArgs {
+    /// Machine ID to inspect.
+    pub machine_id: String,
 
     /// Override the `last_seen_at` freshness threshold (default 90s).
     #[arg(long, value_name = "DURATION")]
