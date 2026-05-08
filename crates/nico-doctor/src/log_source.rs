@@ -69,9 +69,19 @@ impl LogSource for BestEffortChain {
     }
 }
 
-fn is_error_line(s: &str) -> bool {
+pub(crate) fn is_error_line(s: &str) -> bool {
     let l = s.to_lowercase();
     l.contains("error") || l.contains("panic") || l.contains("fatal")
+}
+
+/// Like [`is_error_line`] but also matches `warn`-severity lines. Mirrors the
+/// classification done by `nico_ops::model::log_level_from_text` so the
+/// cluster layer's `pod_log_tail` filtering aligns with operator-facing UI.
+pub(crate) fn is_error_or_warn_line(s: &str) -> bool {
+    if is_error_line(s) {
+        return true;
+    }
+    s.to_lowercase().contains("warn")
 }
 
 pub struct K8sLogSource {

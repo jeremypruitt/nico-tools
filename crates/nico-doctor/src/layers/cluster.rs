@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
@@ -5,6 +6,16 @@ use chrono::{DateTime, Utc};
 use nico_common::k8s::{K8sClient, PodScope, RawEvent, RawPod};
 use nico_common::output::Status;
 use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
+use crate::log_source::is_error_or_warn_line;
+
+/// Number of most-restarted pods that get a `pod_log_tail` detail Check.
+/// Bounded so a 50-pod crash storm cannot stall the cluster layer on
+/// per-pod log fetches. See issue #190.
+const POD_LOG_TAIL_TOP_K: usize = 3;
+
+/// Maximum length of the rendered `pod_log_tail` value. The line is
+/// truncated to keep the findings block readable in the human formatter.
+const POD_LOG_TAIL_MAX_VALUE_LEN: usize = 80;
 
 pub struct ClusterLayer {
     k8s: Arc<dyn K8sClient>,
@@ -35,7 +46,52 @@ impl Layer for ClusterLayer {
             .unwrap_or_default();
         let warning_events = filter_warning_events(&raw_events, SystemTime::now(), opts.since);
         let pods: Vec<&RawPod> = all_pods.iter().filter(|p| !p.succeeded).collect();
-        LayerOutcome::Checks(checks_from(&pods, &warning_events, &opts.namespace))
+        let top_restarting = top_k_restarting(&pods, POD_LOG_TAIL_TOP_K);
+        let pod_logs = fetch_pod_logs(&*self.k8s, &opts.namespace, &top_restarting, opts.since).await;
+        LayerOutcome::Checks(checks_from(
+            &pods,
+            &warning_events,
+            &opts.namespace,
+            opts.since,
+            &pod_logs,
+        ))
+    }
+}
+
+fn top_k_restarting<'a>(pods: &[&'a RawPod], k: usize) -> Vec<&'a RawPod> {
+    let mut restarting: Vec<&RawPod> =
+        pods.iter().copied().filter(|p| p.restart_count > 0).collect();
+    restarting.sort_by_key(|p| std::cmp::Reverse(p.restart_count));
+    restarting.truncate(k);
+    restarting
+}
+
+async fn fetch_pod_logs(
+    k8s: &dyn K8sClient,
+    namespace: &str,
+    pods: &[&RawPod],
+    since: Duration,
+) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    for p in pods {
+        let lines = k8s
+            .pod_logs(namespace, &p.name, since)
+            .await
+            .unwrap_or_default();
+        out.insert(p.name.clone(), lines);
+    }
+    out
+}
+
+fn since_flag(since: Duration) -> String {
+    format!("--since={}s", since.as_secs())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
     }
 }
 
@@ -54,7 +110,13 @@ fn filter_warning_events(
         .collect()
 }
 
-fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) -> Vec<Check> {
+fn checks_from(
+    pods: &[&RawPod],
+    warning_events: &[&RawEvent],
+    namespace: &str,
+    since: Duration,
+    pod_logs: &HashMap<String, Vec<String>>,
+) -> Vec<Check> {
     let total = pods.len();
     let ready = pods.iter().filter(|p| p.ready).count();
     let restarts: u32 = pods.iter().map(|p| p.restart_count).sum();
@@ -108,6 +170,23 @@ fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) 
             status: Status::Warn,
             value: format!("{}: {} restarts", p.name, p.restart_count),
             next_command: Some(format!("kubectl describe pod {} -n {namespace}", p.name)),
+            kind: CheckKind::Detail,
+        });
+    }
+
+    for p in top_k_restarting(pods, POD_LOG_TAIL_TOP_K) {
+        let Some(lines) = pod_logs.get(&p.name) else { continue };
+        let Some(line) = lines.iter().rev().find(|l| is_error_or_warn_line(l)) else { continue };
+        let value = truncate(&format!("{}: {}", p.name, line), POD_LOG_TAIL_MAX_VALUE_LEN);
+        checks.push(Check {
+            name: "pod_log_tail",
+            status: Status::Warn,
+            value,
+            next_command: Some(format!(
+                "kubectl logs {} -n {namespace} {}",
+                p.name,
+                since_flag(since),
+            )),
             kind: CheckKind::Detail,
         });
     }
@@ -231,7 +310,7 @@ mod tests {
         let p2 = pod("rest-xyz", true, 0, false);
         let pods = vec![&p1, &p2];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
         assert_eq!(checks.len(), 3);
         assert!(checks.iter().all(|c| c.status == Status::Ok));
     }
@@ -242,7 +321,7 @@ mod tests {
         let pods = vec![&p1];
         let e1 = warning_event("OOMKilling");
         let events = vec![&e1];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
         let headline: Vec<_> = checks.iter().filter(|c| c.kind == CheckKind::Headline).collect();
         assert_eq!(headline.len(), 3);
         assert!(headline.iter().all(|c| c.status == Status::Warn));
@@ -371,7 +450,7 @@ mod tests {
         let p2 = pod("rest-xyz", true, 0, false);
         let pods = vec![&p1, &p2];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         assert_eq!(checks.iter().filter(|c| c.name == "pod_restart").count(), 0);
     }
@@ -383,7 +462,7 @@ mod tests {
         let p3 = pod("workflow-svc", true, 5, false);
         let pods = vec![&p1, &p2, &p3];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let pod_restarts: Vec<_> = checks.iter().filter(|c| c.name == "pod_restart").collect();
         assert_eq!(pod_restarts.len(), 2);
@@ -406,7 +485,7 @@ mod tests {
         let p1 = pod("core-abc", true, 3, false);
         let pods = vec![&p1];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let pod_restarts: Vec<_> = checks.iter().filter(|c| c.name == "pod_restart").collect();
         assert_eq!(pod_restarts.len(), 1);
@@ -425,7 +504,7 @@ mod tests {
         let p1 = pod("core-abc", true, 0, false);
         let pods = vec![&p1];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         assert_eq!(checks.iter().filter(|c| c.name == "pod_event").count(), 0);
     }
@@ -437,7 +516,7 @@ mod tests {
         let now = Utc::now();
         let e1 = warning_event_for("OOMKilling", "core-abc", now);
         let events = vec![&e1];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let pod_events: Vec<_> = checks.iter().filter(|c| c.name == "pod_event").collect();
         assert_eq!(pod_events.len(), 1);
@@ -460,7 +539,7 @@ mod tests {
         let e_old = warning_event_for("BackOff", "core-abc", earlier);
         let e_new = warning_event_for("OOMKilling", "core-abc", later);
         let events = vec![&e_old, &e_new];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let pod_events: Vec<_> = checks.iter().filter(|c| c.name == "pod_event").collect();
         assert_eq!(pod_events.len(), 1);
@@ -476,7 +555,7 @@ mod tests {
         let e1 = warning_event_for("OOMKilling", "core-abc", now);
         let e2 = warning_event_for("FailedScheduling", "rest-xyz", now);
         let events = vec![&e1, &e2];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let pod_events: Vec<_> = checks.iter().filter(|c| c.name == "pod_event").collect();
         assert_eq!(pod_events.len(), 2);
@@ -508,7 +587,7 @@ mod tests {
             involved_object: None,
         };
         let events = vec![&e1, &e2];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let pod_events: Vec<_> = checks.iter().filter(|c| c.name == "pod_event").collect();
         assert_eq!(pod_events.len(), 1);
@@ -532,7 +611,7 @@ mod tests {
             involved_object: Some("noisy-pod".into()),
         };
         let events = vec![&e1];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let pe = checks.iter().find(|c| c.name == "pod_event").unwrap();
         let after_em_dash = pe
@@ -556,7 +635,7 @@ mod tests {
         let p1 = pod_with_phase("core-abc", false, "Pending", false);
         let pods = vec![&p1];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let details: Vec<_> = checks.iter().filter(|c| c.name == "pod_not_ready").collect();
         assert_eq!(details.len(), 1);
@@ -575,7 +654,7 @@ mod tests {
         let p1 = pod_with_phase("core-abc", false, "Running", true);
         let pods = vec![&p1];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let pnr = checks
             .iter()
@@ -597,7 +676,7 @@ mod tests {
         };
         let pods = vec![&p1];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         assert_eq!(checks.iter().filter(|c| c.name == "pod_not_ready").count(), 0);
     }
@@ -608,7 +687,7 @@ mod tests {
         let p2 = pod("rest-xyz", true, 0, false);
         let pods = vec![&p1, &p2];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         assert_eq!(checks.iter().filter(|c| c.name == "pod_not_ready").count(), 0);
         let pods_ready = checks
@@ -626,7 +705,7 @@ mod tests {
         let p3 = pod_with_phase("workflow-svc", false, "Running", true);
         let pods = vec![&p1, &p2, &p3];
         let events: Vec<&RawEvent> = vec![];
-        let checks = checks_from(&pods, &events, "nico");
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &HashMap::new());
 
         let details: Vec<_> = checks.iter().filter(|c| c.name == "pod_not_ready").collect();
         assert_eq!(details.len(), 2);
@@ -646,6 +725,128 @@ mod tests {
             .find(|c| c.name == "pods_ready")
             .expect("pods_ready");
         assert_eq!(pods_ready.value, "1/3");
+    }
+
+    #[tokio::test]
+    async fn single_restarting_pod_with_error_log_emits_one_pod_log_tail_detail_check() {
+        let client = Arc::new(
+            MockK8sClient::new()
+                .with_pods(vec![pod("core-abc", true, 3, false)])
+                .with_logs(vec![
+                    "INFO startup ok".into(),
+                    "ERROR connection refused".into(),
+                ]),
+        );
+        let result = ClusterLayer::new(client).run(&opts()).await;
+
+        let tails: Vec<_> = result
+            .checks
+            .iter()
+            .filter(|c| c.name == "pod_log_tail")
+            .collect();
+        assert_eq!(tails.len(), 1);
+        let t = tails[0];
+        assert_eq!(t.kind, CheckKind::Detail);
+        assert_eq!(t.status, Status::Warn);
+        assert_eq!(t.value, "core-abc: ERROR connection refused");
+        assert_eq!(
+            t.next_command.as_deref(),
+            Some("kubectl logs core-abc -n nico --since=600s"),
+        );
+    }
+
+    #[test]
+    fn restarting_pod_with_no_error_or_warn_line_emits_no_pod_log_tail() {
+        let p = pod("core-abc", true, 3, false);
+        let pods = vec![&p];
+        let events: Vec<&RawEvent> = vec![];
+        let mut logs = HashMap::new();
+        logs.insert(
+            "core-abc".to_string(),
+            vec!["INFO startup ok".into(), "INFO heartbeat".into()],
+        );
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &logs);
+
+        assert_eq!(checks.iter().filter(|c| c.name == "pod_log_tail").count(), 0);
+    }
+
+    #[test]
+    fn pod_log_tail_picks_most_recent_error_or_warn_line_and_truncates() {
+        let p = pod("core-abc", true, 3, false);
+        let pods = vec![&p];
+        let events: Vec<&RawEvent> = vec![];
+        let mut logs = HashMap::new();
+        logs.insert(
+            "core-abc".to_string(),
+            vec![
+                "INFO startup ok".to_string(),
+                "ERROR an early hiccup but recovered".to_string(),
+                "INFO chugging along".to_string(),
+                "WARN lots and lots of detail xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
+                "INFO heartbeat".to_string(),
+            ],
+        );
+        let checks = checks_from(&pods, &events, "nico", Duration::from_secs(600), &logs);
+
+        let tail = checks
+            .iter()
+            .find(|c| c.name == "pod_log_tail")
+            .expect("pod_log_tail check");
+        assert_eq!(tail.kind, CheckKind::Detail);
+        assert!(
+            tail.value.starts_with("core-abc: WARN lots and lots of detail"),
+            "expected most-recent warn line, got: {}",
+            tail.value
+        );
+        assert_eq!(
+            tail.value.chars().count(),
+            POD_LOG_TAIL_MAX_VALUE_LEN,
+            "value should be truncated to max length"
+        );
+    }
+
+    #[tokio::test]
+    async fn pod_log_tail_bounded_to_top_k_most_restarted_pods() {
+        let client = Arc::new(
+            MockK8sClient::new()
+                .with_pods(vec![
+                    pod("p1", true, 1, false),
+                    pod("p2", true, 7, false),
+                    pod("p3", true, 5, false),
+                    pod("p4", true, 9, false),
+                    pod("p5", true, 3, false),
+                ])
+                .with_logs(vec!["ERROR boom".into()]),
+        );
+        let result = ClusterLayer::new(client).run(&opts()).await;
+
+        let tails: Vec<_> = result
+            .checks
+            .iter()
+            .filter(|c| c.name == "pod_log_tail")
+            .collect();
+        assert_eq!(tails.len(), 3);
+
+        let pod_names: Vec<&str> = tails
+            .iter()
+            .map(|c| c.value.split(':').next().unwrap())
+            .collect();
+        assert!(pod_names.contains(&"p4"));
+        assert!(pod_names.contains(&"p2"));
+        assert!(pod_names.contains(&"p3"));
+        assert!(!pod_names.contains(&"p1"));
+        assert!(!pod_names.contains(&"p5"));
+    }
+
+    #[tokio::test]
+    async fn cluster_with_no_restarting_pods_emits_no_pod_log_tail_checks() {
+        let client = Arc::new(
+            MockK8sClient::new()
+                .with_pods(vec![pod("core-abc", true, 0, false)])
+                .with_logs(vec!["ERROR boom".into()]),
+        );
+        let result = ClusterLayer::new(client).run(&opts()).await;
+        assert_eq!(result.checks.iter().filter(|c| c.name == "pod_log_tail").count(), 0);
     }
 
     #[tokio::test]
