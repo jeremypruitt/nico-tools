@@ -1,4 +1,6 @@
-use nico_common::config::{ColorMode, OutputFormat};
+use std::sync::Arc;
+
+use nico_common::config::{ColorMode, Config, ConfigOverrides, OutputFormat};
 use nico_common::output::{OutputMode, Status};
 use nico_common::theme;
 
@@ -8,6 +10,7 @@ pub mod correlate;
 pub mod diagnosis;
 pub mod event;
 pub mod formatter;
+pub mod hbn_drift;
 pub mod id;
 pub mod namespace;
 pub mod source;
@@ -16,7 +19,7 @@ pub mod tail;
 pub mod timeline;
 
 pub use bootstrap::{collect_all, prepare_sources, resolve_config, BootstrapErr, CorrelateConfig, PreparedSources};
-pub use cli::CorrelateArgs;
+pub use cli::{CorrelateArgs, CorrelateCommand, HbnConfigDriftArgs};
 pub use event::{Event, Severity};
 pub use namespace::{recent_namespace_events, RECENT_EVENT_CAP};
 
@@ -43,6 +46,10 @@ pub async fn run_correlate(args: CorrelateArgs) -> i32 {
         }
     };
 
+    if let Some(CorrelateCommand::HbnConfigDrift(hbn_args)) = args.command.clone() {
+        return run_hbn_config_drift(&args, hbn_args).await;
+    }
+
     let cfg = match resolve_config(&args) {
         Ok(c) => c,
         Err(BootstrapErr::Fatal { message, code }) => {
@@ -50,6 +57,8 @@ pub async fn run_correlate(args: CorrelateArgs) -> i32 {
             return code;
         }
     };
+
+    let id_str = args.id.clone().expect("resolve_config rejects missing id");
 
     let prepared = prepare_sources(&args, &cfg).await;
     let PreparedSources {
@@ -66,7 +75,7 @@ pub async fn run_correlate(args: CorrelateArgs) -> i32 {
         ascii: args.ascii,
     };
 
-    let all_results = collect_all(&named_sources, &args.id, &cfg.id_type).await;
+    let all_results = collect_all(&named_sources, &id_str, &cfg.id_type).await;
     drop(_pf_guards);
 
     let events: Vec<Event> = all_results
@@ -98,7 +107,7 @@ pub async fn run_correlate(args: CorrelateArgs) -> i32 {
         println!(
             "{}",
             formatter::format_json(
-                &args.id,
+                &id_str,
                 cfg.id_type.cli_name(),
                 &filtered,
                 &cfg.restricted_names,
@@ -200,7 +209,7 @@ pub async fn run_correlate(args: CorrelateArgs) -> i32 {
             .collect();
         tail::run_tail(
             tail_sources,
-            args.id.clone(),
+            id_str.clone(),
             cfg.id_type.clone(),
             &filtered,
             &mode,
@@ -210,4 +219,95 @@ pub async fn run_correlate(args: CorrelateArgs) -> i32 {
     }
 
     code
+}
+
+/// `nico correlate hbn-config-drift <machine-id>` flow. Bypasses the
+/// multi-source bootstrap (boot probe, port-forwards, kube client) — the
+/// drift correlation only needs forgedb (Postgres). Reuses the same
+/// config resolution so `--postgres-url`, the `postgres.url` config key,
+/// and the standard output flags all work.
+pub async fn run_hbn_config_drift(args: &CorrelateArgs, hbn_args: HbnConfigDriftArgs) -> i32 {
+    let config = match load_minimal_config(args) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 1;
+        }
+    };
+
+    let freshness = match hbn_args.freshness.as_deref() {
+        Some(s) => match humantime::parse_duration(s) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("error: invalid --freshness {s:?}: {e}");
+                return 1;
+            }
+        },
+        None => hbn_drift::DEFAULT_FRESHNESS_THRESHOLD,
+    };
+
+    let client: Arc<dyn hbn_drift::DriftClient> =
+        match hbn_drift::SqlxDriftClient::new(&config.postgres.url) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("error: invalid postgres URL: {e}");
+                eprintln!(
+                    "  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url"
+                );
+                return 1;
+            }
+        };
+
+    let now = chrono::Utc::now();
+    let snapshot = match client.fetch_drift(&hbn_args.machine_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            print!("{}", hbn_drift::render_drift_no_data(&hbn_args.machine_id));
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("error: hbn-config-drift query failed: {e}");
+            eprintln!("  hint: check forgedb / postgres connectivity");
+            return 1;
+        }
+    };
+
+    let rows = hbn_drift::assemble_drift_rows(&snapshot, now, freshness);
+
+    if matches!(config.output.format, OutputFormat::Json) {
+        println!(
+            "{}",
+            hbn_drift::render_drift_json(&hbn_args.machine_id, &rows, now, snapshot.last_seen_at)
+        );
+    } else {
+        print!(
+            "{}",
+            hbn_drift::render_drift_text(&hbn_args.machine_id, &rows, now, snapshot.last_seen_at)
+        );
+    }
+
+    0
+}
+
+fn load_minimal_config(args: &CorrelateArgs) -> Result<Config, String> {
+    let config_path = args
+        .config
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".config/nico-tools/config.toml")
+        });
+    let file_toml = std::fs::read_to_string(&config_path).ok();
+
+    let overrides = ConfigOverrides {
+        postgres_url: args.postgres_url.clone(),
+        color: if args.no_color { Some(ColorMode::Never) } else { None },
+        format: if args.json { Some(OutputFormat::Json) } else { None },
+        ..Default::default()
+    };
+
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    Config::load(file_toml.as_deref(), &env, &overrides)
+        .map_err(|e| format!("error loading config: {e}"))
 }
