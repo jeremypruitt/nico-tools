@@ -51,6 +51,20 @@ pub const GRUVBOX: Theme = Theme {
     overlay_key: Color::Rgb(250, 189, 47),
 };
 
+/// Theme returned when `NO_COLOR` is set: every role resolves to
+/// `Color::Reset`, so render code that consumes a `Theme` ends up
+/// emitting the terminal's default foreground / background — no
+/// special branching required at every call site.
+pub const NO_COLOR_THEME: Theme = Theme {
+    ok:          Color::Reset,
+    warn:        Color::Reset,
+    error:       Color::Reset,
+    muted:       Color::Reset,
+    overlay_bg:  Color::Reset,
+    overlay_fg:  Color::Reset,
+    overlay_key: Color::Reset,
+};
+
 impl Theme {
     pub fn from_name(s: &str) -> Result<Theme, String> {
         match s {
@@ -67,11 +81,32 @@ impl Theme {
 }
 
 pub fn resolve_theme(flag: Option<&str>) -> Result<Theme, String> {
+    resolve_theme_with(
+        flag,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var("NICO_THEME").ok().as_deref(),
+    )
+}
+
+/// Pure resolver — env vars are passed in, no global state read. Tests
+/// target this directly so they can run in parallel without env-var
+/// races. The thin `resolve_theme` wrapper just plumbs in real env.
+pub fn resolve_theme_with(
+    flag: Option<&str>,
+    no_color: bool,
+    nico_theme_env: Option<&str>,
+) -> Result<Theme, String> {
+    // Per https://no-color.org and ADR-0008 precedence rule #4:
+    // presence of NO_COLOR (any value, including empty) disables color
+    // entirely, overriding both the --theme flag and NICO_THEME.
+    if no_color {
+        return Ok(NO_COLOR_THEME);
+    }
     if let Some(name) = flag {
         return Theme::from_name(name);
     }
-    if let Ok(name) = std::env::var("NICO_THEME") {
-        return Theme::from_name(&name);
+    if let Some(name) = nico_theme_env {
+        return Theme::from_name(name);
     }
     Ok(DEFAULT)
 }
@@ -231,34 +266,61 @@ mod tests {
 
     #[test]
     fn resolve_theme_flag_wins_over_env() {
-        // SAFETY: single-threaded test binary; no concurrent env reads
-        unsafe { std::env::set_var("NICO_THEME", "nord"); }
-        let result = resolve_theme(Some("dracula")).unwrap();
-        unsafe { std::env::remove_var("NICO_THEME"); }
+        let result = resolve_theme_with(Some("dracula"), false, Some("nord")).unwrap();
         assert_eq!(result, DRACULA);
     }
 
     #[test]
     fn resolve_theme_env_used_when_no_flag() {
-        // SAFETY: single-threaded test binary; no concurrent env reads
-        unsafe { std::env::set_var("NICO_THEME", "gruvbox"); }
-        let result = resolve_theme(None).unwrap();
-        unsafe { std::env::remove_var("NICO_THEME"); }
+        let result = resolve_theme_with(None, false, Some("gruvbox")).unwrap();
         assert_eq!(result, GRUVBOX);
     }
 
     #[test]
     fn resolve_theme_defaults_when_no_flag_no_env() {
-        // SAFETY: single-threaded test binary; no concurrent env reads
-        unsafe { std::env::remove_var("NICO_THEME"); }
-        let result = resolve_theme(None).unwrap();
+        let result = resolve_theme_with(None, false, None).unwrap();
         assert_eq!(result, DEFAULT);
     }
 
     #[test]
     fn resolve_theme_invalid_flag_returns_err() {
-        let err = resolve_theme(Some("bad-theme")).unwrap_err();
+        let err = resolve_theme_with(Some("bad-theme"), false, None).unwrap_err();
         assert!(err.contains("bad-theme"));
+    }
+
+    #[test]
+    fn resolve_theme_with_no_color_returns_no_color_theme() {
+        let result = resolve_theme_with(None, true, None).unwrap();
+        assert_eq!(result, NO_COLOR_THEME);
+    }
+
+    #[test]
+    fn resolve_theme_with_no_color_overrides_flag() {
+        let result = resolve_theme_with(Some("dracula"), true, None).unwrap();
+        assert_eq!(result, NO_COLOR_THEME, "NO_COLOR must override --theme flag");
+    }
+
+    #[test]
+    fn resolve_theme_with_no_color_overrides_nico_theme_env() {
+        let result = resolve_theme_with(None, true, Some("gruvbox")).unwrap();
+        assert_eq!(result, NO_COLOR_THEME, "NO_COLOR must override NICO_THEME");
+    }
+
+    #[test]
+    fn no_color_theme_is_all_reset() {
+        assert_eq!(NO_COLOR_THEME.ok, Color::Reset);
+        assert_eq!(NO_COLOR_THEME.warn, Color::Reset);
+        assert_eq!(NO_COLOR_THEME.error, Color::Reset);
+        assert_eq!(NO_COLOR_THEME.muted, Color::Reset);
+        assert_eq!(NO_COLOR_THEME.overlay_bg, Color::Reset);
+        assert_eq!(NO_COLOR_THEME.overlay_fg, Color::Reset);
+        assert_eq!(NO_COLOR_THEME.overlay_key, Color::Reset);
+    }
+
+    #[test]
+    fn resolve_theme_with_invalid_flag_returns_err_even_without_no_color() {
+        let err = resolve_theme_with(Some("solarized"), false, None).unwrap_err();
+        assert!(err.contains("solarized"));
     }
 
     #[test]
