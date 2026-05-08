@@ -1,4 +1,5 @@
 pub mod cluster;
+pub mod dpu_isolation;
 pub mod grpc;
 pub mod hbn;
 pub mod health;
