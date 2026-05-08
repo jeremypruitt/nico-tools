@@ -95,6 +95,9 @@ mod tests {
                 Err(e) => Err(anyhow::anyhow!(e)),
             }
         }
+        async fn fetch_all_snapshots(&self) -> Result<Vec<HbnSnapshot>> {
+            Ok(Vec::new())
+        }
     }
 
     fn snap_healthy() -> HbnSnapshot {

@@ -22,6 +22,7 @@ pub mod cli;
 pub mod clock;
 pub mod data;
 pub mod events;
+pub mod hbn_panel;
 pub mod model;
 pub mod pulse;
 pub mod ringbuffer;
@@ -36,7 +37,7 @@ use crate::model::{
     LayerSnapshot, LogLine, PopoverEvent, PopoverSeverity, SourceError, log_level_from_text,
 };
 
-pub use cli::OpsArgs;
+pub use cli::{HbnPanelArgs, OpsArgs, OpsCommand};
 
 /// How often the host loop sends a `Tick` to the reducer. Drives both
 /// auto-refresh deadline checks and throbber animation.
@@ -48,6 +49,10 @@ const NON_TTY_MESSAGE: &str = "nico ops requires an interactive terminal (stdout
 /// Returns a process exit code (0 = clean exit, 3 = preflight failure or
 /// not a TTY).
 pub async fn run_ops(args: OpsArgs) -> i32 {
+    if let Some(OpsCommand::Hbn(hbn_args)) = args.command.clone() {
+        return run_ops_hbn(args, hbn_args).await;
+    }
+
     if !io::stdout().is_terminal() {
         eprintln!("{NON_TTY_MESSAGE}");
         return 3;
@@ -535,6 +540,260 @@ fn log_lines_from_entries(entries: Vec<(String, String)>) -> Vec<LogLine> {
             message: line,
         })
         .collect()
+}
+
+/// `nico ops hbn` — focused per-DPU HBN panel (issue #209).
+///
+/// Skips the doctor-style multi-layer bootstrap (no k8s / Temporal / Loki
+/// needed) and goes straight to forgedb via [`nico_doctor::hbn::SqlxHbnClient`].
+/// Auto-refreshes on the same cadence chain as the dashboard
+/// (`--interval` flag → `[output] tui_refresh` → `NICO_TUI_REFRESH` →
+/// 30s). Layout switches by terminal width (Option A wide, Option B
+/// narrow); sort defaults to status-first triage.
+pub async fn run_ops_hbn(args: OpsArgs, hbn_args: HbnPanelArgs) -> i32 {
+    if !io::stdout().is_terminal() {
+        eprintln!("{NON_TTY_MESSAGE}");
+        return 3;
+    }
+
+    let theme = match theme::resolve_theme(args.theme.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    let doctor_args = args.to_doctor_args();
+    let config = match nico_doctor::load_minimal_config(&doctor_args) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 1;
+        }
+    };
+
+    let interval = match resolve_interval(args.interval.as_deref(), config.output.tui_refresh) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    let sort_col = match hbn_args.sort.as_str() {
+        "status" => hbn_panel::SortColumn::Status,
+        "machine" | "machine-id" | "machine_id" => hbn_panel::SortColumn::MachineId,
+        other => {
+            eprintln!("error: invalid --sort {other:?}; expected `status` or `machine`");
+            return 1;
+        }
+    };
+
+    let client: Arc<dyn nico_doctor::hbn::HbnClient> =
+        match nico_doctor::hbn::SqlxHbnClient::new(&config.postgres.url) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("error: invalid postgres URL: {e}");
+                return 1;
+            }
+        };
+
+    install_panic_hook();
+
+    let mut terminal = match init_terminal() {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = restore_terminal_raw();
+            eprintln!("error: failed to enter TUI: {e}");
+            return 1;
+        }
+    };
+
+    let result = run_hbn_event_loop(&mut terminal, &theme, client, interval, sort_col).await;
+
+    let _ = restore_terminal(&mut terminal);
+
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+async fn run_hbn_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    theme: &Theme,
+    client: Arc<dyn nico_doctor::hbn::HbnClient>,
+    interval: Duration,
+    initial_sort: hbn_panel::SortColumn,
+) -> io::Result<()> {
+    use chrono::Utc;
+    use crossterm::event::{Event, KeyCode, KeyEventKind};
+
+    let (tx, mut rx) = mpsc::channel::<HbnTick>(8);
+    let mut sort_col = initial_sort;
+    let mut rows: Vec<nico_doctor::hbn::HbnRow> = Vec::new();
+    let mut last_error: Option<String> = None;
+    let mut refreshing = true;
+    let mut last_refreshed: Option<chrono::DateTime<chrono::Local>> = None;
+
+    spawn_hbn_refresh(client.clone(), tx.clone());
+
+    let mut events = EventStream::new();
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick; the spawn above already kicked one off.
+    tick.tick().await;
+
+    loop {
+        terminal.draw(|f| {
+            let area = f.area();
+            let layout = hbn_panel::select_layout(area.width);
+            hbn_panel::render_panel(&rows, layout, theme, f, area);
+            paint_hbn_status(
+                f,
+                theme,
+                area,
+                refreshing,
+                last_refreshed,
+                last_error.as_deref(),
+                sort_col,
+            );
+        })?;
+
+        tokio::select! {
+            maybe_event = events.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
+                        match k.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('r') | KeyCode::Char('R')
+                                if !refreshing =>
+                            {
+                                refreshing = true;
+                                spawn_hbn_refresh(client.clone(), tx.clone());
+                            }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                sort_col = match sort_col {
+                                    hbn_panel::SortColumn::Status => hbn_panel::SortColumn::MachineId,
+                                    hbn_panel::SortColumn::MachineId => hbn_panel::SortColumn::Status,
+                                };
+                                hbn_panel::sort_rows(&mut rows, sort_col);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Err(_)) | None => break,
+                    _ => {}
+                }
+            }
+            maybe_tick = rx.recv() => {
+                match maybe_tick {
+                    Some(HbnTick::Snapshots(snaps)) => {
+                        let now = Utc::now();
+                        rows = snaps.iter().map(|s| nico_doctor::hbn::aggregate_row(s, now)).collect();
+                        hbn_panel::sort_rows(&mut rows, sort_col);
+                        last_error = None;
+                        refreshing = false;
+                        last_refreshed = Some(chrono::Local::now());
+                    }
+                    Some(HbnTick::Error(msg)) => {
+                        last_error = Some(msg);
+                        refreshing = false;
+                        last_refreshed = Some(chrono::Local::now());
+                    }
+                    None => break,
+                }
+            }
+            _ = tick.tick() => {
+                if !refreshing {
+                    refreshing = true;
+                    spawn_hbn_refresh(client.clone(), tx.clone());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+enum HbnTick {
+    Snapshots(Vec<nico_doctor::hbn::HbnSnapshot>),
+    Error(String),
+}
+
+fn spawn_hbn_refresh(
+    client: Arc<dyn nico_doctor::hbn::HbnClient>,
+    tx: mpsc::Sender<HbnTick>,
+) {
+    tokio::spawn(async move {
+        let result = client.fetch_all_snapshots().await;
+        let msg = match result {
+            Ok(snaps) => HbnTick::Snapshots(snaps),
+            Err(e) => HbnTick::Error(e.to_string()),
+        };
+        let _ = tx.send(msg).await;
+    });
+}
+
+fn paint_hbn_status(
+    frame: &mut ratatui::Frame,
+    theme: &Theme,
+    area: ratatui::layout::Rect,
+    refreshing: bool,
+    last_refreshed: Option<chrono::DateTime<chrono::Local>>,
+    last_error: Option<&str>,
+    sort_col: hbn_panel::SortColumn,
+) {
+    use ratatui::layout::Rect;
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    if area.height < 1 {
+        return;
+    }
+    let strip = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+
+    let sort_label = match sort_col {
+        hbn_panel::SortColumn::Status => "status",
+        hbn_panel::SortColumn::MachineId => "machine",
+    };
+    let refreshed = last_refreshed
+        .map(|t| t.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let mut spans = vec![
+        Span::styled(
+            format!(" sort:{sort_label}  refreshed:{refreshed}  "),
+            Style::default().fg(theme.muted),
+        ),
+        Span::styled(
+            "[r]efresh [s]ort [q]uit",
+            Style::default().fg(theme.muted),
+        ),
+    ];
+    if refreshing {
+        spans.insert(
+            0,
+            Span::styled("⟳ refreshing  ", Style::default().fg(theme.warn)),
+        );
+    }
+    if let Some(err) = last_error {
+        spans.push(Span::styled(
+            format!("  error: {err}"),
+            Style::default().fg(theme.error),
+        ));
+    }
+    let p = Paragraph::new(Line::from(spans));
+    frame.render_widget(p, strip);
 }
 
 #[cfg(test)]

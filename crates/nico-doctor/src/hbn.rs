@@ -55,6 +55,13 @@ pub struct HbnSnapshot {
 #[async_trait]
 pub trait HbnClient: Send + Sync {
     async fn fetch_snapshot(&self, dpu_id: &str) -> Result<Option<HbnSnapshot>>;
+
+    /// Fetch the most recent `DpuNetworkStatus` + desired-config peer
+    /// for every DPU in forgedb. Powers the `nico ops hbn` per-DPU panel
+    /// (issue #209). Returns an empty vec when the schema is absent so
+    /// the panel renders an empty table instead of erroring on dev
+    /// clusters; populated otherwise.
+    async fn fetch_all_snapshots(&self) -> Result<Vec<HbnSnapshot>>;
 }
 
 /// Default sqlx-backed [`HbnClient`]. Tracer-bullet shape: we issue the
@@ -139,6 +146,146 @@ impl HbnClient for SqlxHbnClient {
             quarantine_state: r.8,
             last_seen_at: r.9,
         }))
+    }
+
+    async fn fetch_all_snapshots(&self) -> Result<Vec<HbnSnapshot>> {
+        let exists: (bool,) = match sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_name = 'dpu_network_status')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => return Err(anyhow::anyhow!("hbn schema probe failed: {e}")),
+        };
+        if !exists.0 {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<(
+            String,
+            bool,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Vec<String>,
+            Option<String>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(
+            "SELECT DISTINCT ON (s.dpu_id) \
+                s.dpu_id, \
+                s.container_running, \
+                s.hbn_version, \
+                s.applied_managed_host_config_version, \
+                s.applied_instance_network_config_version, \
+                d.managed_host_config_version, \
+                d.instance_network_config_version, \
+                COALESCE(s.bgp_alerts, ARRAY[]::text[]), \
+                s.quarantine_state, \
+                s.last_seen_at \
+             FROM dpu_network_status s \
+             JOIN dpu_desired_network_config d ON d.dpu_id = s.dpu_id \
+             ORDER BY s.dpu_id, s.last_seen_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("dpu_network_status fleet query failed: {e}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| HbnSnapshot {
+                dpu_id: r.0,
+                container_running: r.1,
+                hbn_version: r.2,
+                applied_managed_host_config_version: r.3,
+                applied_instance_network_config_version: r.4,
+                desired_managed_host_config_version: r.5,
+                desired_instance_network_config_version: r.6,
+                bgp_alerts: r.7,
+                quarantine_state: r.8,
+                last_seen_at: r.9,
+            })
+            .collect())
+    }
+}
+
+/// One row in the per-DPU HBN panel (`nico ops hbn`).
+///
+/// Pure aggregation of an [`HbnSnapshot`] into the columns the renderer
+/// displays — applied/desired versions per axis, drift booleans, an
+/// overall row status, and a drift-age proxy used by the renderer for the
+/// `DRIFT` column. Layout selection (Option A wide vs. Option B narrow)
+/// happens in `nico-ops::hbn_panel`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HbnRow {
+    pub machine_id: String,
+    pub hbn_version: String,
+    pub managed_host_applied: String,
+    pub managed_host_desired: String,
+    pub instance_network_applied: String,
+    pub instance_network_desired: String,
+    pub managed_host_drift: bool,
+    pub instance_network_drift: bool,
+    pub quarantine_state: Option<String>,
+    pub status: HbnRowStatus,
+    /// Lower-bound drift age: `now - last_seen_at` when either axis is
+    /// drifting. Zero when both axes are aligned. The DPU has been in
+    /// the observed applied state since at least `last_seen_at`.
+    pub drift_age: Duration,
+}
+
+/// Per-row status used to drive sortability and the Option B `STATUS`
+/// column. Precedence: `Quarantined` > `Unhealthy` > `Drift` > `Healthy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HbnRowStatus {
+    Healthy,
+    Drift,
+    Unhealthy,
+    Quarantined,
+}
+
+/// Aggregate one [`HbnSnapshot`] into a displayable [`HbnRow`].
+///
+/// `now` is provided by the caller so the function stays pure (no clock
+/// reads). Drift age is `now - last_seen_at` clamped at zero — and zero
+/// when neither axis is drifting.
+pub fn aggregate_row(snap: &HbnSnapshot, now: DateTime<Utc>) -> HbnRow {
+    let managed_host_drift =
+        snap.applied_managed_host_config_version != snap.desired_managed_host_config_version;
+    let instance_network_drift = snap.applied_instance_network_config_version
+        != snap.desired_instance_network_config_version;
+
+    let drift_age = if managed_host_drift || instance_network_drift {
+        (now - snap.last_seen_at).to_std().unwrap_or(Duration::ZERO)
+    } else {
+        Duration::ZERO
+    };
+
+    let status = if snap.quarantine_state.is_some() {
+        HbnRowStatus::Quarantined
+    } else if !snap.container_running {
+        HbnRowStatus::Unhealthy
+    } else if managed_host_drift || instance_network_drift {
+        HbnRowStatus::Drift
+    } else {
+        HbnRowStatus::Healthy
+    };
+
+    HbnRow {
+        machine_id: snap.dpu_id.clone(),
+        hbn_version: snap.hbn_version.clone(),
+        managed_host_applied: snap.applied_managed_host_config_version.clone(),
+        managed_host_desired: snap.desired_managed_host_config_version.clone(),
+        instance_network_applied: snap.applied_instance_network_config_version.clone(),
+        instance_network_desired: snap.desired_instance_network_config_version.clone(),
+        managed_host_drift,
+        instance_network_drift,
+        quarantine_state: snap.quarantine_state.clone(),
+        status,
+        drift_age,
     }
 }
 
@@ -474,6 +621,73 @@ mod tests {
             quarantine_state: None,
             last_seen_at: Utc::now(),
         }
+    }
+
+    // ── aggregate_row: per-DPU display columns ───────────────────────────
+
+    #[test]
+    fn aggregate_row_healthy_snapshot_yields_healthy_status_no_drift() {
+        let snap = snap_healthy();
+        let row = aggregate_row(&snap, snap.last_seen_at);
+        assert_eq!(row.machine_id, "dpu-42");
+        assert_eq!(row.hbn_version, "2.0.0-doca2.5.0");
+        assert_eq!(row.managed_host_applied, "v17");
+        assert_eq!(row.managed_host_desired, "v17");
+        assert_eq!(row.instance_network_applied, "v9");
+        assert_eq!(row.instance_network_desired, "v9");
+        assert!(!row.managed_host_drift);
+        assert!(!row.instance_network_drift);
+        assert!(row.quarantine_state.is_none());
+        assert_eq!(row.status, HbnRowStatus::Healthy);
+    }
+
+    #[test]
+    fn aggregate_row_managed_host_drift_marks_only_that_axis() {
+        let mut snap = snap_healthy();
+        snap.applied_managed_host_config_version = "v16".into();
+        snap.desired_managed_host_config_version = "v17".into();
+        let row = aggregate_row(&snap, snap.last_seen_at);
+        assert!(row.managed_host_drift);
+        assert!(!row.instance_network_drift);
+        assert_eq!(row.status, HbnRowStatus::Drift);
+    }
+
+    #[test]
+    fn aggregate_row_quarantined_snapshot_status_overrides_drift() {
+        let mut snap = snap_healthy();
+        snap.applied_managed_host_config_version = "v16".into();
+        snap.desired_managed_host_config_version = "v17".into();
+        snap.quarantine_state = Some("BlockAllTraffic".into());
+        let row = aggregate_row(&snap, snap.last_seen_at);
+        assert_eq!(row.quarantine_state.as_deref(), Some("BlockAllTraffic"));
+        assert_eq!(row.status, HbnRowStatus::Quarantined);
+    }
+
+    #[test]
+    fn aggregate_row_container_down_marks_unhealthy() {
+        let mut snap = snap_healthy();
+        snap.container_running = false;
+        let row = aggregate_row(&snap, snap.last_seen_at);
+        assert_eq!(row.status, HbnRowStatus::Unhealthy);
+    }
+
+    #[test]
+    fn aggregate_row_drift_age_uses_last_seen_when_drifting() {
+        let mut snap = snap_healthy();
+        snap.applied_instance_network_config_version = "v8".into();
+        snap.desired_instance_network_config_version = "v9".into();
+        snap.last_seen_at = Utc::now() - chrono::Duration::seconds(240);
+        let row = aggregate_row(&snap, Utc::now());
+        // Drift age = now - last_seen_at when drifting
+        let secs = row.drift_age.as_secs();
+        assert!((235..=245).contains(&secs), "drift_age was {secs}s");
+    }
+
+    #[test]
+    fn aggregate_row_drift_age_zero_when_not_drifting() {
+        let snap = snap_healthy();
+        let row = aggregate_row(&snap, Utc::now() + chrono::Duration::seconds(120));
+        assert_eq!(row.drift_age, std::time::Duration::ZERO);
     }
 
     // ── compare_hbn_versions ──────────────────────────────────────────────

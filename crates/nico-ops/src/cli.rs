@@ -1,7 +1,10 @@
-use clap::Args;
+use clap::{Args, Subcommand};
 
 #[derive(Args, Debug, Clone)]
 pub struct OpsArgs {
+    #[command(subcommand)]
+    pub command: Option<OpsCommand>,
+
     #[arg(short, long, help = "Kubernetes namespace")]
     pub namespace: Option<String>,
 
@@ -44,6 +47,7 @@ pub struct OpsArgs {
 impl Default for OpsArgs {
     fn default() -> Self {
         Self {
+            command: None,
             namespace: None,
             context: None,
             skip: vec![],
@@ -56,6 +60,26 @@ impl Default for OpsArgs {
             interval: None,
         }
     }
+}
+
+/// Optional subcommand under `nico ops`. When absent, ops runs the full
+/// dashboard. When present, ops opens the focused per-target panel the
+/// subcommand selects.
+#[derive(Subcommand, Debug, Clone)]
+pub enum OpsCommand {
+    /// Per-DPU HBN panel — the at-a-glance view for a tenant-onboarding
+    /// incident (issue #209).
+    Hbn(HbnPanelArgs),
+}
+
+/// Args for `nico ops hbn`. Layout is auto-selected by terminal width
+/// (Option A wide, Option B narrow); sort defaults to triage-first
+/// (Quarantined > Unhealthy > Drift > Healthy).
+#[derive(Args, Debug, Clone, Default)]
+pub struct HbnPanelArgs {
+    /// Sort by `status` (default — worst-first) or `machine` (alphabetical).
+    #[arg(long, value_name = "COL", default_value = "status")]
+    pub sort: String,
 }
 
 impl OpsArgs {

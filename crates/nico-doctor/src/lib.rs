@@ -257,7 +257,12 @@ pub async fn run_hbn(args: &DoctorArgs, hbn_args: HbnArgs) -> i32 {
     exit_code(&report)
 }
 
-fn load_minimal_config(args: &DoctorArgs) -> Result<Config, String> {
+/// Resolve the merged [`Config`] (config file + CLI overrides) for a
+/// doctor-style invocation. Exposed so other crates (e.g. `nico-ops`)
+/// that share the doctor flag surface but skip the full bootstrap can
+/// still read `postgres.url`, `cluster.namespace`, etc. without
+/// duplicating the merge logic.
+pub fn load_minimal_config(args: &DoctorArgs) -> Result<Config, String> {
     let config_path = args
         .config
         .as_deref()
