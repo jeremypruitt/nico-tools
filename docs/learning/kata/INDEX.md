@@ -1,9 +1,9 @@
 # Kata Index
 
 Short hands-on exercises. Targets:
-- Week 1–2: devspace local mocks (kill things, fix them).
-- Week 3+: NVIDIA lab (real DPUs, real switches).
-- Week 4+: GB300 hardware at IREN.
+- Week 1–2: devspace local mocks (kill things, fix them)
+- Week 3+: lab (real DPUs, real switches)
+- Week 4+: GB300 hardware
 
 Format: each kata gets its own file (`kNN-<slug>.md`) when first run. Until then it's a planned seed.
 
