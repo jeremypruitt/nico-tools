@@ -27,8 +27,14 @@ pub use nico_common::config::DpuConfig;
 /// Number of detail lines a drift sub-check emits, capped to match #184.
 pub const DRIFT_DETAIL_TOP_N: usize = 5;
 
-/// One row in the fleet view — the union of `DpuNetworkStatus` columns
-/// and the desired-config peer needed by all six sub-checks.
+/// One row in the fleet view — the union of producer-side fields the
+/// six sub-checks need: applied state from `machines.network_status_observation`,
+/// desired managed-host version from `machines.network_config_version`
+/// (top-level column), desired quarantine + other config from
+/// `machines.network_config` JSON, agent alerts from
+/// `machines.dpu_agent_health_report` JSON, and desired instance
+/// version from `instances.network_config_version` (joined on
+/// `instances.machine_id`). PRD-002.
 #[derive(Debug, Clone)]
 pub struct DpuSnapshot {
     pub dpu_id: String,
@@ -43,17 +49,18 @@ pub struct DpuSnapshot {
 }
 
 /// One entry from the agent's `HealthReport.alerts` array, persisted on
-/// `machine.health` as JSONB. The `dpu` layer only consumes the fields
-/// it acts on — `id` to filter for a known probe (e.g.
-/// `PostConfigCheckWait`) and `in_alert_since` to age the alert.
+/// `machines.dpu_agent_health_report` as JSONB (PRD-002). The `dpu`
+/// layer only consumes the fields it acts on — `id` to filter for a
+/// known probe (e.g. `PostConfigCheckWait`) and `in_alert_since` to
+/// age the alert.
 #[derive(Debug, Clone)]
 pub struct HealthAlert {
     pub id: String,
     pub in_alert_since: Option<DateTime<Utc>>,
 }
 
-/// Extract `HealthAlert`s from the raw `machine.health` JSONB blob.
-/// Tolerates the column being NULL or having no `alerts` array.
+/// Extract `HealthAlert`s from the raw `machines.dpu_agent_health_report`
+/// JSONB blob. Tolerates the column being NULL or having no `alerts` array.
 /// Accepts `in_alert_since` as RFC3339 string, Unix epoch seconds (i64),
 /// or `null` — the agent's serializer history has used all three.
 pub fn parse_health_alerts(blob: Option<&serde_json::Value>) -> Vec<HealthAlert> {
@@ -84,20 +91,43 @@ fn parse_in_alert_since(v: &serde_json::Value) -> Option<DateTime<Utc>> {
 }
 
 /// Read-only seam over the fleet data layer (forgedb + Postgres). The
-/// real impl issues one bulk `DpuNetworkStatus` + desired-config join
-/// covering every DPU; tests inject mocks. Empty vec means "no DPUs"
-/// (or schema absent on dev clusters — we degrade gracefully).
+/// real impl issues one bulk SELECT over `machines` (producer-side
+/// JSON columns) joined with `instances`, covering every DPU; tests
+/// inject mocks. Empty vec means "no DPUs" (or schema absent on dev
+/// clusters — we degrade gracefully).
 #[async_trait]
 pub trait DpuClient: Send + Sync {
     async fn fetch_fleet(&self) -> Result<Vec<DpuSnapshot>>;
 }
 
-/// Default sqlx-backed [`DpuClient`]. Single bulk query joins
-/// `dpu_network_status` (latest row per DPU) with
-/// `dpu_desired_network_config` to produce one [`DpuSnapshot`] per DPU.
+/// Default sqlx-backed [`DpuClient`]. Single bulk query reads
+/// producer-side state from `machines` row (PRD-002): `network_status_observation`
+/// JSON for applied state, top-level `network_config_version` column for
+/// the desired managed-host version, `network_config` JSON for desired
+/// quarantine state, and `instances.network_config_version` (joined on
+/// `instances.machine_id`) for the desired instance version.
 pub struct SqlxDpuClient {
     pool: sqlx::PgPool,
 }
+
+/// SQL used by [`SqlxDpuClient::fetch_fleet`]. Extracted as a constant
+/// so the schema choice (which tables / JSON paths the layer reads) is
+/// pinned by a unit test, even though we can't exercise the full query
+/// without a live postgres.
+pub(crate) const FETCH_FLEET_SQL: &str = "\
+    SELECT \
+        m.id, \
+        COALESCE(m.network_status_observation->>'network_config_version', ''), \
+        COALESCE(m.network_status_observation->'instance_network_observation'->>'config_version', ''), \
+        m.network_config_version, \
+        COALESCE(i.network_config_version, ''), \
+        m.network_config->'quarantine_state'->>'mode', \
+        (m.network_status_observation->>'observed_at')::timestamptz, \
+        (m.network_status_observation->>'client_certificate_expiry')::bigint, \
+        m.dpu_agent_health_report \
+    FROM machines m \
+    LEFT JOIN instances i ON i.machine_id = m.id \
+    WHERE m.network_status_observation IS NOT NULL";
 
 impl SqlxDpuClient {
     pub fn new(url: &str) -> Result<Self> {
@@ -114,7 +144,7 @@ impl DpuClient for SqlxDpuClient {
     async fn fetch_fleet(&self) -> Result<Vec<DpuSnapshot>> {
         let exists: (bool,) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_name = 'dpu_network_status')",
+             WHERE table_name = 'machines')",
         )
         .fetch_one(&self.pool)
         .await
@@ -123,10 +153,6 @@ impl DpuClient for SqlxDpuClient {
             return Ok(Vec::new());
         }
 
-        // `machine.health` is JSONB on the upstream `machine` table
-        // (migration `20240919183221_machine_health.go`). The join is
-        // LEFT so a missing/dropped `machine` row leaves alerts empty
-        // rather than excluding the DPU from the fleet roll-up.
         let rows: Vec<(
             String,
             String,
@@ -137,25 +163,10 @@ impl DpuClient for SqlxDpuClient {
             DateTime<Utc>,
             Option<i64>,
             Option<serde_json::Value>,
-        )> = sqlx::query_as(
-            "SELECT DISTINCT ON (s.dpu_id) \
-                s.dpu_id, \
-                s.applied_managed_host_config_version, \
-                s.applied_instance_network_config_version, \
-                d.managed_host_config_version, \
-                d.instance_network_config_version, \
-                s.quarantine_state, \
-                s.last_seen_at, \
-                s.client_certificate_expiry_unix_epoch_secs, \
-                m.health \
-             FROM dpu_network_status s \
-             JOIN dpu_desired_network_config d ON d.dpu_id = s.dpu_id \
-             LEFT JOIN machine m ON m.dpu_id = s.dpu_id \
-             ORDER BY s.dpu_id, s.last_seen_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("dpu fleet query failed: {e}"))?;
+        )> = sqlx::query_as(FETCH_FLEET_SQL)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("dpu fleet query failed: {e}"))?;
 
         Ok(rows
             .into_iter()
@@ -985,6 +996,42 @@ mod tests {
         assert_eq!(d.len(), DRIFT_DETAIL_TOP_N);
         // Oldest first — dpu-9 has age 60+90=150s, the largest.
         assert!(d[0].value.contains("dpu-9"), "{}", d[0].value);
+    }
+
+    // ── fetch_fleet schema (PRD-002) ────────────────────────────────────
+
+    /// PRD-002 acceptance: fleet query reads producer-side JSON columns
+    /// from the `machines` row, never the (non-existent) old tables.
+    #[test]
+    fn fetch_fleet_sql_targets_producer_side_machines_columns() {
+        let sql = FETCH_FLEET_SQL;
+        // Old schema must not be referenced.
+        assert!(
+            !sql.contains("dpu_network_status"),
+            "old table dpu_network_status still referenced: {sql}"
+        );
+        assert!(
+            !sql.contains("dpu_desired_network_config"),
+            "old table dpu_desired_network_config still referenced: {sql}"
+        );
+        // New schema must be referenced.
+        assert!(sql.contains("FROM machines"), "missing machines table: {sql}");
+        assert!(
+            sql.contains("network_status_observation"),
+            "missing applied-side JSON column: {sql}"
+        );
+        assert!(
+            sql.contains("network_config_version"),
+            "missing desired managed-host version column: {sql}"
+        );
+        assert!(
+            sql.contains("network_config->'quarantine_state'"),
+            "quarantine must be read desired-side from network_config: {sql}"
+        );
+        assert!(
+            sql.contains("dpu_agent_health_report"),
+            "agent alert JSON column must be read for probe-stuck: {sql}"
+        );
     }
 
     // ── drift threshold boundary ────────────────────────────────────────
