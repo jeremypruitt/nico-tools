@@ -27,6 +27,11 @@ pub struct DpuConfig {
     pub lost_connection_warn: Duration,
     pub lost_connection_fail_age: Duration,
     pub lost_connection_fail_pct: f64,
+    /// Grace window before a `PostConfigCheckWait` health probe in alert
+    /// state trips the `probe-stuck` sub-check (issue #239). Briefly
+    /// stuck probes are normal during config rollouts; > grace is the
+    /// signal that the agent has not converged.
+    pub probe_stuck_grace: Duration,
 }
 
 impl Default for DpuConfig {
@@ -41,6 +46,7 @@ impl Default for DpuConfig {
             lost_connection_warn: Duration::from_secs(5 * 60),
             lost_connection_fail_age: Duration::from_secs(30 * 60),
             lost_connection_fail_pct: 0.05,
+            probe_stuck_grace: Duration::from_secs(30),
         }
     }
 }
@@ -212,6 +218,7 @@ struct FileDpuConfig {
     lost_connection_warn: Option<String>,
     lost_connection_fail_age: Option<String>,
     lost_connection_fail_pct: Option<f64>,
+    probe_stuck_grace: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -377,6 +384,7 @@ impl Config {
             ("cert_fail", dpu_file.cert_fail),
             ("lost_connection_warn", dpu_file.lost_connection_warn),
             ("lost_connection_fail_age", dpu_file.lost_connection_fail_age),
+            ("probe_stuck_grace", dpu_file.probe_stuck_grace),
         ] {
             if let Some(s) = val {
                 let d = humantime::parse_duration(&s)
@@ -396,6 +404,7 @@ impl Config {
             ("cert_fail", "NICO_DPU_CERT_FAIL"),
             ("lost_connection_warn", "NICO_DPU_LOST_CONNECTION_WARN"),
             ("lost_connection_fail_age", "NICO_DPU_LOST_CONNECTION_FAIL_AGE"),
+            ("probe_stuck_grace", "NICO_DPU_PROBE_STUCK_GRACE"),
         ] {
             if let Some(s) = env.get(env_key) {
                 let d = humantime::parse_duration(s)
@@ -447,6 +456,7 @@ impl DpuConfig {
             "cert_fail" => self.cert_fail = d,
             "lost_connection_warn" => self.lost_connection_warn = d,
             "lost_connection_fail_age" => self.lost_connection_fail_age = d,
+            "probe_stuck_grace" => self.probe_stuck_grace = d,
             _ => unreachable!("unknown dpu duration field {name}"),
         }
     }

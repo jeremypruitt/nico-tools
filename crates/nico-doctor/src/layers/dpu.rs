@@ -62,7 +62,7 @@ mod tests {
     use anyhow::Result;
     use chrono::Duration as ChronoDuration;
 
-    use crate::dpu::DpuSnapshot;
+    use crate::dpu::{DpuSnapshot, HealthAlert};
 
     struct StubClient {
         fleet: std::sync::Mutex<Option<Result<Vec<DpuSnapshot>, String>>>,
@@ -101,6 +101,7 @@ mod tests {
             quarantine_state: None,
             last_seen_at: Utc::now(),
             client_certificate_expiry: None,
+            health_alerts: Vec::new(),
         }
     }
 
@@ -155,5 +156,95 @@ mod tests {
         let result = layer.run(&RunOpts::default()).await;
         assert_eq!(result.status, Status::Unknown);
         assert!(result.checks[0].value.contains("postgres unreachable"));
+    }
+
+    // ── probe-stuck integration (issue #239 acceptance) ─────────────────
+
+    fn alert(id: &str, since: Option<chrono::DateTime<Utc>>) -> HealthAlert {
+        HealthAlert { id: id.into(), in_alert_since: since }
+    }
+
+    /// Acceptance variant: probe absent → pass.
+    #[tokio::test]
+    async fn probe_stuck_layer_no_alert_is_ok() {
+        let s = snap("dpu-1");
+        let layer = DpuLayer::new(StubClient::ok(vec![s]), DpuConfig::default());
+        let result = layer.run(&RunOpts::default()).await;
+        let h = result
+            .checks
+            .iter()
+            .find(|c| c.name == "probe-stuck" && c.kind == CheckKind::Headline)
+            .expect("probe-stuck headline present");
+        assert_eq!(h.status, Status::Ok);
+        assert_eq!(result.status, Status::Ok);
+    }
+
+    /// Acceptance variant: probe present < grace → pass.
+    #[tokio::test]
+    async fn probe_stuck_layer_alert_within_grace_is_ok() {
+        let now = Utc::now();
+        let mut s = snap("dpu-1");
+        s.health_alerts = vec![alert(
+            "PostConfigCheckWait",
+            Some(now - ChronoDuration::seconds(5)),
+        )];
+        let layer = DpuLayer::new(StubClient::ok(vec![s]), DpuConfig::default());
+        let result = layer.run(&RunOpts::default()).await;
+        let h = result
+            .checks
+            .iter()
+            .find(|c| c.name == "probe-stuck" && c.kind == CheckKind::Headline)
+            .expect("probe-stuck headline present");
+        assert_eq!(h.status, Status::Ok);
+    }
+
+    /// Acceptance variant: probe present > grace → fail; layer status = Fail.
+    #[tokio::test]
+    async fn probe_stuck_layer_alert_past_grace_is_fail() {
+        let now = Utc::now();
+        let mut s = snap("dpu-stuck");
+        s.health_alerts = vec![alert(
+            "PostConfigCheckWait",
+            Some(now - ChronoDuration::seconds(120)),
+        )];
+        let layer = DpuLayer::new(StubClient::ok(vec![s]), DpuConfig::default());
+        let result = layer.run(&RunOpts::default()).await;
+        let h = result
+            .checks
+            .iter()
+            .find(|c| c.name == "probe-stuck" && c.kind == CheckKind::Headline)
+            .expect("probe-stuck headline present");
+        assert_eq!(h.status, Status::Fail);
+        assert!(h.value.starts_with("1 DPUs"));
+        // Layer aggregate flips to Fail.
+        assert_eq!(result.status, Status::Fail);
+        // Per-DPU detail line points the operator to per-DPU drill-down.
+        let detail = result
+            .checks
+            .iter()
+            .find(|c| c.name == "probe-stuck" && c.kind == CheckKind::Detail)
+            .expect("probe-stuck detail present");
+        assert!(detail.value.contains("dpu-stuck"));
+        assert_eq!(
+            detail.next_command.as_deref(),
+            Some("nico doctor hbn dpu-stuck"),
+        );
+    }
+
+    /// Acceptance variant: probe cleared between reports → pass.
+    /// Modeled by a subsequent fleet snapshot whose `health_alerts` no
+    /// longer contains a `PostConfigCheckWait` entry.
+    #[tokio::test]
+    async fn probe_stuck_layer_alert_cleared_between_reports_is_ok() {
+        let mut s = snap("dpu-1");
+        s.health_alerts = Vec::new(); // alert cleared upstream
+        let layer = DpuLayer::new(StubClient::ok(vec![s]), DpuConfig::default());
+        let result = layer.run(&RunOpts::default()).await;
+        let h = result
+            .checks
+            .iter()
+            .find(|c| c.name == "probe-stuck" && c.kind == CheckKind::Headline)
+            .expect("probe-stuck headline present");
+        assert_eq!(h.status, Status::Ok);
     }
 }
