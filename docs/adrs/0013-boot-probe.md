@@ -2,6 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-05-07
+- **Amended:** 2026-05-09 (PRD-001: `detect_deployment_type` step added to `validating` section)
 
 ## Context
 
@@ -205,6 +206,60 @@ Each step has an explicit, configurable timeout (see issue #1):
 | reach postgres                    | 2s             |
 
 Worst-case bound on the boot probe with all parallelism applied: ~10s.
+
+### `detect_deployment_type` step (2026-05-09 amendment)
+
+PRD-001 adds a fourth step to the `validating` section: `detect_deployment_type`
+(plain-English label `"detect deployment-type"`, technical name
+`detect_deployment_type`). It resolves the active cluster to one of the three
+named `DeploymentType` variants — `full`, `core-only`, `rest-only-mock` — so
+the rest of bootstrap (namespace existence check, gRPC address) can use the
+deployment-type's defaults instead of failing on a hardcoded namespace that
+doesn't exist on the active cluster.
+
+**Placement.** After `credentials`, before `namespace_exists`, in the
+`validating` section. The ordering matters: `namespace_exists` checks the
+controller namespace, and the resolved `DeploymentType` supplies that
+namespace's default (`forge-system` for full / core-only,
+`nico-rest` for rest-only-mock). The four `validating` steps still run
+concurrently after the `reach API server` gate per the section's normal
+fail-aware semantics — the constraint is *which* namespace
+`namespace_exists` checks, not *when* it runs relative to detection.
+
+**Force mode short-circuits the step.** When the user passed
+`--deployment-type=<value>` (CLI), set `[cluster] deployment_type` (config),
+or set `NICO_DEPLOYMENT_TYPE` (env) — including `force` — the step passes
+instantly without consulting the cluster. Detection only runs in `auto`
+mode (the default when no override is specified). `force` follows the
+same short-circuit path because PRD-001's hybrid trust model is "trust
+the user's intent over detection"; force just means "and skip the
+deployment-type-derived defaults too".
+
+**Failure semantics.** Two distinct failure modes, both rendered through
+the boot probe's existing `Failed` row treatment (full-brightness label
+in red, error card below):
+
+- *Timeout* — the step exceeds `timeouts.preflight` (5s default). The
+  detection ladder makes 3 cluster reads in the worst case
+  (`Service`, `Namespace`, `CRD` lists), so a 5s budget is generous on a
+  responsive cluster and trips when the API server is degraded. Per the
+  ADR's general timeout-as-failure rule for the boot probe, this
+  surfaces as a failed step with the `try:` line pointing at the
+  manual-override escape hatch (`pass --deployment-type=<...> or =force`).
+- *No-match-with-diagnostic-data* — the detection ladder
+  (workload → namespace inventory → CRD inventory) ran to completion but
+  none of the three rungs matched a known shape. The error message
+  carries the diagnostic payload — observed namespaces, observed
+  services, observed CRDs — so the user can see *why* nothing matched
+  before re-running with `--deployment-type=<...>` or `=force`.
+
+In both cases the step's `next_command` is the same recovery hint:
+`pass --deployment-type=<full|core-only|rest-only-mock> or =force`.
+
+**Budget.** Same 5s as the other `validating` steps
+(`timeouts.preflight`). Adding it keeps the worst-case bound at ~10s
+because the four `validating` steps run concurrently within the
+section's parallel group.
 
 ## Consequences
 
