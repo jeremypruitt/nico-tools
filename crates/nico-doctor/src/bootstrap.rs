@@ -129,6 +129,12 @@ pub struct LayerInputs {
     pub reach_mgr_present: bool,
     pub skip: Vec<String>,
     pub dpu_config: DpuConfig,
+    /// Resolved deployment-type (PRD-001). Layers that depend on
+    /// `forgedb_present()` (the `dpu` layer; see also per-DPU drill-downs)
+    /// consult this to decide whether to skip with an "n/a in <type>" reason.
+    /// `None` means detection is unresolved (auto, with no probe wired) —
+    /// layers fall back to their pre-PRD-001 behavior in that case.
+    pub deployment_type: Option<DeploymentType>,
 }
 
 /// Build the best-effort log source chain (Loki preferred, k8s fallback)
@@ -348,6 +354,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         reach_mgr_present: reach_mgr.is_some(),
         skip: args.skip.clone(),
         dpu_config: config.dpu,
+        deployment_type: config.cluster.deployment_type,
     };
 
     let log_source = build_log_source(&inputs);
@@ -910,7 +917,60 @@ mod tests {
             reach_mgr_present: false,
             skip: vec![],
             dpu_config: DpuConfig::default(),
+            deployment_type: None,
         }
+    }
+
+    #[tokio::test]
+    async fn dpu_layer_skips_with_reason_when_deployment_type_lacks_forgedb() {
+        let mut inputs = empty_inputs();
+        inputs.deployment_type = Some(DeploymentType::RestOnlyMock);
+        let layers = prepare_layers(&inputs);
+        let dpu = layers.iter().find(|l| l.name() == "dpu").expect("dpu layer present");
+        let result = dpu.run(&RunOpts::default()).await;
+        assert_eq!(
+            result.status,
+            nico_common::output::Status::Skipped,
+            "dpu must skip when forgedb absent",
+        );
+        assert_eq!(
+            result.skipped_reason.as_deref(),
+            Some("n/a in rest-only-mock: no forgedb"),
+        );
+    }
+
+    #[tokio::test]
+    async fn dpu_layer_runs_normally_when_deployment_type_has_forgedb() {
+        for dt in [
+            DeploymentType::Full,
+            DeploymentType::CoreOnly,
+            DeploymentType::Force,
+        ] {
+            let mut inputs = empty_inputs();
+            inputs.deployment_type = Some(dt);
+            let layers = prepare_layers(&inputs);
+            let dpu = layers.iter().find(|l| l.name() == "dpu").expect("dpu layer present");
+            let result = dpu.run(&RunOpts::default()).await;
+            assert_ne!(
+                result.status,
+                nico_common::output::Status::Skipped,
+                "dpu must NOT skip in {dt:?} (forgedb present)",
+            );
+            assert_eq!(result.skipped_reason, None, "{dt:?}: no skip reason expected");
+        }
+    }
+
+    #[tokio::test]
+    async fn dpu_layer_runs_normally_when_deployment_type_unresolved() {
+        // None means auto-detect didn't resolve a type — preserve pre-PRD-001
+        // behavior: don't gate. (Layer either runs or hits UnconfiguredLayer
+        // for an invalid postgres URL.)
+        let mut inputs = empty_inputs();
+        inputs.deployment_type = None;
+        let layers = prepare_layers(&inputs);
+        let dpu = layers.iter().find(|l| l.name() == "dpu").expect("dpu layer present");
+        let result = dpu.run(&RunOpts::default()).await;
+        assert_ne!(result.status, nico_common::output::Status::Skipped);
     }
 
     #[tokio::test]

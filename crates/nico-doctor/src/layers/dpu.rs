@@ -18,7 +18,20 @@ use crate::layer::{self, Check, CheckKind, Layer, LayerOutcome, RunOpts};
 pub const NAME: &str = "dpu";
 
 /// Factory consumed by `bootstrap::prepare_layers`.
+///
+/// Three resolution paths:
+///
+/// 1. Resolved deployment-type without forgedb (`rest-only-mock`) →
+///    [`SkippedLayer`] with reason `n/a in <type>: no forgedb` per
+///    PRD-001 §"Status semantics for 'n/a in this deployment-type'".
+///    This is distinct from [`UnconfiguredLayer`] (the `Unknown` /
+///    soft-fail path) — n/a-by-design must not look like a fail.
+/// 2. Invalid postgres URL → [`UnconfiguredLayer`] (`Unknown`).
+/// 3. Otherwise → live [`DpuLayer`].
 pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
+    if let Some(skip) = layer::forgedb_skip_layer(NAME, inputs.deployment_type) {
+        return skip;
+    }
     match SqlxDpuClient::new(&inputs.postgres_url) {
         Ok(client) => Box::new(DpuLayer::new(Arc::new(client), inputs.dpu_config)),
         Err(_) => layer::UnconfiguredLayer::new(NAME, "invalid postgres URL"),

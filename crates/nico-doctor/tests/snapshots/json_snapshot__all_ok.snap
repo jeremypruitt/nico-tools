@@ -1,6 +1,5 @@
 ---
 source: crates/nico-doctor/tests/json_snapshot.rs
-assertion_line: 67
 expression: v
 ---
 {
@@ -29,6 +28,7 @@ expression: v
       "delta": "unchanged",
       "duration_ms": 42,
       "name": "cluster",
+      "skipped_reason": null,
       "status": "ok"
     },
     {
@@ -49,6 +49,7 @@ expression: v
       "delta": "unchanged",
       "duration_ms": 42,
       "name": "logs",
+      "skipped_reason": null,
       "status": "ok"
     },
     {
@@ -69,6 +70,7 @@ expression: v
       "delta": "unchanged",
       "duration_ms": 42,
       "name": "workflows",
+      "skipped_reason": null,
       "status": "ok"
     }
   ],

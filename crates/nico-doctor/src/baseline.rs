@@ -132,6 +132,7 @@ mod tests {
                     status: status.clone(),
                     checks: vec![],
                     duration_ms: 0,
+                    skipped_reason: None,
                 })
                 .collect(),
         }

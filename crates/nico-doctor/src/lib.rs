@@ -78,6 +78,7 @@ pub async fn run_streaming(
                         status: Status::Unknown,
                         checks: vec![],
                         duration_ms: timeout.as_millis() as u64,
+                        skipped_reason: None,
                     },
                 }
             }
@@ -225,18 +226,23 @@ pub async fn run_hbn(args: &DoctorArgs, hbn_args: HbnArgs) -> i32 {
         None => hbn::DEFAULT_FRESHNESS_THRESHOLD,
     };
 
-    let client: Arc<dyn hbn::HbnClient> = match hbn::SqlxHbnClient::new(&config.postgres.url) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            eprintln!("error: invalid postgres URL: {e}");
-            eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
-            return 1;
-        }
+    let layers: Vec<Box<dyn layer::Layer>> = if let Some(skip) =
+        layer::forgedb_skip_layer("hbn", config.cluster.deployment_type)
+    {
+        vec![skip]
+    } else {
+        let client: Arc<dyn hbn::HbnClient> = match hbn::SqlxHbnClient::new(&config.postgres.url) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("error: invalid postgres URL: {e}");
+                eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
+                return 1;
+            }
+        };
+        let l = layers::hbn::HbnLayer::new(client, hbn_args.dpu_id.clone())
+            .with_freshness_threshold(freshness);
+        vec![Box::new(l)]
     };
-
-    let layer = layers::hbn::HbnLayer::new(client, hbn_args.dpu_id.clone())
-        .with_freshness_threshold(freshness);
-    let layers: Vec<Box<dyn layer::Layer>> = vec![Box::new(layer)];
 
     let opts = layer::RunOpts {
         namespace: config.cluster.namespace.clone(),
@@ -306,22 +312,24 @@ pub async fn run_dpu_isolation(args: &DoctorArgs, iso_args: DpuIsolationArgs) ->
         None => dpu_isolation::DEFAULT_FRESHNESS_THRESHOLD,
     };
 
-    let client: Arc<dyn dpu_isolation::DpuIsolationClient> =
-        match dpu_isolation::SqlxDpuIsolationClient::new(&config.postgres.url) {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                eprintln!("error: invalid postgres URL: {e}");
-                eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
-                return 1;
-            }
-        };
-
-    let layer = layers::dpu_isolation::DpuIsolationLayer::new(
-        client,
-        iso_args.machine_id.clone(),
-    )
-    .with_freshness_threshold(freshness);
-    let layers: Vec<Box<dyn layer::Layer>> = vec![Box::new(layer)];
+    let layers: Vec<Box<dyn layer::Layer>> = if let Some(skip) =
+        layer::forgedb_skip_layer("dpu_isolation", config.cluster.deployment_type)
+    {
+        vec![skip]
+    } else {
+        let client: Arc<dyn dpu_isolation::DpuIsolationClient> =
+            match dpu_isolation::SqlxDpuIsolationClient::new(&config.postgres.url) {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    eprintln!("error: invalid postgres URL: {e}");
+                    eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
+                    return 1;
+                }
+            };
+        let l = layers::dpu_isolation::DpuIsolationLayer::new(client, iso_args.machine_id.clone())
+            .with_freshness_threshold(freshness);
+        vec![Box::new(l)]
+    };
 
     let opts = layer::RunOpts {
         namespace: config.cluster.namespace.clone(),
@@ -391,19 +399,24 @@ pub async fn run_dpu_cert(args: &DoctorArgs, cert_args: DpuCertArgs) -> i32 {
         None => dpu_cert::DEFAULT_WARN_THRESHOLD,
     };
 
-    let client: Arc<dyn dpu_cert::DpuCertClient> =
-        match dpu_cert::SqlxDpuCertClient::new(&config.postgres.url) {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                eprintln!("error: invalid postgres URL: {e}");
-                eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
-                return 1;
-            }
-        };
-
-    let layer = layers::dpu_cert::DpuCertLayer::new(client, cert_args.dpu_id.clone())
-        .with_warn_threshold(warn_threshold);
-    let layers: Vec<Box<dyn layer::Layer>> = vec![Box::new(layer)];
+    let layers: Vec<Box<dyn layer::Layer>> = if let Some(skip) =
+        layer::forgedb_skip_layer("dpu_cert", config.cluster.deployment_type)
+    {
+        vec![skip]
+    } else {
+        let client: Arc<dyn dpu_cert::DpuCertClient> =
+            match dpu_cert::SqlxDpuCertClient::new(&config.postgres.url) {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    eprintln!("error: invalid postgres URL: {e}");
+                    eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
+                    return 1;
+                }
+            };
+        let l = layers::dpu_cert::DpuCertLayer::new(client, cert_args.dpu_id.clone())
+            .with_warn_threshold(warn_threshold);
+        vec![Box::new(l)]
+    };
 
     let opts = layer::RunOpts {
         namespace: config.cluster.namespace.clone(),

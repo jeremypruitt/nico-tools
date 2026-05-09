@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use async_trait::async_trait;
+use nico_common::config::DeploymentType;
 use nico_common::output::Status;
 
 #[derive(Clone)]
@@ -53,11 +54,16 @@ pub struct LayerResult {
     pub status: Status,
     pub checks: Vec<Check>,
     pub duration_ms: u64,
+    /// Operator-readable explanation when `status == Skipped`. `None` for
+    /// unconditional skips (e.g. `--skip dpu`); `Some` when a layer is
+    /// n/a-by-design under the resolved deployment-type — see PRD-001 §
+    /// "Status semantics for 'n/a in this deployment-type'".
+    pub skipped_reason: Option<String>,
 }
 
 pub enum LayerOutcome {
     Checks(Vec<Check>),
-    Skipped,
+    Skipped { reason: Option<String> },
 }
 
 #[async_trait]
@@ -68,15 +74,16 @@ pub trait Layer: Send + Sync {
     async fn run(&self, opts: &RunOpts) -> LayerResult {
         let start = Instant::now();
         let outcome = self.collect(opts).await;
-        let (status, checks) = match outcome {
-            LayerOutcome::Skipped => (Status::Skipped, vec![]),
-            LayerOutcome::Checks(checks) => (aggregate_status(&checks), checks),
+        let (status, checks, skipped_reason) = match outcome {
+            LayerOutcome::Skipped { reason } => (Status::Skipped, vec![], reason),
+            LayerOutcome::Checks(checks) => (aggregate_status(&checks), checks, None),
         };
         LayerResult {
             name: self.name(),
             status,
             checks,
             duration_ms: start.elapsed().as_millis() as u64,
+            skipped_reason,
         }
     }
 }
@@ -97,12 +104,23 @@ pub fn aggregate_status(checks: &[Check]) -> Status {
 
 pub struct SkippedLayer {
     name: &'static str,
+    reason: Option<String>,
 }
 
 impl SkippedLayer {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(name: &'static str) -> Box<dyn Layer> {
-        Box::new(Self { name })
+        Box::new(Self { name, reason: None })
+    }
+
+    /// Skip with an operator-readable reason — used when a layer is
+    /// n/a-by-design under the resolved deployment-type (PRD-001).
+    #[allow(clippy::new_ret_no_self)]
+    pub fn with_reason(name: &'static str, reason: impl Into<String>) -> Box<dyn Layer> {
+        Box::new(Self {
+            name,
+            reason: Some(reason.into()),
+        })
     }
 }
 
@@ -110,8 +128,27 @@ impl SkippedLayer {
 impl Layer for SkippedLayer {
     fn name(&self) -> &'static str { self.name }
     async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
-        LayerOutcome::Skipped
+        LayerOutcome::Skipped { reason: self.reason.clone() }
     }
+}
+
+/// PRD-001 §"Status semantics for 'n/a in this deployment-type'": when the
+/// resolved deployment-type lacks forgedb, return a [`SkippedLayer`] with
+/// reason `n/a in <type>: no forgedb`. `None` deployment-type (auto
+/// unresolved) preserves pre-PRD-001 behavior — the caller proceeds with
+/// the real layer.
+pub fn forgedb_skip_layer(
+    name: &'static str,
+    deployment_type: Option<DeploymentType>,
+) -> Option<Box<dyn Layer>> {
+    let dt = deployment_type?;
+    if dt.forgedb_present() {
+        return None;
+    }
+    Some(SkippedLayer::with_reason(
+        name,
+        format!("n/a in {}: no forgedb", dt.label()),
+    ))
 }
 
 pub struct UnconfiguredLayer {
@@ -211,11 +248,51 @@ mod tests {
 
     #[tokio::test]
     async fn default_run_skipped_outcome_produces_skipped_status_and_no_checks() {
-        let layer = StubLayer::new(LayerOutcome::Skipped);
+        let layer = StubLayer::new(LayerOutcome::Skipped { reason: None });
         let result = layer.run(&opts()).await;
         assert_eq!(result.name, "stub");
         assert_eq!(result.status, Status::Skipped);
         assert!(result.checks.is_empty());
+        assert_eq!(result.skipped_reason, None);
+    }
+
+    #[tokio::test]
+    async fn forgedb_skip_layer_returns_skip_with_reason_for_rest_only_mock() {
+        let layer = forgedb_skip_layer("hbn", Some(DeploymentType::RestOnlyMock))
+            .expect("rest-only-mock has no forgedb → skip layer expected");
+        let r = layer.run(&opts()).await;
+        assert_eq!(r.name, "hbn");
+        assert_eq!(r.status, Status::Skipped);
+        assert_eq!(r.skipped_reason.as_deref(), Some("n/a in rest-only-mock: no forgedb"));
+    }
+
+    #[test]
+    fn forgedb_skip_layer_returns_none_when_forgedb_present() {
+        for dt in [DeploymentType::Full, DeploymentType::CoreOnly, DeploymentType::Force] {
+            assert!(
+                forgedb_skip_layer("hbn", Some(dt)).is_none(),
+                "{dt:?}: forgedb present → no skip",
+            );
+        }
+    }
+
+    #[test]
+    fn forgedb_skip_layer_returns_none_when_deployment_type_unresolved() {
+        assert!(forgedb_skip_layer("hbn", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn skipped_outcome_with_reason_propagates_to_layer_result() {
+        let layer = StubLayer::new(LayerOutcome::Skipped {
+            reason: Some("n/a in rest-only-mock: no forgedb".into()),
+        });
+        let result = layer.run(&opts()).await;
+        assert_eq!(result.status, Status::Skipped);
+        assert!(result.checks.is_empty());
+        assert_eq!(
+            result.skipped_reason.as_deref(),
+            Some("n/a in rest-only-mock: no forgedb"),
+        );
     }
 
     #[tokio::test]

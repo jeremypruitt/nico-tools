@@ -29,15 +29,15 @@ fn layer_from_checks(name: &'static str, checks: Vec<Check>) -> LayerResult {
     } else {
         Status::Ok
     };
-    LayerResult { name, status, checks, duration_ms: 42 }
+    LayerResult { name, status, checks, duration_ms: 42, skipped_reason: None }
 }
 
 fn skipped(name: &'static str) -> LayerResult {
-    LayerResult { name, status: Status::Skipped, checks: vec![], duration_ms: 0 }
+    LayerResult { name, status: Status::Skipped, checks: vec![], duration_ms: 0, skipped_reason: None }
 }
 
 fn unknown_timeout(name: &'static str) -> LayerResult {
-    LayerResult { name, status: Status::Unknown, checks: vec![], duration_ms: 5000 }
+    LayerResult { name, status: Status::Unknown, checks: vec![], duration_ms: 5000, skipped_reason: None }
 }
 
 fn all_ok_report() -> Report {

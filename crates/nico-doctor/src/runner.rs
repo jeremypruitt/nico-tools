@@ -37,6 +37,7 @@ pub async fn run(layers: &[Box<dyn Layer>], opts: &RunOpts) -> Report {
                     status: Status::Unknown,
                     checks: vec![],
                     duration_ms: timeout.as_millis() as u64,
+                    skipped_reason: None,
                 },
             }
         }

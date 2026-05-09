@@ -110,6 +110,7 @@ mod tests {
             status,
             checks,
             duration_ms: 0,
+            skipped_reason: None,
         }
     }
 

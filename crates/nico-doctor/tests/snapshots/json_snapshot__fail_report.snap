@@ -1,6 +1,5 @@
 ---
 source: crates/nico-doctor/tests/json_snapshot.rs
-assertion_line: 102
 expression: v
 ---
 {
@@ -23,6 +22,7 @@ expression: v
       "delta": "unchanged",
       "duration_ms": 42,
       "name": "health",
+      "skipped_reason": null,
       "status": "fail"
     },
     {
@@ -37,6 +37,7 @@ expression: v
       "delta": "unchanged",
       "duration_ms": 42,
       "name": "grpc",
+      "skipped_reason": null,
       "status": "fail"
     }
   ],

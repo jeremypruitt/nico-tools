@@ -162,6 +162,13 @@ pub fn render_drift_no_data(machine_id: &str) -> String {
     )
 }
 
+/// PRD-001 §"Status semantics for 'n/a in this deployment-type'": output
+/// for the case where the resolved deployment-type lacks forgedb (no
+/// drift signal exists). Skipped-by-design — not a fail.
+pub fn render_drift_skipped(machine_id: &str, reason: &str) -> String {
+    format!("HBN config drift: skipped for {machine_id} — {reason}.\n")
+}
+
 /// JSON rendering — same data shape as the text output, intended for
 /// scripting consumption. Compatible with `--json`.
 pub fn render_drift_json(
@@ -476,6 +483,24 @@ mod tests {
     fn no_data_render_does_not_reference_dpunetworkstatus() {
         let out = render_drift_no_data("dpu-bf3-r12u5");
         assert!(!out.contains("DpuNetworkStatus"));
+    }
+
+    // ─── render_drift_skipped (PRD-001 slice 7) ────────────────────────────
+
+    #[test]
+    fn render_drift_skipped_includes_machine_id_and_reason() {
+        let out = render_drift_skipped("dpu-bf3-r12u5", "n/a in rest-only-mock: no forgedb");
+        assert!(out.contains("dpu-bf3-r12u5"));
+        assert!(out.contains("n/a in rest-only-mock: no forgedb"));
+    }
+
+    #[test]
+    fn render_drift_skipped_does_not_advertise_drift_or_error() {
+        let out = render_drift_skipped("m1", "n/a in rest-only-mock: no forgedb");
+        // n/a-by-design must NOT look like a fail — no "error" / "fail" wording.
+        assert!(!out.to_lowercase().contains("error"));
+        assert!(!out.to_lowercase().contains("fail"));
+        assert!(out.contains("skipped"));
     }
 
     // ─── render_drift_json ─────────────────────────────────────────────────

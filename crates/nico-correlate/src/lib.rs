@@ -1,8 +1,21 @@
 use std::sync::Arc;
 
-use nico_common::config::{ColorMode, Config, ConfigOverrides, OutputFormat};
+use nico_common::config::{ColorMode, Config, ConfigOverrides, DeploymentType, OutputFormat};
 use nico_common::output::{OutputMode, Status};
 use nico_common::theme;
+
+/// PRD-001 §"Per-layer behavior": when the resolved deployment-type has
+/// no forgedb (`rest-only-mock`), forgedb-dependent commands skip with a
+/// reason. Mirrors `nico_doctor::layer::forgedb_skip_layer` for the
+/// per-DPU non-Layer-trait commands in this crate (currently
+/// `hbn-config-drift`).
+fn forgedb_skip_reason(deployment_type: Option<DeploymentType>) -> Option<String> {
+    let dt = deployment_type?;
+    if dt.forgedb_present() {
+        return None;
+    }
+    Some(format!("n/a in {}: no forgedb", dt.label()))
+}
 
 pub mod bootstrap;
 pub mod cli;
@@ -246,6 +259,11 @@ pub async fn run_hbn_config_drift(args: &CorrelateArgs, hbn_args: HbnConfigDrift
         None => hbn_drift::DEFAULT_FRESHNESS_THRESHOLD,
     };
 
+    if let Some(reason) = forgedb_skip_reason(config.cluster.deployment_type) {
+        print!("{}", hbn_drift::render_drift_skipped(&hbn_args.machine_id, &reason));
+        return 0;
+    }
+
     let client: Arc<dyn hbn_drift::DriftClient> =
         match hbn_drift::SqlxDriftClient::new(&config.postgres.url) {
             Ok(c) => Arc::new(c),
@@ -310,4 +328,33 @@ fn load_minimal_config(args: &CorrelateArgs) -> Result<Config, String> {
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
     Config::load(file_toml.as_deref(), &env, &overrides)
         .map_err(|e| format!("error loading config: {e}"))
+}
+
+#[cfg(test)]
+mod forgedb_skip_reason_tests {
+    use super::*;
+
+    #[test]
+    fn rest_only_mock_has_skip_reason() {
+        assert_eq!(
+            forgedb_skip_reason(Some(DeploymentType::RestOnlyMock)).as_deref(),
+            Some("n/a in rest-only-mock: no forgedb"),
+        );
+    }
+
+    #[test]
+    fn forgedb_present_types_have_no_skip_reason() {
+        for dt in [DeploymentType::Full, DeploymentType::CoreOnly, DeploymentType::Force] {
+            assert_eq!(
+                forgedb_skip_reason(Some(dt)),
+                None,
+                "{dt:?}: forgedb present → no skip",
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_deployment_type_has_no_skip_reason() {
+        assert_eq!(forgedb_skip_reason(None), None);
+    }
 }

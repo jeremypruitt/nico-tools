@@ -31,7 +31,10 @@ pub fn format_report(
         let icon = layer.status.icon(mode);
         let styled_icon = layer.status.style(icon, mode);
         let summary = if layer.status == Status::Skipped {
-            "(skipped)".to_string()
+            match &layer.skipped_reason {
+                Some(reason) => format!("(skipped — {reason})"),
+                None => "(skipped)".to_string(),
+            }
         } else {
             layer.checks.iter()
                 .filter(|c| c.kind == CheckKind::Headline)
@@ -134,6 +137,7 @@ pub fn format_json(
                 "status": format!("{:?}", l.status).to_lowercase(),
                 "delta": delta_str,
                 "duration_ms": l.duration_ms,
+                "skipped_reason": l.skipped_reason,
                 "checks": l.checks.iter().map(|c| serde_json::json!({
                     "name": c.name,
                     "status": format!("{:?}", c.status).to_lowercase(),
@@ -193,11 +197,21 @@ mod tests {
         } else {
             Status::Ok
         };
-        LayerResult { name, status, checks, duration_ms: 0 }
+        LayerResult { name, status, checks, duration_ms: 0, skipped_reason: None }
     }
 
     fn skipped(name: &'static str) -> LayerResult {
-        LayerResult { name, status: Status::Skipped, checks: vec![], duration_ms: 0 }
+        LayerResult { name, status: Status::Skipped, checks: vec![], duration_ms: 0, skipped_reason: None }
+    }
+
+    fn skipped_with_reason(name: &'static str, reason: &str) -> LayerResult {
+        LayerResult {
+            name,
+            status: Status::Skipped,
+            checks: vec![],
+            duration_ms: 0,
+            skipped_reason: Some(reason.to_string()),
+        }
     }
 
     fn all_ok_report() -> Report {
@@ -626,6 +640,42 @@ mod tests {
     }
 
     #[test]
+    fn skipped_layer_with_reason_renders_inline_in_human_summary() {
+        let report = Report { layers: vec![
+            skipped_with_reason("dpu", "n/a in rest-only-mock: no forgedb"),
+        ]};
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
+        assert_eq!(out, concat!(
+            "  . dpu          (skipped — n/a in rest-only-mock: no forgedb)\n",
+            "\n",
+            "Summary: ok  0 warnings, 0 failures\n",
+            "Hint: --verbose for details on passing checks, --json for machine output\n",
+        ));
+    }
+
+    #[test]
+    fn skipped_layer_with_reason_renders_inline_in_verbose_mode() {
+        let report = Report { layers: vec![
+            skipped_with_reason("dpu", "n/a in rest-only-mock: no forgedb"),
+            layer("postgres", vec![ok_check("pool", "5/20")]),
+        ]};
+        let out = format_report(&report, &plain(), true, &no_deltas(), false);
+        assert!(
+            out.contains("  . dpu          (skipped — n/a in rest-only-mock: no forgedb)"),
+            "expected reason in verbose; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn skipped_layer_without_reason_still_renders_plain_skipped() {
+        // No-reason call sites preserved: existing skipped output unchanged.
+        let report = Report { layers: vec![skipped("logs")] };
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
+        assert!(out.contains("(skipped)\n"), "plain (skipped) preserved; got:\n{out}");
+        assert!(!out.contains("(skipped — "), "no em-dash form when reason is None");
+    }
+
+    #[test]
     fn skip_layers_json_snapshot() {
         let report = Report { layers: vec![
             layer("cluster", vec![ok_check("pods_ready", "2/2")]),
@@ -979,6 +1029,42 @@ mod tests {
     }
 
     // ── JSON delta field ──────────────────────────────────────────────────────
+
+    #[test]
+    fn json_skipped_layer_with_reason_includes_skipped_reason_field() {
+        let report = Report { layers: vec![
+            skipped_with_reason("dpu", "n/a in rest-only-mock: no forgedb"),
+        ]};
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())
+        ).unwrap();
+        let layer = &json["layers"][0];
+        assert_eq!(layer["status"], "skipped");
+        assert_eq!(layer["skipped_reason"], "n/a in rest-only-mock: no forgedb");
+    }
+
+    #[test]
+    fn json_skipped_layer_without_reason_emits_null_skipped_reason() {
+        let report = Report { layers: vec![skipped("logs")] };
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())
+        ).unwrap();
+        assert!(
+            json["layers"][0].get("skipped_reason").is_some(),
+            "skipped_reason field present even when None: {}",
+            json["layers"][0],
+        );
+        assert!(json["layers"][0]["skipped_reason"].is_null());
+    }
+
+    #[test]
+    fn json_non_skipped_layer_emits_null_skipped_reason() {
+        let report = Report { layers: vec![layer("cluster", vec![ok_check("pods_ready", "2/2")])] };
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())
+        ).unwrap();
+        assert!(json["layers"][0]["skipped_reason"].is_null());
+    }
 
     #[test]
     fn json_includes_delta_unchanged_by_default() {
