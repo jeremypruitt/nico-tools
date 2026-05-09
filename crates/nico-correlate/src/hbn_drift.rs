@@ -1,12 +1,17 @@
-//! HBN config-drift correlation — joins desired-vs-applied for the two
-//! version axes (`managed_host_config_version`,
-//! `instance_network_config_version`) of a DPU/machine, computes the age
-//! of any drift, and surfaces probe alerts whose `in_alert_since` falls
-//! in the drift window.
+//! HBN config-drift correlation — compares applied (`network_status_observation`)
+//! vs desired (`network_config`) for the two version axes
+//! (`managed_host_config_version`, `instance_network_config_version`)
+//! on a single `machines` row.
 //!
 //! Read-only, side-effect-free apart from the [`DriftClient`] trait —
-//! the seam over the Postgres/forgedb data source. The pure assembly
-//! layer (`assemble_drift_rows`) is fully unit-testable without I/O.
+//! the seam over the Postgres data source. The pure assembly layer
+//! (`assemble_drift_rows`) is fully unit-testable without I/O.
+//!
+//! See PRD-002 (`docs/prds/002-dpu-layer-rewrite.md`) for the schema
+//! mapping. Drift detection reports applied vs desired on the same
+//! machine row; the "first observed drift at" timestamp capability has
+//! been dropped (its only data source — a per-DPU history table —
+//! does not exist in the producer-side schema).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,37 +22,28 @@ use std::time::Duration;
 /// row is flagged stale (matches the per-DPU HBN verdict default).
 pub const DEFAULT_FRESHNESS_THRESHOLD: Duration = Duration::from_secs(90);
 
-/// Snapshot of HBN drift state for a single machine: per-axis drift,
-/// most recent observation timestamp, and the relevant probe alerts.
+/// Snapshot of HBN drift state for a single machine: per-axis drift
+/// plus the most recent `network_status_observation->>'observed_at'`.
 #[derive(Debug, Clone)]
 pub struct DriftSnapshot {
     pub machine_id: String,
     pub managed_host: AxisDrift,
     pub instance_network: AxisDrift,
     pub last_seen_at: Option<DateTime<Utc>>,
-    pub alerts: Vec<HealthAlert>,
 }
 
-/// Applied vs desired version for one axis, plus the timestamp at which
-/// drift was first observed (`None` = currently in sync).
+/// Applied vs desired version for one axis. Drift exists iff
+/// `applied != desired` — no first-observed-drift timestamp because the
+/// producer-side schema has no history table to derive it from.
 #[derive(Debug, Clone)]
 pub struct AxisDrift {
     pub applied: String,
     pub desired: String,
-    pub first_observed_drift_at: Option<DateTime<Utc>>,
 }
 
-/// A probe alert from the health-report stream. Used to overlay the
-/// drift window with concurrent operational signal (e.g.
-/// `PostConfigCheckWait`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealthAlert {
-    pub name: String,
-    pub in_alert_since: DateTime<Utc>,
-}
-
-/// Read-only seam over the drift data layer. Real impl queries forgedb;
-/// tests inject a mock. `Ok(None)` means "no row found for this machine".
+/// Read-only seam over the drift data layer. Real impl reads the
+/// `machines` row's JSON columns; tests inject a mock. `Ok(None)`
+/// means "no `machines` row found for this id".
 #[async_trait]
 pub trait DriftClient: Send + Sync {
     async fn fetch_drift(&self, machine_id: &str) -> Result<Option<DriftSnapshot>>;
@@ -60,8 +56,6 @@ pub struct DriftRow {
     pub applied: String,
     pub desired: String,
     pub status: AxisStatus,
-    pub age: Option<chrono::Duration>,
-    pub overlapping_alerts: Vec<HealthAlert>,
     pub stale: bool,
 }
 
@@ -81,10 +75,6 @@ pub const AXIS_INSTANCE_NETWORK: &str = "instance_network_config";
 /// Rules:
 /// - one row per axis, in fixed order: managed_host, instance_network
 /// - `Drifting` iff `applied != desired`
-/// - `age` = `now − first_observed_drift_at` (when present) for drifting
-///   axes, else `None`
-/// - `overlapping_alerts` for a drifting axis includes any alert whose
-///   `in_alert_since` falls in `[drift_start, now]` (inclusive)
 /// - `stale = true` when `last_seen_at` is older than `freshness_threshold`
 pub fn assemble_drift_rows(
     snapshot: &DriftSnapshot,
@@ -100,62 +90,22 @@ pub fn assemble_drift_rows(
     };
 
     vec![
-        row_for_axis(
-            AXIS_MANAGED_HOST,
-            &snapshot.managed_host,
-            now,
-            &snapshot.alerts,
-            stale,
-        ),
-        row_for_axis(
-            AXIS_INSTANCE_NETWORK,
-            &snapshot.instance_network,
-            now,
-            &snapshot.alerts,
-            stale,
-        ),
+        row_for_axis(AXIS_MANAGED_HOST, &snapshot.managed_host, stale),
+        row_for_axis(AXIS_INSTANCE_NETWORK, &snapshot.instance_network, stale),
     ]
 }
 
-fn row_for_axis(
-    axis: &'static str,
-    drift: &AxisDrift,
-    now: DateTime<Utc>,
-    alerts: &[HealthAlert],
-    stale: bool,
-) -> DriftRow {
-    if drift.applied == drift.desired {
-        return DriftRow {
-            axis,
-            applied: drift.applied.clone(),
-            desired: drift.desired.clone(),
-            status: AxisStatus::NoDrift,
-            age: None,
-            overlapping_alerts: Vec::new(),
-            stale,
-        };
-    }
-
-    let (age, overlapping) = match drift.first_observed_drift_at {
-        Some(start) => {
-            let age = Some(now - start);
-            let overlapping = alerts
-                .iter()
-                .filter(|a| a.in_alert_since >= start && a.in_alert_since <= now)
-                .cloned()
-                .collect();
-            (age, overlapping)
-        }
-        None => (None, Vec::new()),
+fn row_for_axis(axis: &'static str, drift: &AxisDrift, stale: bool) -> DriftRow {
+    let status = if drift.applied == drift.desired {
+        AxisStatus::NoDrift
+    } else {
+        AxisStatus::Drifting
     };
-
     DriftRow {
         axis,
         applied: drift.applied.clone(),
         desired: drift.desired.clone(),
-        status: AxisStatus::Drifting,
-        age,
-        overlapping_alerts: overlapping,
+        status,
         stale,
     }
 }
@@ -173,35 +123,22 @@ pub fn render_drift_text(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("HBN config drift for machine {machine_id}:\n"));
-    out.push_str("  axis                       status     age        alerts\n");
+    out.push_str("  axis                       status     applied              desired\n");
     for row in rows {
         let status = match row.status {
             AxisStatus::NoDrift => "no-drift",
             AxisStatus::Drifting => "drift",
         };
-        let age = format_age(row.age);
-        let alerts = if row.overlapping_alerts.is_empty() {
-            "-".to_string()
-        } else {
-            row.overlapping_alerts
-                .iter()
-                .map(|a| {
-                    let alert_age = format_age(Some(now - a.in_alert_since));
-                    format!("{} (in_alert_since {} ago)", a.name, alert_age)
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
         out.push_str(&format!(
-            "  {axis:<26} {status:<10} {age:<10} {alerts}\n",
+            "  {axis:<26} {status:<10} {applied:<20} {desired}\n",
             axis = row.axis,
             status = status,
-            age = age,
-            alerts = alerts,
+            applied = row.applied,
+            desired = row.desired,
         ));
     }
     if let Some(seen) = last_seen_at {
-        let age = format_age(Some(now - seen));
+        let age = format_age(now - seen);
         let stale_marker = if rows.iter().any(|r| r.stale) {
             " (stale)"
         } else {
@@ -217,10 +154,10 @@ pub fn render_drift_text(
     out
 }
 
-/// Output for the "no row in forgedb for this machine" case.
+/// Output for the "no `machines` row for this id" case.
 pub fn render_drift_no_data(machine_id: &str) -> String {
     format!(
-        "HBN config drift: no DpuNetworkStatus row for machine {machine_id}.\n\
+        "HBN config drift: no machines row for {machine_id}.\n\
          hint: nico correlate {machine_id} to see recent activity for this id.\n"
     )
 }
@@ -240,14 +177,11 @@ pub fn render_drift_json(
                 "axis": r.axis,
                 "applied": r.applied,
                 "desired": r.desired,
-                "status": match r.status { AxisStatus::NoDrift => "no-drift", AxisStatus::Drifting => "drift" },
-                "age_seconds": r.age.map(|d| d.num_seconds()),
+                "status": match r.status {
+                    AxisStatus::NoDrift => "no-drift",
+                    AxisStatus::Drifting => "drift",
+                },
                 "stale": r.stale,
-                "alerts": r.overlapping_alerts.iter().map(|a| serde_json::json!({
-                    "name": a.name,
-                    "in_alert_since": a.in_alert_since.to_rfc3339(),
-                    "in_alert_age_seconds": (now - a.in_alert_since).num_seconds(),
-                })).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -260,10 +194,10 @@ pub fn render_drift_json(
     .to_string()
 }
 
-/// Default sqlx-backed [`DriftClient`]. Best-effort: queries the
-/// canonical forgedb tables and gracefully degrades to `Ok(None)` /
-/// empty fields when the schema is absent (so dev clusters without the
-/// drift-history / health-report tables don't panic).
+/// Default sqlx-backed [`DriftClient`]. Reads the applied/desired
+/// version pairs out of the `machines` row's JSON columns. Best-effort:
+/// schema-probes the `machines` table first and returns `Ok(None)` when
+/// absent (e.g. dev clusters without forgedb).
 pub struct SqlxDriftClient {
     pool: sqlx::PgPool,
 }
@@ -276,168 +210,76 @@ impl SqlxDriftClient {
             .map_err(|e| anyhow::anyhow!("invalid postgres URL: {e}"))?;
         Ok(Self { pool })
     }
-
-    async fn table_exists(&self, name: &str) -> anyhow::Result<bool> {
-        let exists: (bool,) = sqlx::query_as(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_name = $1)",
-        )
-        .bind(name)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("schema probe failed: {e}"))?;
-        Ok(exists.0)
-    }
 }
 
 #[async_trait]
 impl DriftClient for SqlxDriftClient {
     async fn fetch_drift(&self, machine_id: &str) -> Result<Option<DriftSnapshot>> {
-        if !self.table_exists("dpu_network_status").await? {
-            return Ok(None);
-        }
-        if !self.table_exists("dpu_desired_network_config").await? {
+        let exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_name = 'machines')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("hbn_drift schema probe failed: {e}"))?;
+        if !exists.0 {
             return Ok(None);
         }
 
-        let row: Option<(String, String, String, String, String, DateTime<Utc>)> = sqlx::query_as(
+        let row: Option<(
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
             "SELECT \
-                s.dpu_id, \
-                s.applied_managed_host_config_version, \
-                s.applied_instance_network_config_version, \
-                d.managed_host_config_version, \
-                d.instance_network_config_version, \
-                s.last_seen_at \
-             FROM dpu_network_status s \
-             JOIN dpu_desired_network_config d ON d.dpu_id = s.dpu_id \
-             WHERE s.dpu_id = $1 \
-             ORDER BY s.last_seen_at DESC \
+                network_status_observation->>'managed_host_config_version', \
+                network_status_observation->>'instance_network_config_version', \
+                network_config->>'managed_host_config_version', \
+                network_config->>'instance_network_config_version', \
+                network_status_observation->>'observed_at' \
+             FROM machines \
+             WHERE id = $1 \
              LIMIT 1",
         )
         .bind(machine_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| anyhow::anyhow!("dpu_network_status query failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("hbn_drift query failed: {e}"))?;
 
-        let Some(r) = row else {
+        let Some((applied_managed, applied_instance, desired_managed, desired_instance, observed_at)) = row else {
             return Ok(None);
         };
-        let (
-            machine_id_db,
-            applied_managed,
-            applied_instance,
-            desired_managed,
-            desired_instance,
-            last_seen,
-        ) = r;
 
-        let managed_host_drift = self
-            .first_drift_at(
-                &machine_id_db,
-                "applied_managed_host_config_version",
-                &desired_managed,
-            )
-            .await
-            .ok()
-            .flatten();
-        let instance_drift = self
-            .first_drift_at(
-                &machine_id_db,
-                "applied_instance_network_config_version",
-                &desired_instance,
-            )
-            .await
-            .ok()
-            .flatten();
-
-        let alerts = self.fetch_alerts(&machine_id_db).await.unwrap_or_default();
+        let last_seen_at = observed_at
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc));
 
         Ok(Some(DriftSnapshot {
-            machine_id: machine_id_db,
+            machine_id: machine_id.to_string(),
             managed_host: AxisDrift {
-                applied: applied_managed.clone(),
-                desired: desired_managed.clone(),
-                first_observed_drift_at: if applied_managed != desired_managed {
-                    managed_host_drift
-                } else {
-                    None
-                },
+                applied: applied_managed.unwrap_or_default(),
+                desired: desired_managed.unwrap_or_default(),
             },
             instance_network: AxisDrift {
-                applied: applied_instance.clone(),
-                desired: desired_instance.clone(),
-                first_observed_drift_at: if applied_instance != desired_instance {
-                    instance_drift
-                } else {
-                    None
-                },
+                applied: applied_instance.unwrap_or_default(),
+                desired: desired_instance.unwrap_or_default(),
             },
-            last_seen_at: Some(last_seen),
-            alerts,
+            last_seen_at,
         }))
     }
 }
 
-impl SqlxDriftClient {
-    async fn first_drift_at(
-        &self,
-        machine_id: &str,
-        applied_col: &str,
-        desired: &str,
-    ) -> anyhow::Result<Option<DateTime<Utc>>> {
-        if !self.table_exists("dpu_network_status_history").await? {
-            return Ok(None);
-        }
-        // applied_col is one of two internal constants — never user input.
-        let sql = format!(
-            "SELECT MIN(last_seen_at) FROM dpu_network_status_history \
-             WHERE dpu_id = $1 AND {applied_col} <> $2"
-        );
-        let row: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(&sql)
-            .bind(machine_id)
-            .bind(desired)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("drift-history query failed: {e}"))?;
-        Ok(row.and_then(|r| r.0))
-    }
-
-    async fn fetch_alerts(&self, machine_id: &str) -> anyhow::Result<Vec<HealthAlert>> {
-        if !self.table_exists("health_report").await? {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT alert_name, in_alert_since FROM health_report \
-             WHERE dpu_id = $1 AND in_alert_since IS NOT NULL \
-             ORDER BY in_alert_since DESC LIMIT 50",
-        )
-        .bind(machine_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("health_report query failed: {e}"))?;
-        Ok(rows
-            .into_iter()
-            .map(|(name, since)| HealthAlert {
-                name,
-                in_alert_since: since,
-            })
-            .collect())
-    }
-}
-
-fn format_age(d: Option<chrono::Duration>) -> String {
-    match d {
-        None => "-".to_string(),
-        Some(d) => {
-            let secs = d.num_seconds().max(0);
-            if secs < 60 {
-                format!("{secs}s")
-            } else if secs < 3600 {
-                format!("{}m{:02}s", secs / 60, secs % 60)
-            } else {
-                format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-            }
-        }
+fn format_age(d: chrono::Duration) -> String {
+    let secs = d.num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -454,15 +296,13 @@ mod tests {
         AxisDrift {
             applied: version.into(),
             desired: version.into(),
-            first_observed_drift_at: None,
         }
     }
 
-    fn axis_drifting(applied: &str, desired: &str, drift_start: DateTime<Utc>) -> AxisDrift {
+    fn axis_drifting(applied: &str, desired: &str) -> AxisDrift {
         AxisDrift {
             applied: applied.into(),
             desired: desired.into(),
-            first_observed_drift_at: Some(drift_start),
         }
     }
 
@@ -472,7 +312,6 @@ mod tests {
             managed_host: axis_in_sync("v17"),
             instance_network: axis_in_sync("v9"),
             last_seen_at: Some(now),
-            alerts: vec![],
         }
     }
 
@@ -487,11 +326,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].axis, AXIS_MANAGED_HOST);
         assert_eq!(rows[0].status, AxisStatus::NoDrift);
-        assert!(rows[0].age.is_none());
-        assert!(rows[0].overlapping_alerts.is_empty());
         assert_eq!(rows[1].axis, AXIS_INSTANCE_NETWORK);
         assert_eq!(rows[1].status, AxisStatus::NoDrift);
-        assert!(rows[1].age.is_none());
     }
 
     // ─── single-axis drift ─────────────────────────────────────────────────
@@ -499,9 +335,8 @@ mod tests {
     #[test]
     fn single_axis_managed_host_drift_only_managed_drifts() {
         let now = ts(10_000);
-        let drift_start = ts(9_000);
         let mut snap = snapshot_in_sync(now);
-        snap.managed_host = axis_drifting("v16", "v17", drift_start);
+        snap.managed_host = axis_drifting("v16", "v17");
 
         let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
 
@@ -510,7 +345,6 @@ mod tests {
         assert_eq!(mh.status, AxisStatus::Drifting);
         assert_eq!(mh.applied, "v16");
         assert_eq!(mh.desired, "v17");
-        assert_eq!(mh.age, Some(chrono::Duration::seconds(1_000)));
 
         let inet = &rows[1];
         assert_eq!(inet.axis, AXIS_INSTANCE_NETWORK);
@@ -521,12 +355,13 @@ mod tests {
     fn single_axis_instance_network_drift_only_instance_drifts() {
         let now = ts(10_000);
         let mut snap = snapshot_in_sync(now);
-        snap.instance_network = axis_drifting("v8", "v9", ts(8_500));
+        snap.instance_network = axis_drifting("v8", "v9");
 
         let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
         assert_eq!(rows[0].status, AxisStatus::NoDrift);
         assert_eq!(rows[1].status, AxisStatus::Drifting);
-        assert_eq!(rows[1].age, Some(chrono::Duration::seconds(1_500)));
+        assert_eq!(rows[1].applied, "v8");
+        assert_eq!(rows[1].desired, "v9");
     }
 
     // ─── both-axes drift ───────────────────────────────────────────────────
@@ -536,15 +371,12 @@ mod tests {
         let now = ts(10_000);
         let snap = DriftSnapshot {
             machine_id: "m1".into(),
-            managed_host: axis_drifting("v16", "v17", ts(9_400)),
-            instance_network: axis_drifting("v8", "v9", ts(9_700)),
+            managed_host: axis_drifting("v16", "v17"),
+            instance_network: axis_drifting("v8", "v9"),
             last_seen_at: Some(now),
-            alerts: vec![],
         };
         let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
         assert!(rows.iter().all(|r| r.status == AxisStatus::Drifting));
-        assert_eq!(rows[0].age, Some(chrono::Duration::seconds(600)));
-        assert_eq!(rows[1].age, Some(chrono::Duration::seconds(300)));
     }
 
     // ─── stale data ────────────────────────────────────────────────────────
@@ -567,67 +399,16 @@ mod tests {
         assert!(rows.iter().all(|r| !r.stale));
     }
 
-    // ─── alerts in drift window ────────────────────────────────────────────
-
     #[test]
-    fn alert_within_drift_window_appears_on_drifting_row() {
+    fn missing_last_seen_leaves_rows_fresh() {
         let now = ts(10_000);
-        let drift_start = ts(9_000);
-        let alert = HealthAlert {
-            name: "PostConfigCheckWait".into(),
-            in_alert_since: ts(9_500),
-        };
-        let snap = DriftSnapshot {
-            machine_id: "m1".into(),
-            managed_host: axis_drifting("v16", "v17", drift_start),
-            instance_network: axis_in_sync("v9"),
-            last_seen_at: Some(now),
-            alerts: vec![alert.clone()],
-        };
-
-        let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
-        assert_eq!(rows[0].overlapping_alerts, vec![alert]);
-        assert!(rows[1].overlapping_alerts.is_empty());
+        let mut snap = snapshot_in_sync(now);
+        snap.last_seen_at = None;
+        let rows = assemble_drift_rows(&snap, now, Duration::from_secs(90));
+        assert!(rows.iter().all(|r| !r.stale));
     }
 
-    #[test]
-    fn alert_before_drift_window_is_excluded() {
-        let now = ts(10_000);
-        let drift_start = ts(9_000);
-        let alert_before = HealthAlert {
-            name: "PostConfigCheckWait".into(),
-            in_alert_since: ts(8_500),
-        };
-        let snap = DriftSnapshot {
-            machine_id: "m1".into(),
-            managed_host: axis_drifting("v16", "v17", drift_start),
-            instance_network: axis_in_sync("v9"),
-            last_seen_at: Some(now),
-            alerts: vec![alert_before],
-        };
-        let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
-        assert!(rows[0].overlapping_alerts.is_empty());
-    }
-
-    #[test]
-    fn alert_does_not_attach_when_axis_in_sync() {
-        let now = ts(10_000);
-        let alert = HealthAlert {
-            name: "PostConfigCheckWait".into(),
-            in_alert_since: ts(9_500),
-        };
-        let snap = DriftSnapshot {
-            machine_id: "m1".into(),
-            managed_host: axis_in_sync("v17"),
-            instance_network: axis_in_sync("v9"),
-            last_seen_at: Some(now),
-            alerts: vec![alert],
-        };
-        let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
-        assert!(rows.iter().all(|r| r.overlapping_alerts.is_empty()));
-    }
-
-    // ─── render_drift_text smoke test ──────────────────────────────────────
+    // ─── render_drift_text ─────────────────────────────────────────────────
 
     #[test]
     fn render_includes_machine_id_and_axis_names() {
@@ -642,31 +423,122 @@ mod tests {
     }
 
     #[test]
-    fn render_drifting_row_contains_age_and_alert() {
+    fn render_drifting_row_shows_applied_and_desired() {
         let now = ts(10_000);
-        let drift_start = ts(9_400);
-        let alert = HealthAlert {
-            name: "PostConfigCheckWait".into(),
-            in_alert_since: ts(9_500),
-        };
         let snap = DriftSnapshot {
             machine_id: "m1".into(),
-            managed_host: axis_drifting("v16", "v17", drift_start),
+            managed_host: axis_drifting("v16", "v17"),
             instance_network: axis_in_sync("v9"),
             last_seen_at: Some(now),
-            alerts: vec![alert],
         };
         let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
         let out = render_drift_text("m1", &rows, now, snap.last_seen_at);
         assert!(out.contains("drift"));
-        assert!(out.contains("10m"), "age missing in: {out}");
-        assert!(out.contains("PostConfigCheckWait"));
+        assert!(out.contains("v16"));
+        assert!(out.contains("v17"));
     }
+
+    #[test]
+    fn render_drifting_row_does_not_advertise_drift_since() {
+        let now = ts(10_000);
+        let snap = DriftSnapshot {
+            machine_id: "m1".into(),
+            managed_host: axis_drifting("v16", "v17"),
+            instance_network: axis_in_sync("v9"),
+            last_seen_at: Some(now),
+        };
+        let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
+        let out = render_drift_text("m1", &rows, now, snap.last_seen_at);
+        assert!(!out.to_lowercase().contains("drift exists since"));
+        assert!(!out.to_lowercase().contains("first observed"));
+    }
+
+    #[test]
+    fn render_marks_stale_when_last_seen_too_old() {
+        let now = ts(10_000);
+        let mut snap = snapshot_in_sync(now);
+        snap.last_seen_at = Some(now - chrono::Duration::seconds(300));
+        let rows = assemble_drift_rows(&snap, now, Duration::from_secs(90));
+        let out = render_drift_text("m1", &rows, now, snap.last_seen_at);
+        assert!(out.contains("(stale)"), "missing stale marker in: {out}");
+    }
+
+    // ─── render_drift_no_data ──────────────────────────────────────────────
 
     #[test]
     fn no_data_render_mentions_machine_and_correlate_hint() {
         let out = render_drift_no_data("dpu-bf3-r12u5");
         assert!(out.contains("dpu-bf3-r12u5"));
         assert!(out.contains("nico correlate"));
+    }
+
+    #[test]
+    fn no_data_render_does_not_reference_dpunetworkstatus() {
+        let out = render_drift_no_data("dpu-bf3-r12u5");
+        assert!(!out.contains("DpuNetworkStatus"));
+    }
+
+    // ─── render_drift_json ─────────────────────────────────────────────────
+
+    #[test]
+    fn render_drift_json_carries_per_row_status_and_versions() {
+        let now = ts(10_000);
+        let snap = DriftSnapshot {
+            machine_id: "m1".into(),
+            managed_host: axis_drifting("v16", "v17"),
+            instance_network: axis_in_sync("v9"),
+            last_seen_at: Some(now),
+        };
+        let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
+        let out = render_drift_json("m1", &rows, now, snap.last_seen_at);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["machine_id"], "m1");
+        assert_eq!(v["rows"][0]["status"], "drift");
+        assert_eq!(v["rows"][0]["applied"], "v16");
+        assert_eq!(v["rows"][0]["desired"], "v17");
+        assert_eq!(v["rows"][1]["status"], "no-drift");
+    }
+
+    #[test]
+    fn render_drift_json_omits_age_and_alerts_fields() {
+        let now = ts(10_000);
+        let snap = DriftSnapshot {
+            machine_id: "m1".into(),
+            managed_host: axis_drifting("v16", "v17"),
+            instance_network: axis_in_sync("v9"),
+            last_seen_at: Some(now),
+        };
+        let rows = assemble_drift_rows(&snap, now, DEFAULT_FRESHNESS_THRESHOLD);
+        let out = render_drift_json("m1", &rows, now, snap.last_seen_at);
+        assert!(!out.contains("age_seconds"));
+        assert!(!out.contains("alerts"));
+    }
+
+    // ─── DriftClient mock-injection sanity ─────────────────────────────────
+
+    struct StubClient(Option<DriftSnapshot>);
+
+    #[async_trait]
+    impl DriftClient for StubClient {
+        async fn fetch_drift(&self, _machine_id: &str) -> Result<Option<DriftSnapshot>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_client_returns_injected_snapshot() {
+        let now = ts(10_000);
+        let snap = snapshot_in_sync(now);
+        let client = StubClient(Some(snap.clone()));
+        let got = client.fetch_drift("dpu-bf3-r12u5").await.unwrap().unwrap();
+        assert_eq!(got.machine_id, snap.machine_id);
+        assert_eq!(got.managed_host.applied, "v17");
+    }
+
+    #[tokio::test]
+    async fn mock_client_returns_none_when_no_row() {
+        let client = StubClient(None);
+        let got = client.fetch_drift("missing").await.unwrap();
+        assert!(got.is_none());
     }
 }
