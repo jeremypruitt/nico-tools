@@ -28,7 +28,7 @@ pub use nico_common::config::DpuConfig;
 pub const DRIFT_DETAIL_TOP_N: usize = 5;
 
 /// One row in the fleet view — the union of `DpuNetworkStatus` columns
-/// and the desired-config peer needed by all five sub-checks.
+/// and the desired-config peer needed by all six sub-checks.
 #[derive(Debug, Clone)]
 pub struct DpuSnapshot {
     pub dpu_id: String,
@@ -39,6 +39,48 @@ pub struct DpuSnapshot {
     pub quarantine_state: Option<String>,
     pub last_seen_at: DateTime<Utc>,
     pub client_certificate_expiry: Option<DateTime<Utc>>,
+    pub health_alerts: Vec<HealthAlert>,
+}
+
+/// One entry from the agent's `HealthReport.alerts` array, persisted on
+/// `machine.health` as JSONB. The `dpu` layer only consumes the fields
+/// it acts on — `id` to filter for a known probe (e.g.
+/// `PostConfigCheckWait`) and `in_alert_since` to age the alert.
+#[derive(Debug, Clone)]
+pub struct HealthAlert {
+    pub id: String,
+    pub in_alert_since: Option<DateTime<Utc>>,
+}
+
+/// Extract `HealthAlert`s from the raw `machine.health` JSONB blob.
+/// Tolerates the column being NULL or having no `alerts` array.
+/// Accepts `in_alert_since` as RFC3339 string, Unix epoch seconds (i64),
+/// or `null` — the agent's serializer history has used all three.
+pub fn parse_health_alerts(blob: Option<&serde_json::Value>) -> Vec<HealthAlert> {
+    let Some(v) = blob else { return Vec::new() };
+    let Some(arr) = v.get("alerts").and_then(|a| a.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?.to_owned();
+            let in_alert_since = entry.get("in_alert_since").and_then(parse_in_alert_since);
+            Some(HealthAlert { id, in_alert_since })
+        })
+        .collect()
+}
+
+fn parse_in_alert_since(v: &serde_json::Value) -> Option<DateTime<Utc>> {
+    if v.is_null() {
+        return None;
+    }
+    if let Some(s) = v.as_str() {
+        return DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc));
+    }
+    if let Some(n) = v.as_i64() {
+        return DateTime::<Utc>::from_timestamp(n, 0);
+    }
+    None
 }
 
 /// Read-only seam over the fleet data layer (forgedb + Postgres). The
@@ -81,6 +123,10 @@ impl DpuClient for SqlxDpuClient {
             return Ok(Vec::new());
         }
 
+        // `machine.health` is JSONB on the upstream `machine` table
+        // (migration `20240919183221_machine_health.go`). The join is
+        // LEFT so a missing/dropped `machine` row leaves alerts empty
+        // rather than excluding the DPU from the fleet roll-up.
         let rows: Vec<(
             String,
             String,
@@ -90,6 +136,7 @@ impl DpuClient for SqlxDpuClient {
             Option<String>,
             DateTime<Utc>,
             Option<i64>,
+            Option<serde_json::Value>,
         )> = sqlx::query_as(
             "SELECT DISTINCT ON (s.dpu_id) \
                 s.dpu_id, \
@@ -99,9 +146,11 @@ impl DpuClient for SqlxDpuClient {
                 d.instance_network_config_version, \
                 s.quarantine_state, \
                 s.last_seen_at, \
-                s.client_certificate_expiry_unix_epoch_secs \
+                s.client_certificate_expiry_unix_epoch_secs, \
+                m.health \
              FROM dpu_network_status s \
              JOIN dpu_desired_network_config d ON d.dpu_id = s.dpu_id \
+             LEFT JOIN machine m ON m.dpu_id = s.dpu_id \
              ORDER BY s.dpu_id, s.last_seen_at DESC",
         )
         .fetch_all(&self.pool)
@@ -119,6 +168,7 @@ impl DpuClient for SqlxDpuClient {
                 quarantine_state: r.5,
                 last_seen_at: r.6,
                 client_certificate_expiry: r.7.and_then(|s| DateTime::<Utc>::from_timestamp(s, 0)),
+                health_alerts: parse_health_alerts(r.8.as_ref()),
             })
             .collect())
     }
@@ -311,9 +361,68 @@ fn lost_connection_check(
     }
 }
 
-/// Assemble the five `dpu` layer sub-checks (plus drift detail lines)
-/// from a fleet snapshot. Pure — the caller supplies `now` so the
-/// function stays clock-free.
+/// `probe-stuck` sub-check (issue #239). Flags DPUs whose
+/// `PostConfigCheckWait` health probe has been in alert state longer
+/// than [`DpuConfig::probe_stuck_grace`]. Encodes failure mode 3 from
+/// `docs/learning/topics/01-hbn.md` §3 — DPU traffic is dropped
+/// post-config and the agent's `PostConfigCheckWait` probe stays in
+/// alert.
+fn probe_stuck_check(
+    snapshots: &[DpuSnapshot],
+    now: DateTime<Utc>,
+    config: &DpuConfig,
+) -> Vec<Check> {
+    const PROBE_ID: &str = "PostConfigCheckWait";
+
+    let mut stuck: Vec<(&str, Duration)> = Vec::new();
+    for s in snapshots {
+        for alert in &s.health_alerts {
+            if alert.id != PROBE_ID {
+                continue;
+            }
+            let Some(since) = alert.in_alert_since else {
+                continue;
+            };
+            let age = (now - since).to_std().unwrap_or(Duration::ZERO);
+            if age > config.probe_stuck_grace {
+                stuck.push((s.dpu_id.as_str(), age));
+            }
+        }
+    }
+
+    let count = stuck.len();
+    let status = if count > 0 { Status::Fail } else { Status::Ok };
+    let mut out = vec![Check {
+        name: "probe-stuck",
+        status: status.clone(),
+        value: format!("{count} DPUs with stuck PostConfigCheckWait"),
+        next_command: None,
+        kind: CheckKind::Headline,
+    }];
+
+    if status == Status::Ok {
+        return out;
+    }
+
+    stuck.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
+    for (dpu_id, age) in stuck.into_iter().take(DRIFT_DETAIL_TOP_N) {
+        out.push(Check {
+            name: "probe-stuck",
+            status: Status::Fail,
+            value: format!(
+                "dpu {dpu_id} PostConfigCheckWait stuck (in_alert_since {}s ago)",
+                age.as_secs()
+            ),
+            next_command: Some(format!("nico doctor hbn {dpu_id}")),
+            kind: CheckKind::Detail,
+        });
+    }
+    out
+}
+
+/// Assemble the six `dpu` layer sub-checks (plus drift / probe-stuck
+/// detail lines) from a fleet snapshot. Pure — the caller supplies
+/// `now` so the function stays clock-free.
 pub fn assemble_checks(
     snapshots: &[DpuSnapshot],
     now: DateTime<Utc>,
@@ -351,6 +460,7 @@ pub fn assemble_checks(
     out.push(cert_check(snapshots, now, config));
     out.push(quarantine_check(snapshots));
     out.push(lost_connection_check(snapshots, now, config));
+    out.extend(probe_stuck_check(snapshots, now, config));
     out
 }
 
@@ -369,6 +479,7 @@ mod tests {
             quarantine_state: None,
             last_seen_at: Utc::now(),
             client_certificate_expiry: None,
+            health_alerts: Vec::new(),
         }
     }
 
@@ -393,14 +504,14 @@ mod tests {
     // ── empty + single-DPU fleets ────────────────────────────────────────
 
     #[test]
-    fn empty_fleet_emits_five_ok_headlines_and_no_details() {
+    fn empty_fleet_emits_six_ok_headlines_and_no_details() {
         let now = Utc::now();
         let checks = assemble_checks(&[], now, &DpuConfig::default());
         let headline_count = checks
             .iter()
             .filter(|c| c.kind == CheckKind::Headline)
             .count();
-        assert_eq!(headline_count, 5, "expected 5 headlines, got {headline_count}");
+        assert_eq!(headline_count, 6, "expected 6 headlines, got {headline_count}");
         assert!(
             checks.iter().all(|c| c.kind == CheckKind::Headline),
             "no details expected on empty fleet",
@@ -411,6 +522,7 @@ mod tests {
             "cert-fleet",
             "quarantine",
             "lost-connection",
+            "probe-stuck",
         ] {
             assert_eq!(headline(&checks, name).status, Status::Ok, "{name}");
         }
@@ -427,6 +539,7 @@ mod tests {
             "cert-fleet",
             "quarantine",
             "lost-connection",
+            "probe-stuck",
         ] {
             assert_eq!(headline(&checks, name).status, Status::Ok, "{name}");
         }
@@ -685,6 +798,193 @@ mod tests {
         }
         let checks = assemble_checks(&snaps, now, &DpuConfig::default());
         assert_eq!(headline(&checks, "lost-connection").status, Status::Warn);
+    }
+
+    // ── parse_health_alerts (issue #239) ────────────────────────────────
+
+    #[test]
+    fn parse_health_alerts_returns_empty_for_none() {
+        assert!(parse_health_alerts(None).is_empty());
+    }
+
+    #[test]
+    fn parse_health_alerts_returns_empty_when_alerts_missing() {
+        let v = serde_json::json!({"other": "field"});
+        assert!(parse_health_alerts(Some(&v)).is_empty());
+    }
+
+    #[test]
+    fn parse_health_alerts_extracts_rfc3339_in_alert_since() {
+        let v = serde_json::json!({
+            "alerts": [
+                {"id": "PostConfigCheckWait", "in_alert_since": "2024-01-15T12:34:56Z"}
+            ]
+        });
+        let out = parse_health_alerts(Some(&v));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "PostConfigCheckWait");
+        assert_eq!(
+            out[0].in_alert_since,
+            Some(
+                DateTime::parse_from_rfc3339("2024-01-15T12:34:56Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        );
+    }
+
+    #[test]
+    fn parse_health_alerts_extracts_unix_epoch_in_alert_since() {
+        let v = serde_json::json!({
+            "alerts": [
+                {"id": "PostConfigCheckWait", "in_alert_since": 1_700_000_000_i64}
+            ]
+        });
+        let out = parse_health_alerts(Some(&v));
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].in_alert_since,
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0),
+        );
+    }
+
+    #[test]
+    fn parse_health_alerts_handles_null_in_alert_since() {
+        let v = serde_json::json!({
+            "alerts": [
+                {"id": "PostConfigCheckWait", "in_alert_since": null}
+            ]
+        });
+        let out = parse_health_alerts(Some(&v));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].in_alert_since.is_none());
+    }
+
+    #[test]
+    fn parse_health_alerts_skips_entries_without_id() {
+        let v = serde_json::json!({
+            "alerts": [
+                {"in_alert_since": "2024-01-15T12:34:56Z"},
+                {"id": "Good", "in_alert_since": "2024-01-15T12:34:56Z"}
+            ]
+        });
+        let out = parse_health_alerts(Some(&v));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "Good");
+    }
+
+    // ── probe-stuck (issue #239) ────────────────────────────────────────
+
+    fn alert(id: &str, in_alert_since: Option<DateTime<Utc>>) -> HealthAlert {
+        HealthAlert { id: id.into(), in_alert_since }
+    }
+
+    #[test]
+    fn probe_stuck_within_grace_window_is_ok() {
+        let now = Utc::now();
+        let mut s = snap("dpu-1");
+        // In alert for 10s — under the 30s grace window.
+        s.health_alerts = vec![alert(
+            "PostConfigCheckWait",
+            Some(now - ChronoDuration::seconds(10)),
+        )];
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let h = headline(&checks, "probe-stuck");
+        assert_eq!(h.status, Status::Ok);
+        assert_eq!(h.value, "0 DPUs with stuck PostConfigCheckWait");
+        assert!(details(&checks, "probe-stuck").is_empty());
+    }
+
+    #[test]
+    fn probe_stuck_past_grace_window_is_fail_with_detail() {
+        let now = Utc::now();
+        let mut s = snap("dpu-stuck");
+        // In alert for 60s — past the 30s grace window.
+        s.health_alerts = vec![alert(
+            "PostConfigCheckWait",
+            Some(now - ChronoDuration::seconds(60)),
+        )];
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let h = headline(&checks, "probe-stuck");
+        assert_eq!(h.status, Status::Fail);
+        assert_eq!(h.value, "1 DPUs with stuck PostConfigCheckWait");
+        let d = details(&checks, "probe-stuck");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].status, Status::Fail);
+        assert!(d[0].value.contains("dpu-stuck"));
+        assert!(d[0].value.contains("60s"));
+        assert_eq!(
+            d[0].next_command.as_deref(),
+            Some("nico doctor hbn dpu-stuck")
+        );
+    }
+
+    #[test]
+    fn probe_stuck_only_postconfigcheckwait_id_counts() {
+        let now = Utc::now();
+        let mut s = snap("dpu-1");
+        s.health_alerts = vec![
+            // Some other probe in alert > grace — should NOT count.
+            alert("OtherProbe", Some(now - ChronoDuration::seconds(120))),
+        ];
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        assert_eq!(headline(&checks, "probe-stuck").status, Status::Ok);
+    }
+
+    #[test]
+    fn probe_stuck_alert_with_no_in_alert_since_does_not_count() {
+        let now = Utc::now();
+        let mut s = snap("dpu-1");
+        // Alert entry exists but in_alert_since is None — treat as not stuck.
+        s.health_alerts = vec![alert("PostConfigCheckWait", None)];
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        assert_eq!(headline(&checks, "probe-stuck").status, Status::Ok);
+    }
+
+    #[test]
+    fn probe_stuck_cleared_between_reports_is_ok() {
+        let now = Utc::now();
+        // Acceptance criterion: "probe cleared between reports (pass)".
+        // After clear, the alert vec contains no PostConfigCheckWait entry.
+        let s = snap("dpu-1");
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        assert_eq!(headline(&checks, "probe-stuck").status, Status::Ok);
+    }
+
+    #[test]
+    fn probe_stuck_at_exact_grace_threshold_is_ok() {
+        let now = Utc::now();
+        let mut s = snap("dpu-1");
+        s.health_alerts = vec![alert(
+            "PostConfigCheckWait",
+            Some(now - ChronoDuration::seconds(30)),
+        )];
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        // Strict > grace: exactly 30s does NOT trip.
+        assert_eq!(headline(&checks, "probe-stuck").status, Status::Ok);
+    }
+
+    #[test]
+    fn probe_stuck_detail_lines_capped_and_sorted_by_age() {
+        let now = Utc::now();
+        let snaps: Vec<DpuSnapshot> = (0..10)
+            .map(|i| {
+                let mut s = snap(&format!("dpu-{i}"));
+                s.health_alerts = vec![alert(
+                    "PostConfigCheckWait",
+                    Some(now - ChronoDuration::seconds(60 + i * 10)),
+                )];
+                s
+            })
+            .collect();
+        let checks = assemble_checks(&snaps, now, &DpuConfig::default());
+        let h = headline(&checks, "probe-stuck");
+        assert_eq!(h.status, Status::Fail);
+        assert_eq!(h.value, "10 DPUs with stuck PostConfigCheckWait");
+        let d = details(&checks, "probe-stuck");
+        assert_eq!(d.len(), DRIFT_DETAIL_TOP_N);
+        // Oldest first — dpu-9 has age 60+90=150s, the largest.
+        assert!(d[0].value.contains("dpu-9"), "{}", d[0].value);
     }
 
     // ── drift threshold boundary ────────────────────────────────────────
