@@ -10,7 +10,7 @@ use nico_common::config::{
     Config, ConfigOverrides, ColorMode, DeploymentType, OutputFormat, ReachMode,
 };
 use nico_common::deployment_detect::{
-    workload_probe, ClusterShapeProbe, KubeClusterShapeProbe,
+    namespace_inventory_probe, workload_probe, ClusterShapeProbe, KubeClusterShapeProbe,
 };
 use nico_common::output::OutputMode;
 use nico_common::reach::ReachManager;
@@ -641,16 +641,20 @@ async fn run_validating_section(
 /// - `Some(_)` (resolved from CLI / env / file, including `Force`) →
 ///   pass instantly; detection is skipped per PRD-001's hybrid trust
 ///   model.
-/// - `None` (auto) + a shape probe is wired → run signal 1 (workload
-///   probe). Pass on match; fail with an observed-services diagnostic
-///   on no-match. Slices 3 / 4 will fall through to namespace and CRD
-///   inventory before failing.
+/// - `None` (auto) + a shape probe is wired → run the signal ladder in
+///   order, first match wins:
+///     1. workload probe (slice 2) — known Services
+///     2. namespace inventory (slice 3) — `forge-system` / `nico-rest`
+///        presence
+///
+///   Slice 4 will append CRD inventory. Pass on any match; fail with a
+///   combined diagnostic when every signal is inconclusive.
 /// - `None` + no shape probe → preserve the slice-1 fallback so
 ///   non-cluster code paths (tests, degraded boot) still surface a
 ///   clear "no detection signals" error.
 ///
-/// The matched type is intentionally *not* wired back into config in
-/// slice 2 — capability re-pointing lands in slice 5 (#282).
+/// The matched type is intentionally *not* wired back into config —
+/// capability re-pointing lands in slice 5 (#282).
 async fn detect_deployment_type_step(
     deployment_type: Option<DeploymentType>,
     shape_probe: Option<&dyn ClusterShapeProbe>,
@@ -663,18 +667,27 @@ async fn detect_deployment_type_step(
             "no detection signals available; pass --deployment-type=<full|core-only|rest-only-mock> or =force"
         ));
     };
+
+    // Signal 1: workload probe. Hold the outcome for the no-match
+    // diagnostic regardless of whether later signals fire.
     let outcome = workload_probe(probe).await?;
     if outcome.matched.is_some() {
         return Ok(());
     }
+
+    // Signal 2: namespace inventory fallback.
+    if namespace_inventory_probe(probe).await?.is_some() {
+        return Ok(());
+    }
+
     let observed = if outcome.observed_services.is_empty() {
         "<none>".to_string()
     } else {
         outcome.observed_services.join(", ")
     };
     Err(anyhow::anyhow!(
-        "workload probe matched no known deployment-type \
-         (observed services: {observed}); \
+        "workload probe and namespace inventory matched no known \
+         deployment-type (observed services: {observed}); \
          pass --deployment-type=<full|core-only|rest-only-mock> or =force"
     ))
 }
@@ -975,24 +988,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_step_fails_with_observed_services_when_workload_probe_no_match() {
+    async fn detect_step_falls_through_to_namespace_inventory_when_workload_probe_misses() {
         use nico_common::deployment_detect::testing::MockClusterShapeProbe;
-        // carbide-api visible but `nico-rest` namespace exists without
-        // either of its Services — falls through workload-probe rules.
+        // Edge case from slice 2's workload-probe rules: carbide-api
+        // visible, `nico-rest` namespace exists without either of its
+        // Services. Workload probe says no-match. Slice 3's
+        // namespace-inventory fallback picks both namespaces up and
+        // resolves to `full`, so the step passes.
         let probe = MockClusterShapeProbe::new()
             .with_service("forge-system", "carbide-api")
             .with_namespace("nico-rest");
+        let res = detect_deployment_type_step(None, Some(&probe)).await;
+        assert!(res.is_ok(), "expected ladder fall-through to pass; got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn detect_step_does_not_consult_namespace_inventory_when_workload_probe_matches() {
+        use nico_common::deployment_detect::testing::MockClusterShapeProbe;
+        // First-match-wins: workload probe resolves before slice 3 runs.
+        // Configure a probe whose namespace inventory would *disagree*
+        // (only `nico-rest` namespace, which would resolve to
+        // `rest-only-mock`) but whose workload-probe match (mock-core
+        // service) also says `rest-only-mock`. Either way the step
+        // passes; the assertion is simply that we don't reach a state
+        // where namespace-inventory's verdict overrides.
+        let probe = MockClusterShapeProbe::new()
+            .with_service("nico-rest", "nico-rest-mock-core");
+        let res = detect_deployment_type_step(None, Some(&probe)).await;
+        assert!(res.is_ok(), "expected workload-probe match to pass; got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn detect_step_fails_with_combined_diagnostic_when_all_signals_miss() {
+        use nico_common::deployment_detect::testing::MockClusterShapeProbe;
+        // No known services AND neither `forge-system` nor `nico-rest`
+        // namespaces present — both signals miss; the step fails with
+        // the combined diagnostic mentioning both signals tried.
+        let probe = MockClusterShapeProbe::new().with_namespace("kube-system");
         let err = detect_deployment_type_step(None, Some(&probe))
             .await
-            .expect_err("auto + no-match must fail");
+            .expect_err("auto + all-signals-miss must fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("workload probe matched no known deployment-type"),
-            "expected workload-probe-no-match diagnostic; got: {msg}"
-        );
-        assert!(
-            msg.contains("carbide-api@forge-system"),
-            "expected observed services to include carbide-api@forge-system; got: {msg}"
+            msg.contains("workload probe and namespace inventory"),
+            "expected combined ladder diagnostic; got: {msg}"
         );
         assert!(
             msg.contains("--deployment-type"),

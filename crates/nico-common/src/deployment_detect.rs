@@ -7,7 +7,9 @@
 //!
 //! Slice 2 lands signal 1 — the workload probe — backed by a small
 //! [`ClusterShapeProbe`] trait so the boot probe can drive detection
-//! without taking a hard dep on `kube::Client` everywhere.
+//! without taking a hard dep on `kube::Client` everywhere. Slice 3 adds
+//! signal 2 — the namespace-inventory fallback ([`namespace_inventory_probe`]) —
+//! consulted when the workload probe is inconclusive.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -85,6 +87,29 @@ pub async fn workload_probe(
     Ok(WorkloadProbeOutcome {
         matched,
         observed_services: observed,
+    })
+}
+
+/// Signal 2 of the detection ladder — namespace inventory fallback.
+///
+/// Resolves the deployment-type from the presence/absence of
+/// `forge-system` and `nico-rest`. Used when slice 2's
+/// [`workload_probe`] returns `WorkloadProbeOutcome { matched: None, .. }`.
+///
+/// - `forge-system` present, `nico-rest` absent → `core-only`
+/// - `forge-system` present, `nico-rest` present → `full`
+/// - `forge-system` absent, `nico-rest` present → `rest-only-mock`
+/// - otherwise → `None` (fall through to slice 4 / CRD inventory)
+pub async fn namespace_inventory_probe(
+    probe: &dyn ClusterShapeProbe,
+) -> Result<Option<DeploymentType>> {
+    let forge = probe.namespace_exists("forge-system").await?;
+    let rest = probe.namespace_exists("nico-rest").await?;
+    Ok(match (forge, rest) {
+        (true, false) => Some(DeploymentType::CoreOnly),
+        (true, true) => Some(DeploymentType::Full),
+        (false, true) => Some(DeploymentType::RestOnlyMock),
+        (false, false) => None,
     })
 }
 
@@ -246,5 +271,39 @@ mod tests {
             .observed_services
             .iter()
             .any(|s| s == "carbide-api@forge-system"));
+    }
+
+    #[tokio::test]
+    async fn namespace_inventory_resolves_core_only_when_only_forge_system_present() {
+        let probe = MockClusterShapeProbe::new().with_namespace("forge-system");
+        let got = namespace_inventory_probe(&probe).await.unwrap();
+        assert_eq!(got, Some(DeploymentType::CoreOnly));
+    }
+
+    #[tokio::test]
+    async fn namespace_inventory_resolves_full_when_both_namespaces_present() {
+        let probe = MockClusterShapeProbe::new()
+            .with_namespace("forge-system")
+            .with_namespace("nico-rest");
+        let got = namespace_inventory_probe(&probe).await.unwrap();
+        assert_eq!(got, Some(DeploymentType::Full));
+    }
+
+    #[tokio::test]
+    async fn namespace_inventory_resolves_rest_only_mock_when_only_nico_rest_present() {
+        let probe = MockClusterShapeProbe::new().with_namespace("nico-rest");
+        let got = namespace_inventory_probe(&probe).await.unwrap();
+        assert_eq!(got, Some(DeploymentType::RestOnlyMock));
+    }
+
+    #[tokio::test]
+    async fn namespace_inventory_returns_none_when_neither_namespace_present() {
+        // Ambiguous-no-match: cluster has unrelated namespaces only.
+        // Caller falls through to slice 4 (CRD inventory).
+        let probe = MockClusterShapeProbe::new()
+            .with_namespace("kube-system")
+            .with_namespace("default");
+        let got = namespace_inventory_probe(&probe).await.unwrap();
+        assert_eq!(got, None);
     }
 }
