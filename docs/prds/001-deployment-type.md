@@ -39,7 +39,7 @@
 
 ### Detection (capability-based; signals 2 + 3 + 4)
 
-Architecture: detection produces a capability bundle; layers gate on capabilities, not on the type-name label. Type label is a human-friendly summary of the bundle. **Capability vocabulary is deliberately not finalized here** (see #242 + auto-memory `project_deployment_type_capability_vocab.md`); a follow-up grilling session must settle the names before any sub-issue touches capability internals.
+Architecture: detection resolves the active cluster to one of the named `DeploymentType` variants. The type carries deployment-type-derived defaults for existing config keys (no new identifier namespace) plus one feature gate (`forgedb_present`) that forgedb-dependent layers consult to skip cleanly. Layers gate on the predicate (`forgedb_present()`), not on the type-name label. Vocabulary is finalized below in the **Capability vocabulary** section.
 
 Signal ladder (first match wins):
 
@@ -126,9 +126,27 @@ Amend ADR-0013 (boot probe) to document the new `detect_deployment_type` step in
 
 `Deployment-type` and `Force mode` are already part of the ubiquitous-language section (added when this PRD was specced).
 
-## Open question deliberately deferred
+## Capability vocabulary
 
-Capability vocabulary (`controller_namespace`, `grpc_address`, `forgedb_present`, `mock_core` were sketched but not finalized). Must be re-grilled in a follow-up session before any sub-issue that touches capability internals is implemented. See auto-memory: `project_deployment_type_capability_vocab.md`.
+Resolved 2026-05-09. The "capability bundle" is a defaults overlay on existing config keys plus a single feature gate. Implemented as methods on the `DeploymentType` enum (no parallel identifier namespace, no separate bundle struct).
+
+```rust
+pub enum DeploymentType { Full, CoreOnly, RestOnlyMock, Force }
+
+impl DeploymentType {
+    pub fn default_cluster_namespace(&self) -> Option<&'static str>;
+    pub fn default_grpc_address(&self) -> Option<&'static str>;
+    pub fn default_postgres_namespace(&self) -> Option<&'static str>;
+    pub fn default_temporal_address(&self) -> Option<&'static str>;
+    pub fn default_temporal_namespace(&self) -> Option<&'static str>;
+    pub fn forgedb_present(&self) -> bool;
+}
+```
+
+- `Force` returns `None` for every default (falls through to existing hardcoded fallbacks) and `true` for `forgedb_present` (assume present; forgedb-dependent layers fail naturally if it isn't — that's the price of force).
+- **Override-conflict warning rule.** When a per-key file/env/CLI value differs from the active deployment-type's default for one of the five default-keys above, emit a one-line stderr warning after the boot banner header (one line per contradicting key). `--deployment-type=force` silences. Keys without deployment-type-derived defaults (`cluster.context`, `cluster.reach_mode`, `postgres.url`, `dpu.*`) are not checked.
+- **Single feature gate.** `forgedb_present` is substrate-shaped (names the database the layers depend on) and covers every forgedb-dependent layer (`dpu`, `hbn`, `dpu_cert`, `dpu_isolation`, `hbn_drift`, plus PRD-002's `dpu_health` / `dpu_services` / `infiniband` once they land). If a future deployment-type introduces a different DPU data source, replace `bool` with an enum at that point — not before.
+- **Slice 1 escape valve.** The α-flat shape (`Force` as an enum variant; methods on the enum) is the spec. If a concrete need emerges during slice 1 to switch to a separate `CapabilityBundle` struct or to nest `Force` as `DeploymentTypeResolved::Force`, the slice 1 PR may do so without amending this PRD.
 
 ## Implementation tracking
 
