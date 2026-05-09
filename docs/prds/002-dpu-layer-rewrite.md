@@ -233,6 +233,25 @@ rollup, per-port detail, both?) deferred to implementation.
   `instance_config_version` (distinct from
   `instance_network_config_version` and extension-service drift).
   Called out as deserving its own PRD.
+- **`vpc_vni` mismatch detection and BGP-EVPN type-2 route presence**
+  (issue #216). Verified 2026-05-09 against `infra-controller-core`
+  (`crates/rpc/proto/forge.proto:4592` `DpuNetworkStatus`,
+  `crates/agent/src/health/{bgp.rs,probe_ids.rs}`,
+  `crates/api-model/src/machine/network.rs:38` /
+  `crates/api-db/migrations/20230308160000_machine_network_status_observation.sql`):
+  neither configured-vs-expected `vpc_vni` nor EVPN type-2 route presence
+  is exposed by `RecordDpuNetworkStatus`, the `network_status_observation`
+  JSONB column, or the `HealthReport` probe vocabulary. The agent runs
+  `vtysh -c 'show bgp summary json'` for **session state only** —
+  `pfx_rcd`/`pfx_snt` are read but explicitly skipped
+  (`bgp.rs:362-369`), and `show bgp l2vpn evpn` route-table contents are
+  not parsed anywhere. Probe IDs are session-typed
+  (`BgpPeeringTor`, `BgpPeeringRouteServer`, `UnexpectedBgpPeer`,
+  `BgpStats`, `BgpDaemonEnabled`). Surfacing these would require an
+  upstream change to NICo before nico-doctor could query them; remains
+  operator-side debug (`crictl exec … vtysh -c 'show bgp l2vpn evpn
+  summary'`) until then. See `docs/playbooks/stuck_objects/waiting_for_network_config.md`
+  in core for the operator path.
 
 ## Testing strategy
 
