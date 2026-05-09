@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nico_common::boot_probe::{
-    next_command_for, standard_steps, BootProbe, ProbeMode, ProbeOutcome, ProbeState, StderrSink,
-    StepId, StepState,
+    next_command_for, standard_steps_with_grpc, BootProbe, ProbeMode, ProbeOutcome, ProbeState,
+    StderrSink, StepId, StepState,
 };
 use nico_common::config::{
     Config, ConfigOverrides, ColorMode, DeploymentType, OutputFormat, ReachMode,
@@ -406,7 +406,11 @@ async fn run_boot_probe(
         }
     };
 
-    let steps = standard_steps(&config.cluster.namespace, &config.bootstrap.timeouts);
+    let steps = standard_steps_with_grpc(
+        &config.cluster.namespace,
+        &config.bootstrap.timeouts,
+        config.cluster.grpc_address.as_deref(),
+    );
     let probe_state = ProbeState::new(steps, reach_mode.as_str(), reach_source)
         .with_deployment_type(
             config.cluster.deployment_type.map(|d| d.label().to_string()),

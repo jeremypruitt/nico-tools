@@ -351,11 +351,28 @@ impl ProbeOutcome {
 /// bootstrap path. Steps that don't apply for a given run (e.g. no
 /// gRPC address configured) can be filtered out by the caller before
 /// constructing the probe.
+///
+/// When `grpc_address` is `Some`, the `port-forward: grpc` step's
+/// label renders the resolved target inline (`port-forward: grpc → <addr>`).
+/// When `None`, the label stays minimal — the step itself is marked
+/// `Skipped` at run time.
 pub fn standard_steps(
     namespace: &str,
     timeouts: &crate::config::BootstrapTimeouts,
 ) -> Vec<StepDef> {
+    standard_steps_with_grpc(namespace, timeouts, None)
+}
+
+pub fn standard_steps_with_grpc(
+    namespace: &str,
+    timeouts: &crate::config::BootstrapTimeouts,
+    grpc_address: Option<&str>,
+) -> Vec<StepDef> {
     use super::state::Section::*;
+    let grpc_label = match grpc_address {
+        Some(addr) => format!("port-forward: grpc → {addr}"),
+        None => "port-forward: grpc".to_string(),
+    };
     vec![
         StepDef {
             id: StepId::LoadKubeconfig,
@@ -401,7 +418,7 @@ pub fn standard_steps(
         },
         StepDef {
             id: StepId::PortForwardGrpc,
-            label: "port-forward: grpc".into(),
+            label: grpc_label,
             section: Serving,
             budget: timeouts.port_forward,
         },
@@ -723,5 +740,85 @@ mod tests {
         let s = standard_steps("nico", &t);
         let detect = s.iter().find(|d| d.id == StepId::DetectDeploymentType).unwrap();
         assert_eq!(detect.section, crate::boot_probe::state::Section::Validating);
+    }
+
+    #[tokio::test]
+    async fn standard_steps_renders_resolved_grpc_target_in_label() {
+        // PRD-001 slice 6: when a gRPC address is resolved (from
+        // deployment-type default, file, or env), the `port-forward: grpc`
+        // step's banner label must include the target inline so the
+        // operator sees exactly what the boot probe is dialing.
+        let t = crate::config::BootstrapTimeouts::default();
+        let s = standard_steps_with_grpc("nico-rest", &t, Some("nico-rest-mock-core.nico-rest:11079"));
+        let grpc = s.iter().find(|d| d.id == StepId::PortForwardGrpc).unwrap();
+        assert_eq!(
+            grpc.label,
+            "port-forward: grpc → nico-rest-mock-core.nico-rest:11079",
+            "expected resolved grpc target in banner label, got {:?}",
+            grpc.label,
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_steps_omits_arrow_when_grpc_address_unset() {
+        // No resolved address → no arrow. The step renders Skipped at run
+        // time; the label should not pretend a target exists.
+        let t = crate::config::BootstrapTimeouts::default();
+        let s = standard_steps_with_grpc("nico", &t, None);
+        let grpc = s.iter().find(|d| d.id == StepId::PortForwardGrpc).unwrap();
+        assert_eq!(grpc.label, "port-forward: grpc");
+    }
+
+    #[tokio::test]
+    async fn rest_only_mock_resolves_to_nico_rest_labels_end_to_end() {
+        // Closes the user-reported failure: with `--deployment-type=rest-only-mock`
+        // (and no overrides), slice 5 resolves the capability bundle so that
+        // `cluster.namespace = "nico-rest"` and
+        // `cluster.grpc_address = Some("nico-rest-mock-core.nico-rest:11079")`.
+        // Slice 6's contract: those resolved values flow into the boot probe's
+        // step labels — the `namespace_exists` row reads `nico-rest`, and the
+        // `port-forward: grpc` row renders the resolved target inline.
+        use crate::config::{Config, ConfigOverrides};
+        let env = std::collections::HashMap::new();
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("rest-only-mock".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &env, &overrides).expect("config load");
+        assert_eq!(cfg.cluster.namespace, "nico-rest");
+        assert_eq!(
+            cfg.cluster.grpc_address.as_deref(),
+            Some("nico-rest-mock-core.nico-rest:11079")
+        );
+
+        let steps = standard_steps_with_grpc(
+            &cfg.cluster.namespace,
+            &cfg.bootstrap.timeouts,
+            cfg.cluster.grpc_address.as_deref(),
+        );
+        let ns = steps.iter().find(|d| d.id == StepId::NamespaceExists).unwrap();
+        let grpc = steps.iter().find(|d| d.id == StepId::PortForwardGrpc).unwrap();
+        assert_eq!(ns.label, "namespace 'nico-rest' exists");
+        assert_eq!(
+            grpc.label,
+            "port-forward: grpc → nico-rest-mock-core.nico-rest:11079"
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_steps_namespace_label_uses_resolved_namespace() {
+        // PRD-001 slice 6: closes the user-reported failure where the
+        // banner showed `namespace 'forge-system' exists` against a
+        // `rest-only-mock` cluster. The label must reflect whatever
+        // `cluster.namespace` resolved to, with no `forge-system` fallback.
+        let t = crate::config::BootstrapTimeouts::default();
+        let s = standard_steps("nico-rest", &t);
+        let ns = s.iter().find(|d| d.id == StepId::NamespaceExists).unwrap();
+        assert_eq!(ns.label, "namespace 'nico-rest' exists");
+        assert!(
+            !ns.label.contains("forge-system"),
+            "namespace label must not hard-code forge-system, got {:?}",
+            ns.label,
+        );
     }
 }

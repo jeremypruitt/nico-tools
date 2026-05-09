@@ -655,7 +655,7 @@ mod tests {
             def_in(StepId::LoadKubeconfig, "load kubeconfig", Section::Connecting, 5),
             def_in(StepId::ReachApiServer, "reach API server", Section::Connecting, 5),
             def_in(StepId::Credentials, "credentials", Section::Validating, 5),
-            def_in(StepId::NamespaceExists, "namespace 'forge-system' exists", Section::Validating, 5),
+            def_in(StepId::NamespaceExists, "namespace 'nico' exists", Section::Validating, 5),
             def_in(StepId::Rbac, "list-pods permission", Section::Validating, 5),
             def_in(StepId::PortForwardWorkflows, "port-forward: workflows", Section::Serving, 5),
             def_in(StepId::PortForwardGrpc, "port-forward: grpc", Section::Serving, 5),
