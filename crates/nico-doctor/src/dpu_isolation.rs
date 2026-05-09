@@ -1,19 +1,22 @@
-//! DPU isolation verdict — distinguishes the three reasons a DPU might
+//! DPU isolation verdict — distinguishes the four reasons a DPU might
 //! have no traffic so the operator does not have to triage them by hand:
 //!
-//! - `not-yet-known` — machine row absent, or scout discovery has not
-//!   completed for it. We have nothing to quarantine or measure freshness
-//!   against.
-//! - `quarantined` — `MachineQuarantineState` is set (e.g.
-//!   `BlockAllTraffic`). Deliberate.
-//! - `lost-connection` — most recent `DpuNetworkStatus.last_seen_at` is
-//!   older than the freshness threshold (or absent entirely).
+//! - `not-yet-known` — `machines` row absent, or no
+//!   `network_status_observation` has been written for it. Nothing to
+//!   quarantine or measure freshness against.
+//! - `quarantine-requested` — `network_config->'quarantine_state'->>'mode'`
+//!   is set (e.g. `BlockAllTraffic`). Operator intent (desired-side), not
+//!   observed effect — see PRD-002.
+//! - `lost-connection` — `network_status_observation->>'observed_at'` is
+//!   older than the freshness threshold (or the observation row is
+//!   absent entirely).
 //! - `healthy` — none of the above.
 //!
-//! Precedence (mutually exclusive): `not-yet-known` > `quarantined` >
-//! `lost-connection` > `healthy`. Pure `assess()` over a small
-//! [`IsolationSnapshot`] keeps the logic testable without touching
-//! Postgres; the [`DpuIsolationClient`] trait is the seam.
+//! Precedence (mutually exclusive): `not-yet-known` >
+//! `quarantine-requested` > `lost-connection` > `healthy`. Pure
+//! `assess()` over a small [`IsolationSnapshot`] keeps the logic
+//! testable without touching Postgres; the [`DpuIsolationClient`] trait
+//! is the seam.
 
 use std::time::Duration;
 use anyhow::Result;
@@ -36,22 +39,24 @@ pub struct IsolationSnapshot {
     /// `machines.id` exists in forgedb. False ⇒ the operator typed an
     /// ID we have never seen.
     pub registered: bool,
-    /// Scout discovery has completed for this machine — i.e. there is
-    /// enough state to evaluate quarantine / freshness signals against.
-    /// False before scout runs, true after.
+    /// `network_status_observation` has been written for this machine —
+    /// i.e. the agent has reported at least once, so quarantine /
+    /// freshness signals are evaluable. False before the first
+    /// observation lands, true after.
     pub scout_discovery_complete: bool,
-    /// `MachineQuarantineState` for this machine, e.g.
-    /// `Some("BlockAllTraffic")`. `None` ⇒ not quarantined.
+    /// Desired-side quarantine mode pulled from
+    /// `network_config->'quarantine_state'->>'mode'`, e.g.
+    /// `Some("BlockAllTraffic")`. `None` ⇒ no quarantine requested.
+    /// Operator intent — not observed effect — per PRD-002.
     pub quarantine_state: Option<String>,
-    /// Most recent `DpuNetworkStatus.last_seen_at`. `None` ⇒ no row
-    /// has ever been observed (treated as `lost-connection` for a
-    /// registered + scouted DPU).
+    /// `network_status_observation->>'observed_at'`. `None` ⇒ no
+    /// observation has ever landed (treated as `lost-connection` for a
+    /// registered + observed DPU).
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
-/// Read-only seam over the isolation data layer (machines /
-/// scout-discovery / MachineQuarantineState / DpuNetworkStatus). The
-/// real impl issues the canonical queries against forgedb and degrades
+/// Read-only seam over forgedb for the `dpu_isolation` layer. The real
+/// impl reads the producer-side `machines` row (PRD-002) and degrades
 /// soft when the schema is absent (returning `not-yet-known`); tests
 /// inject mocks.
 #[async_trait]
@@ -59,20 +64,34 @@ pub trait DpuIsolationClient: Send + Sync {
     async fn fetch_snapshot(&self, machine_id: &str) -> Result<IsolationSnapshot>;
 }
 
-/// Default sqlx-backed [`DpuIsolationClient`].
+/// Default sqlx-backed [`DpuIsolationClient`]. Reads:
 ///
-/// Follows the same schema-probe-and-degrade pattern as
-/// [`crate::hbn::SqlxHbnClient`]: when `dpu_network_status` is absent
-/// (carbide drift, #213), every machine reports `not-yet-known` rather
-/// than crashing. The tracer-bullet query reads `quarantine_state` and
-/// `last_seen_at` from the most recent row; presence of the row implies
-/// registration + scout completion. Once the carbide port (#213) lands,
-/// this becomes four separate queries against `machines`,
-/// scout-discovery state, `MachineQuarantineState`, and
-/// `dpu_network_status`.
+/// - `machines.id` — presence ⇒ registered.
+/// - `machines.network_config->'quarantine_state'->>'mode'` — desired-side
+///   quarantine intent (PRD-002). The companion
+///   `network_status_observation` axis would record observed effect, but
+///   the layer reports intent: "what did the operator ask for".
+/// - `(machines.network_status_observation->>'observed_at')::timestamptz`
+///   — most recent observation timestamp; presence ⇒ the agent has
+///   reported at least once.
+///
+/// Schema-probes the `machines` table and degrades to `not-yet-known`
+/// when absent so dev clusters that haven't run the carbide schema
+/// render the gentle Unknown verdict instead of crashing.
 pub struct SqlxDpuIsolationClient {
     pool: sqlx::PgPool,
 }
+
+/// SQL columns the snapshot reads. Extracted as a constant so the
+/// schema choice (which producer-side JSON paths the layer reads) is
+/// pinned by a unit test, even though we can't exercise the full query
+/// without a live postgres.
+pub(crate) const FETCH_SNAPSHOT_COLS: &str = "\
+    m.id, \
+    m.network_config->'quarantine_state'->>'mode', \
+    (m.network_status_observation->>'observed_at')::timestamptz";
+
+pub(crate) const FETCH_SNAPSHOT_FROM: &str = "FROM machines m";
 
 impl SqlxDpuIsolationClient {
     pub fn new(url: &str) -> Result<Self> {
@@ -84,18 +103,21 @@ impl SqlxDpuIsolationClient {
     }
 }
 
+async fn machines_table_exists(pool: &sqlx::PgPool) -> Result<bool> {
+    let exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_name = 'machines')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("dpu_isolation schema probe failed: {e}"))?;
+    Ok(exists.0)
+}
+
 #[async_trait]
 impl DpuIsolationClient for SqlxDpuIsolationClient {
     async fn fetch_snapshot(&self, machine_id: &str) -> Result<IsolationSnapshot> {
-        let exists: (bool,) = sqlx::query_as(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_name = 'dpu_network_status')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("dpu_isolation schema probe failed: {e}"))?;
-
-        if !exists.0 {
+        if !machines_table_exists(&self.pool).await? {
             return Ok(IsolationSnapshot {
                 machine_id: machine_id.to_string(),
                 registered: false,
@@ -105,25 +127,23 @@ impl DpuIsolationClient for SqlxDpuIsolationClient {
             });
         }
 
-        let row: Option<(Option<String>, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT s.quarantine_state, s.last_seen_at \
-             FROM dpu_network_status s \
-             WHERE s.dpu_id = $1 \
-             ORDER BY s.last_seen_at DESC \
-             LIMIT 1",
-        )
-        .bind(machine_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("dpu_isolation query failed: {e}"))?;
+        let sql = format!(
+            "SELECT {FETCH_SNAPSHOT_COLS} {FETCH_SNAPSHOT_FROM} WHERE m.id = $1 LIMIT 1"
+        );
+        let row: Option<(String, Option<String>, Option<DateTime<Utc>>)> =
+            sqlx::query_as(&sql)
+                .bind(machine_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("dpu_isolation query failed: {e}"))?;
 
         Ok(match row {
-            Some((quarantine_state, last_seen_at)) => IsolationSnapshot {
+            Some((_id, quarantine_state, last_seen_at)) => IsolationSnapshot {
                 machine_id: machine_id.to_string(),
                 registered: true,
-                scout_discovery_complete: true,
+                scout_discovery_complete: last_seen_at.is_some(),
                 quarantine_state,
-                last_seen_at: Some(last_seen_at),
+                last_seen_at,
             },
             None => IsolationSnapshot {
                 machine_id: machine_id.to_string(),
@@ -219,7 +239,7 @@ pub fn assemble_checks(machine_id: &str, verdict: &IsolationVerdict) -> Vec<Chec
         ),
         IsolationVerdict::Quarantined { state } => (
             Status::Fail,
-            format!("dpu {machine_id} quarantined: {state}"),
+            format!("dpu {machine_id} quarantine requested: {state}"),
             Some(format!(
                 "nico correlate {machine_id} # see why this DPU was quarantined"
             )),
@@ -236,7 +256,7 @@ pub fn assemble_checks(machine_id: &str, verdict: &IsolationVerdict) -> Vec<Chec
                     threshold.as_secs()
                 ),
                 None => format!(
-                    "dpu {machine_id} lost-connection: no DpuNetworkStatus row ever observed"
+                    "dpu {machine_id} lost-connection: no network_status_observation ever recorded"
                 ),
             },
             Some(format!(
@@ -450,7 +470,11 @@ mod tests {
         let checks = assemble_checks("machine-42", &verdict);
         assert_eq!(checks[0].status, Status::Fail);
         assert!(checks[0].value.contains("BlockAllTraffic"));
-        assert!(checks[0].value.contains("quarantined"));
+        assert!(
+            checks[0].value.contains("quarantine requested"),
+            "value: {}",
+            checks[0].value,
+        );
         assert!(checks[0]
             .next_command
             .as_deref()
@@ -478,7 +502,37 @@ mod tests {
         };
         let checks = assemble_checks("machine-42", &verdict);
         assert_eq!(checks[0].status, Status::Fail);
-        assert!(checks[0].value.contains("no DpuNetworkStatus"));
+        assert!(
+            checks[0].value.contains("no network_status_observation"),
+            "value: {}",
+            checks[0].value,
+        );
+    }
+
+    // ── SQL: producer-side machines columns only (PRD-002) ────────────────
+
+    #[test]
+    fn fetch_snapshot_sql_targets_producer_side_machines_columns() {
+        let cols = FETCH_SNAPSHOT_COLS;
+        let from = FETCH_SNAPSHOT_FROM;
+        let combined = format!("{cols} {from}");
+
+        assert!(
+            !combined.contains("dpu_network_status"),
+            "old table dpu_network_status must not be referenced: {combined}"
+        );
+        assert!(
+            from.contains("FROM machines"),
+            "must read from machines table: {from}"
+        );
+        assert!(
+            cols.contains("network_config->'quarantine_state'->>'mode'"),
+            "must read desired-side quarantine mode: {cols}"
+        );
+        assert!(
+            cols.contains("network_status_observation->>'observed_at'"),
+            "must read observed_at for last_seen_at: {cols}"
+        );
     }
 
     #[test]
