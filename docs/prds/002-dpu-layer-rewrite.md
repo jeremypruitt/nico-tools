@@ -1,6 +1,6 @@
 # PRD-002 — DPU layer rewrite: schema realignment + new axes
 
-- **Status:** Specced (2026-05-09); awaiting `/to-issues` breakdown.
+- **Status:** Specced (2026-05-09; amended same day to fold in the fleet-wide `dpu` layer after PR #241 landed); awaiting `/to-issues` breakdown.
 - **Epic:** #253 (carries `prd-002` label; tracks slice progress).
 - **Touches:** `CONTEXT.md` (`dpu` layer entry; new layer entries for `dpu_health`, `dpu_services`, `infiniband`).
 - **Pre-existing bugs this fixes:** #213, #147.
@@ -12,14 +12,19 @@ against the actual core schema, plus three new axes (`dpu_health`,
 
 ## Problem
 
-The per-DPU drill-down layers (`hbn`, `dpu_cert`, `dpu_isolation`) and
-the correlate-side drift trail (`nico-correlate/src/hbn_drift.rs`)
-currently query SQL tables that do not exist in either
-`infra-controller-core` or `infra-controller-rest`:
+The per-DPU drill-down layers (`hbn`, `dpu_cert`, `dpu_isolation`),
+the fleet-wide rollup layer (`dpu`, shipped 2026-05-08 in PR #241
+closing #214), and the correlate-side drift trail
+(`nico-correlate/src/hbn_drift.rs`) currently query SQL tables that
+do not exist in either `infra-controller-core` or `infra-controller-rest`:
 
-- `dpu_network_status` — 8 references in nico-doctor; defined nowhere upstream
-- `dpu_desired_network_config` — 5 references; defined nowhere upstream
-- `dpu_network_status_history` — 1 reference; defined nowhere upstream
+- `dpu_network_status` — referenced in `dpu.rs`, `hbn.rs`, `dpu_cert.rs`,
+  `dpu_isolation.rs` (nico-doctor) and `hbn_drift.rs` (nico-correlate);
+  defined nowhere upstream
+- `dpu_desired_network_config` — referenced in `dpu.rs`, `hbn.rs`
+  (nico-doctor) and `hbn_drift.rs` (nico-correlate); defined nowhere upstream
+- `dpu_network_status_history` — 1 reference in `hbn_drift.rs`;
+  defined nowhere upstream
 - `health_report` as a relational table with `alert_name` /
   `in_alert_since` columns — defined nowhere upstream;
   `HealthReport` exists only as a JSON-serialized struct stored in
@@ -47,14 +52,17 @@ thousands.
 
 ## Goals
 
-- Rewrite existing per-DPU layers against producer-side reality.
+- Rewrite existing per-DPU drill-down layers against producer-side reality.
+- Rewrite the fleet-wide `dpu` rollup layer (PR #241) against the same
+  producer-side reality. Same missing-table bug; same JSON columns; was
+  out-of-scope in the original draft because the PRD was written before
+  PR #241 merged.
 - Add three new per-DPU layers surfacing currently-invisible signal:
   `dpu_health`, `dpu_services`, `infiniband`.
 - Preserve read-only / non-blocking discipline (no remediation, fast exit).
 
 ## Non-goals
 
-- Implementing the fleet-wide `dpu` layer (CONTEXT.md). Separate effort.
 - Tier 3 axes — captured in a follow-up PRD issue.
 - Producing migrations on the core side. Adapt to what exists.
 
@@ -93,6 +101,21 @@ tables joined on `dpu_id`.
 | `health_report` table with `alert_name`/`in_alert_since` columns | **Wrong shape.** Read alerts from `dpu_agent_health_report` JSON instead. |
 
 ## Layer changes
+
+### `dpu` (existing — fleet-wide rewrite)
+
+Just-shipped fleet-wide rollup (PR #241, closing #214) hits the same
+missing-table problem as the per-DPU layers. Rewrite against:
+
+- `network_status_observation` JSON for applied state per DPU
+- `network_config` JSON for desired state per DPU
+- `dpu_agent_health_report` JSON for alert summary
+
+`DpuSnapshot` shape stays compatible. Drop `container_running` field
+(no producer). Update `quarantine_state` semantics to "quarantine
+requested" (matches `dpu_isolation` adjust — desired-side, not
+observed). BGP-typed alerts continue to surface in the rollup;
+non-BGP categories are exposed via `dpu_health` for drill-down.
 
 ### `dpu_cert` (existing — clean rewrite)
 
@@ -229,5 +252,8 @@ rollup, per-port detail, both?) deferred to implementation.
   Implementation hits missing tables.
 - Issue #207 — `nico doctor dpu-isolation <machine-id>`. Implementation
   hits missing tables.
+- Issue #214 / PR #241 — `nico doctor` fleet-wide `dpu` layer. Shipped
+  2026-05-08 with the same missing-table bug; in scope of this PRD per
+  the 2026-05-09 amendment.
 - CONTEXT.md `dpu` layer entry — fleet-wide rollup; data-source
   description updated alongside this PRD.
