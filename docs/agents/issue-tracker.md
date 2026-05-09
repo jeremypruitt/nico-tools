@@ -75,7 +75,15 @@ Use (1) for parent-child relationships within a PRD. Use (3) for ordering constr
 
 ## PRD format and lifecycle
 
-PRDs are forward-looking specs. The canonical doc lives in `docs/prds/NNN-slug.md` (zero-padded numbering, parallel to `docs/adrs/`). The doc is the source of truth for the spec; an Epic GitHub issue (label `epic` + `prd-NNN`) tracks implementation progress with a children tasklist.
+PRDs are forward-looking specs. The canonical doc lives in `docs/prds/NNN-slug.md` (zero-padded numbering, parallel to `docs/adrs/`). The doc is the source of truth for the spec; an Epic GitHub issue (label `epic` + `prd-NNN`) tracks implementation progress.
+
+**Every PRD ships as an Epic with native sub-issues.** Before any implementation begins, run `/to-issues` against the PRD to spawn one issue per vertical slice, each linked to the Epic via the native sub-issue API (§"Dependency tracking" → step 1) AND carrying `Parent: #<epic>` in its body. This is non-negotiable because:
+
+1. The GitHub UI renders an `N/M completed` progress badge on the Epic only when children are linked as native sub-issues — markdown checklists don't count. That badge is the primary at-a-glance signal of how a PRD is progressing.
+2. The `prd-NNN` label query (`gh issue list --label prd-NNN`) returns the whole tree (epic + children), letting the triage flow operate on a PRD as a unit.
+3. Slices that surface as concrete issues are graspable independently (`ready-for-agent`, picked up AFK, merged); placeholder checklists are not.
+
+A PRD whose epic body has only markdown checklist placeholders is in an unfinished state, even if the PRD doc itself is complete. Run `/to-issues` to finish it.
 
 ### File layout
 
@@ -122,6 +130,8 @@ The Epic issue's body is a thin shell:
 - Related issues / pre-existing bugs / upstream deps
 
 The Epic body can be edited freely as implementation progresses. The PRD doc is more stable — major spec changes warrant a new commit (and possibly a new PRD if the change is substantive enough).
+
+**Reference epic to imitate:** PRD-002's epic (#253) is the canonical example of a fully-fleshed Epic — children #257-#265 are filed and linked, the body lists them by issue number, and the GitHub UI shows an `N/9 completed` progress badge. PRD-001's epic (#245) was brought into compliance retroactively on 2026-05-09 via `/to-issues`; new PRDs should reach this shape *before* any implementation slice is picked up.
 
 ## Project board automation
 
