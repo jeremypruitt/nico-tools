@@ -90,6 +90,11 @@ every output line points at where to dig deeper.
   _Avoid_: entry, record, log line
 - **Timeline** — the chronologically sorted sequence of Events in a Correlation, normalized across all Sources. The default human output format for `nico-correlate`.
   _Avoid_: log, history, trace
+- **Deployment-type** (nico-doctor specific) — one of three named NICo cluster shapes: `full` (core+rest co-located), `core-only` (carbide-kind), `rest-only-mock` (the rest repo's documented quick-setup with mock-core stand-in). Detected automatically by signal ladder, or set explicitly via `--deployment-type` / `[cluster] deployment_type` / `NICO_DEPLOYMENT_TYPE`. `--deployment-type=force` is the escape hatch — disables detection, type-derived defaults, and conflict warnings; runs with raw config. Distinct from the rest repo's "deployment topology" (co-located vs cloud-hosted), which is an orthogonal axis. See PRD-001.
+  _Avoid_: profile, mode, shape, stack
+- **Epic** — a master/parent GitHub issue that has child sub-issues. Carries the `epic` label plus the PRD label of the work it heads. Body lists children as a tasklist; children carry `Parent: #<epic>` and the same PRD label.
+- **PRD label** — `prd-NNN` (zero-padded, ADR-style numbering). Applied to the Epic AND every child sub-issue, so `gh issue list --label prd-NNN` returns the whole tree. Numbering is allocated at PRD-creation time; the next free number is found via `gh label list | grep '^prd-' | sort -r | head -1`.
+- **ADR label** — `adr-NNNN` (4-digit, matching the ADR filename). Applied to issues that touch or amend that ADR. Bidirectional backlink: ADR docs reference issues; issues reference ADRs via this label.
 
 ## Umbrella binary layout
 
