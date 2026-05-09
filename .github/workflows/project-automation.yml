@@ -1,0 +1,148 @@
+name: Project board automation
+
+# Drives card status on project 1 (https://github.com/users/jeremypruitt/projects/1)
+# in response to issue + PR lifecycle events. See docs/agents/issue-tracker.md
+# §"Project board automation" for the full transition table and the
+# `PROJECT_PAT` secret setup required to grant project scope.
+
+on:
+  issues:
+    types: [opened, labeled, closed, reopened]
+  pull_request:
+    types: [opened, ready_for_review, converted_to_draft, closed, reopened]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+env:
+  PROJECT_ID: PVT_kwHOAAE0oM4BXFC0
+  STATUS_FIELD_ID: PVTSSF_lAHOAAE0oM4BXFC0zhSUcro
+  STATUS_BACKLOG: a18af1e3
+  STATUS_READY: 0855fb61
+  STATUS_IN_PROGRESS: 7c242164
+  STATUS_VALIDATING: f5779989
+  STATUS_DONE: a8a3d908
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+    steps:
+      - name: Determine target status from event
+        id: status
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+        run: |
+          set -euo pipefail
+          STATE=""
+          case "$EVENT_NAME.$EVENT_ACTION" in
+            issues.opened|issues.reopened)
+              STATE="$STATUS_BACKLOG"
+              ;;
+            issues.labeled)
+              if [[ "$LABEL_NAME" == "ready-for-agent" || "$LABEL_NAME" == "ready-for-human" ]]; then
+                STATE="$STATUS_READY"
+              fi
+              ;;
+            issues.closed)
+              STATE="$STATUS_DONE"
+              ;;
+            pull_request.opened|pull_request.reopened)
+              if [[ "$PR_DRAFT" == "true" ]]; then
+                STATE="$STATUS_IN_PROGRESS"
+              else
+                STATE="$STATUS_VALIDATING"
+              fi
+              ;;
+            pull_request.ready_for_review)
+              STATE="$STATUS_VALIDATING"
+              ;;
+            pull_request.converted_to_draft)
+              STATE="$STATUS_IN_PROGRESS"
+              ;;
+            pull_request.closed)
+              STATE="$STATUS_DONE"
+              ;;
+          esac
+          if [[ -z "$STATE" ]]; then
+            echo "no-op for $EVENT_NAME.$EVENT_ACTION"
+          fi
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+
+      - name: Sync content + linked issues to status
+        if: steps.status.outputs.state != ''
+        env:
+          STATE: ${{ steps.status.outputs.state }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
+          PR_NODE_ID: ${{ github.event.pull_request.node_id }}
+        run: |
+          set -euo pipefail
+
+          # Build the list of node IDs to sync.
+          declare -a CONTENT_IDS
+          if [[ "$EVENT_NAME" == "issues" ]]; then
+            CONTENT_IDS+=("$ISSUE_NODE_ID")
+          else
+            CONTENT_IDS+=("$PR_NODE_ID")
+
+            # PR closed without merge → only update the PR card; leave linked issues alone.
+            if [[ "$EVENT_NAME" == "pull_request" && "$EVENT_ACTION" == "closed" && "$PR_MERGED" != "true" ]]; then
+              echo "PR closed without merge — skipping linked-issue updates"
+            else
+              # Resolve linked issues via closingIssuesReferences.
+              while IFS= read -r issue_node; do
+                [[ -n "$issue_node" ]] && CONTENT_IDS+=("$issue_node")
+              done < <(gh api graphql \
+                -f query='query($id: ID!) {
+                  node(id: $id) {
+                    ... on PullRequest {
+                      closingIssuesReferences(first: 20) { nodes { id } }
+                    }
+                  }
+                }' \
+                -F id="$PR_NODE_ID" \
+                --jq '.data.node.closingIssuesReferences.nodes[].id')
+            fi
+          fi
+
+          for CID in "${CONTENT_IDS[@]}"; do
+            # Add to project — idempotent: returns the existing item if already added.
+            ITEM_ID=$(gh api graphql \
+              -f query='mutation($project: ID!, $content: ID!) {
+                addProjectV2ItemById(input: {projectId: $project, contentId: $content}) {
+                  item { id }
+                }
+              }' \
+              -F project="$PROJECT_ID" \
+              -F content="$CID" \
+              --jq '.data.addProjectV2ItemById.item.id')
+
+            # Set status.
+            gh api graphql \
+              -f query='mutation($project: ID!, $item: ID!, $field: ID!, $value: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project,
+                  itemId: $item,
+                  fieldId: $field,
+                  value: { singleSelectOptionId: $value }
+                }) {
+                  projectV2Item { id }
+                }
+              }' \
+              -F project="$PROJECT_ID" \
+              -F item="$ITEM_ID" \
+              -F field="$STATUS_FIELD_ID" \
+              -F value="$STATE" > /dev/null
+
+            echo "synced $CID → $STATE"
+          done
