@@ -103,12 +103,12 @@ mod tests {
     fn snap_healthy() -> HbnSnapshot {
         HbnSnapshot {
             dpu_id: "dpu-42".into(),
-            container_running: true,
             hbn_version: "2.0.0-doca2.5.0".into(),
             applied_managed_host_config_version: "v17".into(),
             desired_managed_host_config_version: "v17".into(),
             applied_instance_network_config_version: "v9".into(),
             desired_instance_network_config_version: "v9".into(),
+            network_config_error: None,
             bgp_alerts: vec![],
             quarantine_state: None,
             last_seen_at: Utc::now(),
@@ -167,6 +167,26 @@ mod tests {
         let result = layer.run(&RunOpts::default()).await;
         assert_eq!(result.status, Status::Fail);
         assert!(result.checks.iter().any(|c| c.name == "version_nvue" && c.status == Status::Fail));
+    }
+
+    #[tokio::test]
+    async fn network_config_error_run_reports_fail_layer_with_error_in_headline() {
+        let mut snap = snap_healthy();
+        snap.network_config_error = Some("nvue apply failed".into());
+        let layer = HbnLayer::new(StubClient::ok(snap), "dpu-42");
+
+        let result = layer.run(&RunOpts::default()).await;
+        assert_eq!(result.status, Status::Fail);
+        let headline = result
+            .checks
+            .iter()
+            .find(|c| c.kind == CheckKind::Headline)
+            .unwrap();
+        assert!(
+            headline.value.contains("nvue apply failed"),
+            "headline: {}",
+            headline.value
+        );
     }
 
     #[tokio::test]

@@ -32,17 +32,25 @@ pub const FMDS_MINIMUM_HBN_VERSION: &str = "1.5.0-doca2.2.0";
 pub const DEFAULT_FRESHNESS_THRESHOLD: Duration = Duration::from_secs(90);
 
 /// A snapshot of HBN-relevant data for a single DPU. Combines fields
-/// from the most recent `DpuNetworkStatus` row plus the corresponding
-/// desired-config row from forgedb.
+/// from the producer-side `machines.network_status_observation` JSON
+/// (applied state) and `machines.network_config` JSON (desired state)
+/// on the same row, joined with `instances.network_config_version` for
+/// the desired instance-network axis (PRD-002).
+///
+/// `network_config_error`, when set, is the agent's explicit error
+/// message and surfaces as the verdict headline — more actionable than
+/// "versions disagree" because it tells the operator *why*. `bgp_alerts`
+/// is narrowed to BGP-typed alerts only; other categories live in the
+/// `dpu_health` layer.
 #[derive(Debug, Clone)]
 pub struct HbnSnapshot {
     pub dpu_id: String,
-    pub container_running: bool,
     pub hbn_version: String,
     pub applied_managed_host_config_version: String,
     pub desired_managed_host_config_version: String,
     pub applied_instance_network_config_version: String,
     pub desired_instance_network_config_version: String,
+    pub network_config_error: Option<String>,
     pub bgp_alerts: Vec<String>,
     pub quarantine_state: Option<String>,
     pub last_seen_at: DateTime<Utc>,
@@ -64,14 +72,39 @@ pub trait HbnClient: Send + Sync {
     async fn fetch_all_snapshots(&self) -> Result<Vec<HbnSnapshot>>;
 }
 
-/// Default sqlx-backed [`HbnClient`]. Tracer-bullet shape: we issue the
-/// canonical query against forgedb and gracefully degrade when the
-/// schema is absent (returns `Ok(None)` so the layer prints "no recent
-/// DpuNetworkStatus" instead of panicking on dev clusters that don't
-/// yet have the table).
+/// Default sqlx-backed [`HbnClient`]. Reads producer-side state from
+/// the `machines` row (PRD-002): `network_status_observation` JSON for
+/// applied state plus `network_config_error` and BGP-typed alerts,
+/// `network_config` JSON for desired state including `quarantine_state`,
+/// `inventory` for the running HBN component version, and
+/// `instances.network_config_version` (joined on `instances.machine_id`)
+/// for the desired instance axis. Schema-probes `machines` and degrades
+/// to `Ok(None)` / empty vec when absent so dev clusters that don't have
+/// the table render "no recent status" instead of panicking.
 pub struct SqlxHbnClient {
     pool: sqlx::PgPool,
 }
+
+/// SQL columns shared by the per-DPU and fleet queries. Extracted as a
+/// constant so the schema choice (which producer-side JSON paths the
+/// layer reads) is pinned by a unit test, even though we can't exercise
+/// the full query without a live postgres.
+pub(crate) const FETCH_SNAPSHOT_COLS: &str = "\
+    m.id, \
+    COALESCE(m.network_status_observation->>'network_config_version', ''), \
+    COALESCE(m.network_status_observation->'instance_network_observation'->>'config_version', ''), \
+    m.network_config_version, \
+    COALESCE(i.network_config_version, ''), \
+    NULLIF(m.network_status_observation->>'network_config_error', ''), \
+    m.network_config->'quarantine_state'->>'mode', \
+    (m.network_status_observation->>'observed_at')::timestamptz, \
+    (SELECT c->>'version' FROM jsonb_array_elements(COALESCE(m.inventory->'components', '[]'::jsonb)) c \
+       WHERE c->>'name' = 'hbn' LIMIT 1), \
+    m.dpu_agent_health_report";
+
+pub(crate) const FETCH_SNAPSHOT_FROM: &str = "\
+    FROM machines m \
+    LEFT JOIN instances i ON i.machine_id = m.id";
 
 impl SqlxHbnClient {
     pub fn new(url: &str) -> Result<Self> {
@@ -83,133 +116,115 @@ impl SqlxHbnClient {
     }
 }
 
+type SnapshotRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    DateTime<Utc>,
+    Option<String>,
+    Option<serde_json::Value>,
+);
+
+fn row_to_snapshot(r: SnapshotRow) -> HbnSnapshot {
+    HbnSnapshot {
+        dpu_id: r.0,
+        applied_managed_host_config_version: r.1,
+        applied_instance_network_config_version: r.2,
+        desired_managed_host_config_version: r.3,
+        desired_instance_network_config_version: r.4,
+        network_config_error: r.5,
+        quarantine_state: r.6,
+        last_seen_at: r.7,
+        hbn_version: r.8.unwrap_or_default(),
+        bgp_alerts: parse_bgp_alerts(r.9.as_ref()),
+    }
+}
+
+async fn machines_table_exists(pool: &sqlx::PgPool) -> Result<bool> {
+    let exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_name = 'machines')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("hbn schema probe failed: {e}"))?;
+    Ok(exists.0)
+}
+
 #[async_trait]
 impl HbnClient for SqlxHbnClient {
     async fn fetch_snapshot(&self, dpu_id: &str) -> Result<Option<HbnSnapshot>> {
-        let exists: (bool,) = match sqlx::query_as(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_name = 'dpu_network_status')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        {
-            Ok(row) => row,
-            Err(e) => return Err(anyhow::anyhow!("hbn schema probe failed: {e}")),
-        };
-        if !exists.0 {
+        if !machines_table_exists(&self.pool).await? {
             return Ok(None);
         }
 
-        let row: Option<(
-            String,
-            bool,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Vec<String>,
-            Option<String>,
-            DateTime<Utc>,
-        )> = sqlx::query_as(
-            "SELECT \
-                s.dpu_id, \
-                s.container_running, \
-                s.hbn_version, \
-                s.applied_managed_host_config_version, \
-                s.applied_instance_network_config_version, \
-                d.managed_host_config_version, \
-                d.instance_network_config_version, \
-                COALESCE(s.bgp_alerts, ARRAY[]::text[]), \
-                s.quarantine_state, \
-                s.last_seen_at \
-             FROM dpu_network_status s \
-             JOIN dpu_desired_network_config d ON d.dpu_id = s.dpu_id \
-             WHERE s.dpu_id = $1 \
-             ORDER BY s.last_seen_at DESC \
-             LIMIT 1",
-        )
-        .bind(dpu_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("dpu_network_status query failed: {e}"))?;
+        let sql = format!(
+            "SELECT {FETCH_SNAPSHOT_COLS} {FETCH_SNAPSHOT_FROM} \
+             WHERE m.id = $1 AND m.network_status_observation IS NOT NULL \
+             LIMIT 1"
+        );
+        let row: Option<SnapshotRow> = sqlx::query_as(&sql)
+            .bind(dpu_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("hbn snapshot query failed: {e}"))?;
 
-        Ok(row.map(|r| HbnSnapshot {
-            dpu_id: r.0,
-            container_running: r.1,
-            hbn_version: r.2,
-            applied_managed_host_config_version: r.3,
-            applied_instance_network_config_version: r.4,
-            desired_managed_host_config_version: r.5,
-            desired_instance_network_config_version: r.6,
-            bgp_alerts: r.7,
-            quarantine_state: r.8,
-            last_seen_at: r.9,
-        }))
+        Ok(row.map(row_to_snapshot))
     }
 
     async fn fetch_all_snapshots(&self) -> Result<Vec<HbnSnapshot>> {
-        let exists: (bool,) = match sqlx::query_as(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_name = 'dpu_network_status')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        {
-            Ok(row) => row,
-            Err(e) => return Err(anyhow::anyhow!("hbn schema probe failed: {e}")),
-        };
-        if !exists.0 {
+        if !machines_table_exists(&self.pool).await? {
             return Ok(Vec::new());
         }
 
-        let rows: Vec<(
-            String,
-            bool,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Vec<String>,
-            Option<String>,
-            DateTime<Utc>,
-        )> = sqlx::query_as(
-            "SELECT DISTINCT ON (s.dpu_id) \
-                s.dpu_id, \
-                s.container_running, \
-                s.hbn_version, \
-                s.applied_managed_host_config_version, \
-                s.applied_instance_network_config_version, \
-                d.managed_host_config_version, \
-                d.instance_network_config_version, \
-                COALESCE(s.bgp_alerts, ARRAY[]::text[]), \
-                s.quarantine_state, \
-                s.last_seen_at \
-             FROM dpu_network_status s \
-             JOIN dpu_desired_network_config d ON d.dpu_id = s.dpu_id \
-             ORDER BY s.dpu_id, s.last_seen_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("dpu_network_status fleet query failed: {e}"))?;
+        let sql = format!(
+            "SELECT {FETCH_SNAPSHOT_COLS} {FETCH_SNAPSHOT_FROM} \
+             WHERE m.network_status_observation IS NOT NULL"
+        );
+        let rows: Vec<SnapshotRow> = sqlx::query_as(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("hbn fleet query failed: {e}"))?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| HbnSnapshot {
-                dpu_id: r.0,
-                container_running: r.1,
-                hbn_version: r.2,
-                applied_managed_host_config_version: r.3,
-                applied_instance_network_config_version: r.4,
-                desired_managed_host_config_version: r.5,
-                desired_instance_network_config_version: r.6,
-                bgp_alerts: r.7,
-                quarantine_state: r.8,
-                last_seen_at: r.9,
-            })
-            .collect())
+        Ok(rows.into_iter().map(row_to_snapshot).collect())
     }
+}
+
+/// Extract BGP-typed alert strings from the `dpu_agent_health_report`
+/// JSON blob. The agent's `HealthReport.alerts` array carries a
+/// `category` discriminator; only `Bgp` entries surface in the `hbn`
+/// layer (PRD-002). Other categories are owned by `dpu_health`.
+///
+/// Each alert is rendered as `"{id}"` (or `"{id}: {message}"` when the
+/// agent attached a message). Tolerates the column being NULL or having
+/// no `alerts` array.
+pub fn parse_bgp_alerts(blob: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(v) = blob else { return Vec::new() };
+    let Some(arr) = v.get("alerts").and_then(|a| a.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|entry| {
+            entry
+                .get("category")
+                .and_then(|c| c.as_str())
+                .map(|c| c.eq_ignore_ascii_case("bgp"))
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?;
+            let message = entry.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            if message.is_empty() {
+                Some(id.to_owned())
+            } else {
+                Some(format!("{id}: {message}"))
+            }
+        })
+        .collect()
 }
 
 /// One row in the per-DPU HBN panel (`nico ops hbn`).
@@ -239,6 +254,9 @@ pub struct HbnRow {
 
 /// Per-row status used to drive sortability and the Option B `STATUS`
 /// column. Precedence: `Quarantined` > `Unhealthy` > `Drift` > `Healthy`.
+/// `Unhealthy` now reflects an explicit `network_config_error` from the
+/// agent (PRD-002): a producer-side error is more actionable than
+/// "versions disagree" because it tells the operator *why*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HbnRowStatus {
     Healthy,
@@ -266,7 +284,7 @@ pub fn aggregate_row(snap: &HbnSnapshot, now: DateTime<Utc>) -> HbnRow {
 
     let status = if snap.quarantine_state.is_some() {
         HbnRowStatus::Quarantined
-    } else if !snap.container_running {
+    } else if snap.network_config_error.is_some() {
         HbnRowStatus::Unhealthy
     } else if managed_host_drift || instance_network_drift {
         HbnRowStatus::Drift
@@ -337,6 +355,10 @@ pub fn compare_hbn_versions(lhs: &str, rhs: &str) -> Ordering {
 /// Produces exactly one `Headline` (the aggregate verdict line) plus
 /// one `Detail` per criterion in the order the issue lists them. Pure
 /// — no I/O, fully unit-testable.
+///
+/// When `network_config_error` is set, the headline surfaces that error
+/// verbatim and pins the layer to `Fail` (PRD-002): an explicit error
+/// from the agent is more actionable than "versions disagree".
 pub fn assemble_checks(
     snapshot: &HbnSnapshot,
     now: DateTime<Utc>,
@@ -344,27 +366,20 @@ pub fn assemble_checks(
 ) -> Vec<Check> {
     let mut details: Vec<Check> = Vec::new();
 
-    // 1. HBN container running
-    details.push(if snapshot.container_running {
-        Check {
-            name: "container",
-            status: Status::Ok,
-            value: "hbn container running".to_string(),
-            next_command: None,
-            kind: CheckKind::Detail,
-        }
-    } else {
-        Check {
-            name: "container",
+    // 1. Producer-side network_config_error — when present, this is the
+    //    most actionable signal and pins the headline (PRD-002).
+    if let Some(err) = snapshot.network_config_error.as_deref().filter(|s| !s.is_empty()) {
+        details.push(Check {
+            name: "network_config_error",
             status: Status::Fail,
-            value: "hbn container not running".to_string(),
+            value: format!("network_config_error: {err}"),
             next_command: Some(format!(
-                "ssh dpu-{} 'docker ps --filter name=hbn'",
+                "nico correlate {} # trace the failed config apply",
                 snapshot.dpu_id
             )),
             kind: CheckKind::Detail,
-        }
-    });
+        });
+    }
 
     // 2. HBN version >= NVUE minimum (hard requirement)
     let nvue_ok =
@@ -519,14 +534,15 @@ pub fn assemble_checks(
 }
 
 /// Build the "no recent status row" check list — used when the data
-/// layer returns `Ok(None)` for a DPU. Renders as a single `Unknown`
-/// headline; no detail bullets (we have nothing to say about state we
-/// never received).
+/// layer returns `Ok(None)` for a DPU (no `machines` row, or the row's
+/// `network_status_observation` JSON column is NULL). Renders as a
+/// single `Unknown` headline; no detail bullets (we have nothing to say
+/// about state we never received).
 pub fn assemble_no_status_checks(dpu_id: &str) -> Vec<Check> {
     vec![Check {
         name: "hbn",
         status: Status::Unknown,
-        value: format!("no recent DpuNetworkStatus for dpu {dpu_id}"),
+        value: format!("no recent network_status_observation for dpu {dpu_id}"),
         next_command: Some(format!(
             "nico correlate {dpu_id} # last activity for this DPU"
         )),
@@ -582,6 +598,18 @@ fn aggregate_status(checks: &[Check]) -> Status {
 }
 
 fn headline_check(snapshot: &HbnSnapshot, aggregate: Status, details: &[Check]) -> Check {
+    if let Some(err) = snapshot.network_config_error.as_deref().filter(|s| !s.is_empty()) {
+        return Check {
+            name: "hbn",
+            status: Status::Fail,
+            value: format!("dpu {} network_config_error: {err}", snapshot.dpu_id),
+            next_command: Some(format!(
+                "nico correlate {} # trace the failed config apply",
+                snapshot.dpu_id
+            )),
+            kind: CheckKind::Headline,
+        };
+    }
     let value = match aggregate {
         Status::Ok => format!("dpu {} hbn healthy", snapshot.dpu_id),
         Status::Skipped => format!("dpu {} hbn skipped", snapshot.dpu_id),
@@ -611,12 +639,12 @@ mod tests {
     fn snap_healthy() -> HbnSnapshot {
         HbnSnapshot {
             dpu_id: "dpu-42".into(),
-            container_running: true,
             hbn_version: "2.0.0-doca2.5.0".into(),
             applied_managed_host_config_version: "v17".into(),
             desired_managed_host_config_version: "v17".into(),
             applied_instance_network_config_version: "v9".into(),
             desired_instance_network_config_version: "v9".into(),
+            network_config_error: None,
             bgp_alerts: vec![],
             quarantine_state: None,
             last_seen_at: Utc::now(),
@@ -664,11 +692,21 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_row_container_down_marks_unhealthy() {
+    fn aggregate_row_network_config_error_marks_unhealthy() {
         let mut snap = snap_healthy();
-        snap.container_running = false;
+        snap.network_config_error = Some("apply failed: bgp peer down".into());
         let row = aggregate_row(&snap, snap.last_seen_at);
         assert_eq!(row.status, HbnRowStatus::Unhealthy);
+    }
+
+    #[test]
+    fn aggregate_row_quarantine_overrides_network_config_error() {
+        let mut snap = snap_healthy();
+        snap.network_config_error = Some("apply failed".into());
+        snap.quarantine_state = Some("BlockAllTraffic".into());
+        let row = aggregate_row(&snap, snap.last_seen_at);
+        // Quarantine still wins (precedence: Quarantined > Unhealthy).
+        assert_eq!(row.status, HbnRowStatus::Quarantined);
     }
 
     #[test]
@@ -870,12 +908,176 @@ mod tests {
     #[test]
     fn unhealthy_headline_lists_failing_detail_names() {
         let mut snap = snap_healthy();
-        snap.container_running = false;
+        snap.applied_instance_network_config_version = "v8".into();
+        snap.desired_instance_network_config_version = "v9".into();
         snap.quarantine_state = Some("auto".into());
         let checks = assemble_checks(&snap, snap.last_seen_at, DEFAULT_FRESHNESS_THRESHOLD);
 
         let headline = checks.iter().find(|c| c.kind == CheckKind::Headline).unwrap();
-        assert!(headline.value.contains("container"));
+        assert!(headline.value.contains("instance_network_config"));
         assert!(headline.value.contains("quarantine"));
+    }
+
+    // ── network_config_error: top-line headline (PRD-002) ─────────────────
+
+    #[test]
+    fn network_config_error_pins_headline_to_fail_with_error_text() {
+        let mut snap = snap_healthy();
+        snap.network_config_error = Some("nvue apply failed: peer 192.0.2.1 unreachable".into());
+        let checks = assemble_checks(&snap, snap.last_seen_at, DEFAULT_FRESHNESS_THRESHOLD);
+
+        let headline = checks
+            .iter()
+            .find(|c| c.kind == CheckKind::Headline)
+            .unwrap();
+        assert_eq!(headline.status, Status::Fail);
+        assert!(
+            headline.value.contains("network_config_error"),
+            "headline: {}",
+            headline.value
+        );
+        assert!(
+            headline.value.contains("nvue apply failed"),
+            "headline: {}",
+            headline.value
+        );
+        assert!(headline.next_command.is_some());
+    }
+
+    #[test]
+    fn network_config_error_emits_a_detail_line() {
+        let mut snap = snap_healthy();
+        snap.network_config_error = Some("apply timeout".into());
+        let checks = assemble_checks(&snap, snap.last_seen_at, DEFAULT_FRESHNESS_THRESHOLD);
+
+        let detail = checks
+            .iter()
+            .find(|c| c.name == "network_config_error")
+            .expect("network_config_error detail");
+        assert_eq!(detail.kind, CheckKind::Detail);
+        assert_eq!(detail.status, Status::Fail);
+        assert!(detail.value.contains("apply timeout"));
+    }
+
+    #[test]
+    fn empty_network_config_error_string_is_treated_as_none() {
+        let mut snap = snap_healthy();
+        snap.network_config_error = Some(String::new());
+        let checks = assemble_checks(&snap, snap.last_seen_at, DEFAULT_FRESHNESS_THRESHOLD);
+
+        let headline = checks
+            .iter()
+            .find(|c| c.kind == CheckKind::Headline)
+            .unwrap();
+        assert_eq!(headline.status, Status::Ok);
+        assert!(
+            !checks.iter().any(|c| c.name == "network_config_error"),
+            "no detail expected when error is empty string"
+        );
+    }
+
+    #[test]
+    fn network_config_error_takes_precedence_over_drift_in_headline() {
+        let mut snap = snap_healthy();
+        snap.applied_instance_network_config_version = "v8".into();
+        snap.desired_instance_network_config_version = "v9".into();
+        snap.network_config_error = Some("explicit agent error".into());
+        let checks = assemble_checks(&snap, snap.last_seen_at, DEFAULT_FRESHNESS_THRESHOLD);
+
+        let headline = checks
+            .iter()
+            .find(|c| c.kind == CheckKind::Headline)
+            .unwrap();
+        assert!(
+            headline.value.contains("explicit agent error"),
+            "headline must surface the error verbatim, got: {}",
+            headline.value
+        );
+    }
+
+    // ── BGP alerts: only category-Bgp entries surface here ────────────────
+
+    #[test]
+    fn parse_bgp_alerts_filters_by_category_case_insensitive() {
+        let v = serde_json::json!({
+            "alerts": [
+                {"id": "BgpPeerDown", "category": "Bgp", "message": "peer 192.0.2.1"},
+                {"id": "DhcpStale", "category": "Dhcp"},
+                {"id": "BgpRoutesMissing", "category": "bgp"},
+                {"id": "PostConfigCheckWait", "category": "Health"},
+            ]
+        });
+        let out = parse_bgp_alerts(Some(&v));
+        assert_eq!(out.len(), 2);
+        assert!(out[0].contains("BgpPeerDown") && out[0].contains("peer 192.0.2.1"));
+        assert!(out[1].contains("BgpRoutesMissing"));
+    }
+
+    #[test]
+    fn parse_bgp_alerts_returns_empty_when_blob_absent() {
+        assert!(parse_bgp_alerts(None).is_empty());
+    }
+
+    #[test]
+    fn parse_bgp_alerts_returns_empty_when_alerts_array_missing() {
+        let v = serde_json::json!({"version": "1.2.3"});
+        assert!(parse_bgp_alerts(Some(&v)).is_empty());
+    }
+
+    #[test]
+    fn parse_bgp_alerts_skips_entries_without_id() {
+        let v = serde_json::json!({
+            "alerts": [
+                {"category": "Bgp"},
+                {"id": "BgpOk", "category": "Bgp"},
+            ]
+        });
+        let out = parse_bgp_alerts(Some(&v));
+        assert_eq!(out, vec!["BgpOk"]);
+    }
+
+    // ── SQL: producer-side machines columns only (PRD-002) ────────────────
+
+    /// Pin the schema choice — the tracer SQL must read producer JSON
+    /// from `machines` / `instances`, never the (non-existent) old
+    /// `dpu_network_status` / `dpu_desired_network_config` tables.
+    #[test]
+    fn fetch_snapshot_sql_targets_producer_side_machines_columns() {
+        let cols = FETCH_SNAPSHOT_COLS;
+        let from = FETCH_SNAPSHOT_FROM;
+        let combined = format!("{cols} {from}");
+
+        assert!(
+            !combined.contains("dpu_network_status"),
+            "old table dpu_network_status still referenced: {combined}"
+        );
+        assert!(
+            !combined.contains("dpu_desired_network_config"),
+            "old table dpu_desired_network_config still referenced: {combined}"
+        );
+        assert!(
+            from.contains("FROM machines"),
+            "missing machines table: {from}"
+        );
+        assert!(
+            from.contains("LEFT JOIN instances"),
+            "missing instances join for desired instance version: {from}"
+        );
+        assert!(
+            cols.contains("network_status_observation"),
+            "missing applied-side observation JSON: {cols}"
+        );
+        assert!(
+            cols.contains("network_config_error"),
+            "missing network_config_error column: {cols}"
+        );
+        assert!(
+            cols.contains("network_config->'quarantine_state'"),
+            "quarantine must be read desired-side from network_config: {cols}"
+        );
+        assert!(
+            cols.contains("inventory"),
+            "hbn version must be read from inventory components: {cols}"
+        );
     }
 }

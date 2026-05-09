@@ -268,12 +268,12 @@ mod tests {
     fn snap(id: &str, mh_app: &str, mh_des: &str) -> HbnSnapshot {
         HbnSnapshot {
             dpu_id: id.into(),
-            container_running: true,
             hbn_version: "2.0.0-doca2.5.0".into(),
             applied_managed_host_config_version: mh_app.into(),
             desired_managed_host_config_version: mh_des.into(),
             applied_instance_network_config_version: "v9".into(),
             desired_instance_network_config_version: "v9".into(),
+            network_config_error: None,
             bgp_alerts: vec![],
             quarantine_state: None,
             last_seen_at: Utc::now(),
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn status_string_unhealthy_word() {
         let mut s = snap("dpu-1", "v17", "v17");
-        s.container_running = false;
+        s.network_config_error = Some("apply failed".into());
         let row = aggregate_row(&s, Utc::now());
         assert_eq!(status_string(&row), "unhealthy");
     }
