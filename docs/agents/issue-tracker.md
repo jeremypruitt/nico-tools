@@ -21,9 +21,12 @@ Every PR body **must** include a closing reference so the linked issue auto-clos
 Closes #NNN
 ```
 
-Accepted keywords: `Closes`, `Fixes`, `Resolves` (case-insensitive). The CI workflow enforces this — PRs without a valid reference will fail the `ci` check.
+Accepted keywords: `Closes`, `Fixes`, `Resolves` (case-insensitive). The `pr-validation` workflow enforces this — PRs without a valid reference will fail the `validate-pr` check.
 
-The required CI status check context is **`ci`** (matches `jobs.ci` in `.github/workflows/ci.yml`). The branch ruleset ID is `16012805`.
+Required status check contexts (branch ruleset ID `16012805`):
+
+- **`ci`** — `jobs.ci` in `.github/workflows/ci.yml`. Skipped (reports success) on docs-only PRs.
+- **`validate-pr`** — `jobs.validate-pr` in `.github/workflows/pr-validation.yml`. Runs on every PR.
 
 ## When a skill says "publish to the issue tracker"
 

@@ -1,0 +1,19 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR has Closes reference
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! echo "$PR_BODY" | grep -qiE '(closes|fixes|resolves)[[:space:]]+#[0-9]+'; then
+            echo "Error: PR body must contain a 'Closes #NNN', 'Fixes #NNN', or 'Resolves #NNN' reference."
+            exit 1
+          fi
+          echo "PR body contains required issue reference."
