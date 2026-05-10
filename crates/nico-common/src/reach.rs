@@ -30,6 +30,7 @@ pub struct ReachManager {
     client: Client,
     namespace: String,
     postgres_namespace: String,
+    temporal_k8s_namespace: String,
 }
 
 impl ReachManager {
@@ -38,8 +39,15 @@ impl ReachManager {
         client: Client,
         namespace: impl Into<String>,
         postgres_namespace: impl Into<String>,
+        temporal_k8s_namespace: impl Into<String>,
     ) -> Self {
-        Self { mode, client, namespace: namespace.into(), postgres_namespace: postgres_namespace.into() }
+        Self {
+            mode,
+            client,
+            namespace: namespace.into(),
+            postgres_namespace: postgres_namespace.into(),
+            temporal_k8s_namespace: temporal_k8s_namespace.into(),
+        }
     }
 
     /// Resolve the Temporal gRPC address (`host:port`).
@@ -54,11 +62,14 @@ impl ReachManager {
     ) -> Result<(String, Option<ForwardedEndpoint>), BootstrapStepError> {
         match self.mode {
             ReachMode::InCluster => {
-                let addr = format!("temporal-frontend.{}.svc.cluster.local:7233", self.namespace);
+                let addr = format!(
+                    "temporal-frontend.{}.svc.cluster.local:7233",
+                    self.temporal_k8s_namespace
+                );
                 Ok((addr, None))
             }
             ReachMode::PortForward => {
-                let ns = self.namespace.clone();
+                let ns = self.temporal_k8s_namespace.clone();
                 let ep = run_with_budget(budget, async {
                     self.forward_by_port(7233, &ns)
                         .await

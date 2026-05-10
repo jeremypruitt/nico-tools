@@ -31,11 +31,11 @@
 
 ### Three deployment-types (hardcoded labels)
 
-| Type             | Controller ns | gRPC address                          | forgedb |
-|------------------|---------------|---------------------------------------|---------|
-| `full`           | `forge-system`| `carbide-api.forge-system:1079`       | yes     |
-| `core-only`      | `forge-system`| `carbide-api.forge-system:1079`       | yes     |
-| `rest-only-mock` | `nico-rest`   | `nico-rest-mock-core.nico-rest:11079` | no      |
+| Type             | Controller ns | gRPC address                          | postgres ns | temporal k8s ns | forgedb | temporal |
+|------------------|---------------|---------------------------------------|-------------|-----------------|---------|----------|
+| `full`           | `forge-system`| `carbide-api.forge-system:1079`       | `postgres`  | `temporal`      | yes     | yes      |
+| `core-only`      | `forge-system`| `carbide-api.forge-system:1079`       | `postgres`  | n/a             | yes     | **no**   |
+| `rest-only-mock` | `nico-rest`   | `nico-rest-mock-core.nico-rest:11079` | `postgres`  | `temporal`      | no      | yes      |
 
 ### Detection (capability-based; signals 2 + 3 + 4)
 
@@ -58,17 +58,17 @@ If all three signals fail to match a known type → exit 3 with diagnostic data 
 
 ### Per-layer behavior
 
-| Layer       | full / core-only                      | rest-only-mock                                  |
-|-------------|---------------------------------------|-------------------------------------------------|
-| `cluster`   | runs                                  | runs                                            |
-| `logs`      | runs                                  | runs                                            |
-| `workflows` | runs                                  | runs (Temporal real)                            |
-| `health`    | runs (per-layer endpoint detail TBD)  | runs (per-layer endpoint detail TBD)            |
-| `grpc`      | dials `carbide-api:1079`              | dials `nico-rest-mock-core:11079`               |
-| `postgres`  | runs                                  | runs                                            |
-| `dpu`       | runs                                  | **n/a — no forgedb**                            |
+| Layer       | full                                  | core-only                              | rest-only-mock                                  |
+|-------------|---------------------------------------|----------------------------------------|-------------------------------------------------|
+| `cluster`   | runs                                  | runs                                   | runs                                            |
+| `logs`      | runs                                  | runs                                   | runs                                            |
+| `workflows` | runs                                  | **n/a — no Temporal**                  | runs (Temporal real)                            |
+| `health`    | runs (per-layer endpoint detail TBD)  | runs (per-layer endpoint detail TBD)   | runs (per-layer endpoint detail TBD)            |
+| `grpc`      | dials `carbide-api:1079`              | dials `carbide-api:1079`               | dials `nico-rest-mock-core:11079`               |
+| `postgres`  | runs                                  | runs                                   | runs                                            |
+| `dpu`       | runs                                  | runs                                   | **n/a — no forgedb**                            |
 
-`dpu`-in-`rest-only-mock` is the only layer that "skips" by deployment-type. All other type-dependent variation is address re-pointing via the capability bundle.
+`dpu`-in-`rest-only-mock` and `workflows`-in-`core-only` are the only layers that "skip" by deployment-type (each gated by a feature gate: `forgedb_present` and `temporal_present` respectively). All other type-dependent variation is address re-pointing via the capability bundle.
 
 ### Status semantics for "n/a in this deployment-type"
 
@@ -138,14 +138,18 @@ impl DeploymentType {
     pub fn default_grpc_address(&self) -> Option<&'static str>;
     pub fn default_postgres_namespace(&self) -> Option<&'static str>;
     pub fn default_temporal_address(&self) -> Option<&'static str>;
-    pub fn default_temporal_namespace(&self) -> Option<&'static str>;
+    pub fn default_temporal_k8s_namespace(&self) -> Option<&'static str>;
     pub fn forgedb_present(&self) -> bool;
+    pub fn temporal_present(&self) -> bool;
 }
 ```
 
-- `Force` returns `None` for every default (falls through to existing hardcoded fallbacks) and `true` for `forgedb_present` (assume present; forgedb-dependent layers fail naturally if it isn't — that's the price of force).
-- **Override-conflict warning rule.** When a per-key file/env/CLI value differs from the active deployment-type's default for one of the five default-keys above, emit a one-line stderr warning after the boot banner header (one line per contradicting key). `--deployment-type=force` silences. Keys without deployment-type-derived defaults (`cluster.context`, `cluster.reach_mode`, `postgres.url`, `dpu.*`) are not checked.
-- **Single feature gate.** `forgedb_present` is substrate-shaped (names the database the layers depend on) and covers every forgedb-dependent layer (`dpu`, `hbn`, `dpu_cert`, `dpu_isolation`, `hbn_drift`, plus PRD-002's `dpu_health` / `dpu_services` / `infiniband` once they land). If a future deployment-type introduces a different DPU data source, replace `bool` with an enum at that point — not before.
+- `Force` returns `None` for every default (falls through to existing hardcoded fallbacks) and `true` for both feature gates (`forgedb_present`, `temporal_present`) — assume present; substrate-dependent layers fail naturally if it isn't — that's the price of force.
+- **Override-conflict warning rule.** When a per-key file/env/CLI value differs from the active deployment-type's default for one of the five default-keys above, emit a one-line stderr warning after the boot banner header (one line per contradicting key). `--deployment-type=force` silences. Keys without deployment-type-derived defaults (`cluster.context`, `cluster.reach_mode`, `postgres.url`, `dpu.*`, `temporal.namespace` (the Temporal *tenancy* namespace)) are not checked.
+- **Feature gates.** Each names the substrate the layer depends on:
+  - `forgedb_present` — covers every forgedb-dependent layer (`dpu`, `hbn`, `dpu_cert`, `dpu_isolation`, `hbn_drift`, plus PRD-002's `dpu_health` / `dpu_services` / `infiniband` once they land). False only on `rest-only-mock`.
+  - `temporal_present` — covers the `workflows` layer and the `port-forward: workflows` boot-probe step (PRD-001 slice 10). False only on `core-only`, which stops at carbide-kind without rest and never deploys Temporal (helm-prereqs phase boundary in `infra-controller-core/helm-prereqs/setup.sh`).
+- **Two senses of "temporal namespace."** `default_temporal_k8s_namespace` is the kubernetes namespace where `temporal-frontend` runs (where the port-forward connects). The Temporal *tenancy* namespace (workflow visibility) is the existing `[temporal] namespace` config key and remains independent — section name disambiguates the two senses.
 - **Slice 1 escape valve.** The α-flat shape (`Force` as an enum variant; methods on the enum) is the spec. If a concrete need emerges during slice 1 to switch to a separate `CapabilityBundle` struct or to nest `Force` as `DeploymentTypeResolved::Force`, the slice 1 PR may do so without amending this PRD.
 
 ## Implementation tracking

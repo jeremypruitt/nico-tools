@@ -82,10 +82,19 @@ impl DeploymentType {
         None
     }
 
-    /// Capability: Temporal namespace. Stubbed; see
-    /// `default_postgres_namespace`.
-    pub fn default_temporal_namespace(self) -> Option<&'static str> {
-        None
+    /// Capability: kubernetes namespace where `temporal-frontend` runs.
+    /// `Full` and `RestOnlyMock` install Temporal in its own `temporal`
+    /// namespace; `CoreOnly` doesn't deploy Temporal, so this is `None`.
+    /// `Force` returns `None` (raw config flows through).
+    ///
+    /// Distinct from the Temporal *tenancy* namespace (`temporal.namespace`
+    /// in config) which addresses workflow visibility and is unrelated to
+    /// k8s tenancy. PRD-001 §"Capability vocabulary".
+    pub fn default_temporal_k8s_namespace(self) -> Option<&'static str> {
+        match self {
+            Self::Full | Self::RestOnlyMock => Some("temporal"),
+            Self::CoreOnly | Self::Force => None,
+        }
     }
 
     /// Capability: whether this deployment-type runs the forgedb postgres
@@ -96,6 +105,19 @@ impl DeploymentType {
         match self {
             Self::Full | Self::CoreOnly | Self::Force => true,
             Self::RestOnlyMock => false,
+        }
+    }
+
+    /// Capability: whether this deployment-type runs Temporal. `core-only`
+    /// stops at carbide-kind without rest, so Temporal is never deployed
+    /// (see `infra-controller-core/helm-prereqs/setup.sh` phase boundary);
+    /// the `workflows` layer and `port-forward: workflows` boot-probe step
+    /// skip with reason in that case. `Force` returns `true` (no
+    /// enforcement; let the operator's raw config flow through).
+    pub fn temporal_present(self) -> bool {
+        match self {
+            Self::Full | Self::RestOnlyMock | Self::Force => true,
+            Self::CoreOnly => false,
         }
     }
 
@@ -271,6 +293,11 @@ pub struct ClusterConfig {
     pub context: Option<String>,
     pub namespace: String,
     pub postgres_namespace: String,
+    /// Kubernetes namespace where `temporal-frontend` runs. Distinct from
+    /// `temporal.namespace` (the Temporal tenancy namespace). Defaults to
+    /// the active deployment-type's `default_temporal_k8s_namespace()`,
+    /// or `"temporal"` when no type is resolved.
+    pub temporal_namespace: String,
     pub reach_mode: ReachMode,
     pub grpc_address: Option<String>,
     /// Resolved deployment-type. `None` means `auto` — the boot-probe
@@ -341,6 +368,11 @@ pub struct ConfigOverrides {
     pub postgres_url: Option<String>,
     pub temporal_address: Option<String>,
     pub temporal_namespace: Option<String>,
+    /// CLI override for the kubernetes namespace where `temporal-frontend`
+    /// runs (PRD-001 slice 10). Distinct from `temporal_namespace` above
+    /// (the tenancy namespace). Highest precedence over env, file, and
+    /// the deployment-type bundle.
+    pub temporal_k8s_namespace: Option<String>,
     pub stuck_threshold: Option<Duration>,
     pub color: Option<ColorMode>,
     pub format: Option<OutputFormat>,
@@ -400,6 +432,7 @@ struct FileClusterConfig {
     context: Option<String>,
     namespace: Option<String>,
     postgres_namespace: Option<String>,
+    temporal_namespace: Option<String>,
     reach_mode: Option<String>,
     grpc_address: Option<String>,
     deployment_type: Option<String>,
@@ -461,7 +494,7 @@ impl Config {
         let dt_grpc = deployment_type.and_then(|dt| dt.default_grpc_address());
         let dt_postgres_ns = deployment_type.and_then(|dt| dt.default_postgres_namespace());
         let dt_temporal_addr = deployment_type.and_then(|dt| dt.default_temporal_address());
-        let dt_temporal_ns = deployment_type.and_then(|dt| dt.default_temporal_namespace());
+        let dt_temporal_k8s_ns = deployment_type.and_then(|dt| dt.default_temporal_k8s_namespace());
 
         // Env var layer — overrides file, which overrides deployment-type
         // defaults (when present), which overrides hardcoded fallbacks.
@@ -474,6 +507,10 @@ impl Config {
             .or(cluster.postgres_namespace)
             .or(dt_postgres_ns.map(String::from))
             .unwrap_or_else(|| "postgres".into());
+        let temporal_k8s_namespace = env.get("NICO_TEMPORAL_K8S_NAMESPACE").cloned()
+            .or(cluster.temporal_namespace)
+            .or(dt_temporal_k8s_ns.map(String::from))
+            .unwrap_or_else(|| "temporal".into());
         let postgres_url = env.get("NICO_POSTGRES_URL").cloned()
             .or(postgres.url)
             .unwrap_or_else(|| "postgres://nico:nico@localhost:5432/nico".into());
@@ -483,7 +520,6 @@ impl Config {
             .unwrap_or_else(|| "localhost:7233".into());
         let temporal_namespace = env.get("NICO_TEMPORAL_NAMESPACE").cloned()
             .or(temporal.namespace)
-            .or(dt_temporal_ns.map(String::from))
             .unwrap_or_else(|| "default".into());
 
         let stuck_threshold_str = env.get("NICO_STUCK_THRESHOLD").cloned()
@@ -613,6 +649,10 @@ impl Config {
         let postgres_url = overrides.postgres_url.clone().unwrap_or(postgres_url);
         let temporal_address = overrides.temporal_address.clone().unwrap_or(temporal_address);
         let temporal_namespace = overrides.temporal_namespace.clone().unwrap_or(temporal_namespace);
+        let temporal_k8s_namespace = overrides
+            .temporal_k8s_namespace
+            .clone()
+            .unwrap_or(temporal_k8s_namespace);
         let stuck_threshold = overrides.stuck_threshold.unwrap_or(stuck_threshold);
         let color = overrides.color.unwrap_or(color);
         let format = overrides.format.unwrap_or(format);
@@ -624,6 +664,7 @@ impl Config {
                 context,
                 namespace,
                 postgres_namespace,
+                temporal_namespace: temporal_k8s_namespace,
                 reach_mode,
                 grpc_address,
                 deployment_type,
@@ -699,12 +740,12 @@ impl Config {
                 default,
             ));
         }
-        if let Some(default) = dt.default_temporal_namespace()
-            && self.temporal.namespace != default
+        if let Some(default) = dt.default_temporal_k8s_namespace()
+            && self.cluster.temporal_namespace != default
         {
             warnings.push(format_override_warning(
-                "temporal.namespace",
-                &self.temporal.namespace,
+                "cluster.temporal_namespace",
+                &self.cluster.temporal_namespace,
                 dt_label,
                 default,
             ));
@@ -1133,8 +1174,41 @@ port_forward = "1s"
         assert!(DeploymentType::Force.default_grpc_address().is_none());
         assert!(DeploymentType::Force.default_postgres_namespace().is_none());
         assert!(DeploymentType::Force.default_temporal_address().is_none());
-        assert!(DeploymentType::Force.default_temporal_namespace().is_none());
+        assert!(DeploymentType::Force.default_temporal_k8s_namespace().is_none());
         assert!(DeploymentType::Force.forgedb_present());
+        // PRD-001 slice 10: temporal_present mirrors forgedb_present —
+        // Force returns true (no enforcement; let raw config flow).
+        assert!(DeploymentType::Force.temporal_present());
+    }
+
+    // PRD-001 slice 10: temporal k8s namespace + temporal_present.
+    //
+    // `default_temporal_k8s_namespace` is the kubernetes namespace where
+    // `temporal-frontend` runs. `Full` and `RestOnlyMock` both install
+    // Temporal in its own `temporal` namespace. `CoreOnly` doesn't deploy
+    // Temporal at all (helm-prereqs phase boundary). `Force` returns
+    // `None`. `temporal_present` is the matching feature gate.
+
+    #[test]
+    fn deployment_type_default_temporal_k8s_namespace_matches_capability_matrix() {
+        assert_eq!(
+            DeploymentType::Full.default_temporal_k8s_namespace(),
+            Some("temporal")
+        );
+        assert_eq!(
+            DeploymentType::RestOnlyMock.default_temporal_k8s_namespace(),
+            Some("temporal")
+        );
+        assert_eq!(DeploymentType::CoreOnly.default_temporal_k8s_namespace(), None);
+        assert_eq!(DeploymentType::Force.default_temporal_k8s_namespace(), None);
+    }
+
+    #[test]
+    fn deployment_type_temporal_present_matches_capability_matrix() {
+        assert!(DeploymentType::Full.temporal_present());
+        assert!(DeploymentType::RestOnlyMock.temporal_present());
+        assert!(DeploymentType::Force.temporal_present());
+        assert!(!DeploymentType::CoreOnly.temporal_present());
     }
 
     #[test]
@@ -1677,6 +1751,126 @@ grpc_address = "weird:9999"
             DeploymentTypeSource::Force
         );
         assert!(cfg.override_conflict_warnings().is_empty());
+    }
+
+    // PRD-001 slice 10: precedence chain for `cluster.temporal_namespace`
+    //   hardcoded ("temporal") < bundle (deployment-type) < file < env < CLI
+
+    #[test]
+    fn temporal_k8s_namespace_defaults_to_temporal_when_no_sources() {
+        let cfg = Config::load(None, &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
+        assert_eq!(cfg.cluster.temporal_namespace, "temporal");
+    }
+
+    #[test]
+    fn temporal_k8s_namespace_bundle_layer_supplies_value_for_full() {
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("full".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
+        assert_eq!(cfg.cluster.temporal_namespace, "temporal");
+        assert!(cfg.override_conflict_warnings().is_empty());
+    }
+
+    #[test]
+    fn temporal_k8s_namespace_bundle_layer_falls_through_for_core_only() {
+        // CoreOnly returns None from default_temporal_k8s_namespace —
+        // falls through to the hardcoded "temporal" fallback.
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("core-only".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
+        assert_eq!(cfg.cluster.temporal_namespace, "temporal");
+        // CoreOnly's None means override-conflict warning never fires
+        // for this key, even when the resolved value differs from a
+        // hypothetical default.
+        assert!(cfg.override_conflict_warnings().is_empty());
+    }
+
+    #[test]
+    fn temporal_k8s_namespace_from_file() {
+        let toml = "[cluster]\ntemporal_namespace = \"my-temporal\"";
+        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
+        assert_eq!(cfg.cluster.temporal_namespace, "my-temporal");
+    }
+
+    #[test]
+    fn temporal_k8s_namespace_from_env() {
+        let mut env = HashMap::new();
+        env.insert(
+            "NICO_TEMPORAL_K8S_NAMESPACE".to_string(),
+            "env-temporal".to_string(),
+        );
+        let cfg = Config::load(None, &env, &ConfigOverrides::default(), None).unwrap();
+        assert_eq!(cfg.cluster.temporal_namespace, "env-temporal");
+    }
+
+    #[test]
+    fn temporal_k8s_namespace_env_overrides_file() {
+        let toml = "[cluster]\ntemporal_namespace = \"file-temporal\"";
+        let mut env = HashMap::new();
+        env.insert(
+            "NICO_TEMPORAL_K8S_NAMESPACE".to_string(),
+            "env-temporal".to_string(),
+        );
+        let cfg = Config::load(Some(toml), &env, &ConfigOverrides::default(), None).unwrap();
+        assert_eq!(cfg.cluster.temporal_namespace, "env-temporal");
+    }
+
+    #[test]
+    fn temporal_k8s_namespace_cli_overrides_env_and_file() {
+        let toml = "[cluster]\ntemporal_namespace = \"file-temporal\"";
+        let mut env = HashMap::new();
+        env.insert(
+            "NICO_TEMPORAL_K8S_NAMESPACE".to_string(),
+            "env-temporal".to_string(),
+        );
+        let overrides = ConfigOverrides {
+            temporal_k8s_namespace: Some("cli-temporal".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &env, &overrides, None).unwrap();
+        assert_eq!(cfg.cluster.temporal_namespace, "cli-temporal");
+    }
+
+    #[test]
+    fn temporal_k8s_namespace_file_overrides_bundle() {
+        // file pin to a non-default namespace beats deployment-type
+        // bundle's default. Override-conflict warning fires.
+        let toml = "[cluster]\ntemporal_namespace = \"temporal-prod\"";
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("full".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides, None).unwrap();
+        assert_eq!(cfg.cluster.temporal_namespace, "temporal-prod");
+        let warnings = cfg.override_conflict_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cluster.temporal_namespace=temporal-prod"));
+        assert!(warnings[0].contains("full"));
+        assert!(warnings[0].contains("temporal"));
+    }
+
+    #[test]
+    fn temporal_k8s_namespace_no_warn_when_default_method_returns_none() {
+        // CoreOnly returns None — no warning ever fires for this key
+        // regardless of resolved value, mirroring the existing Option
+        // handling for the other capability defaults.
+        let toml = "[cluster]\ntemporal_namespace = \"weird-ns\"";
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("core-only".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides, None).unwrap();
+        assert_eq!(cfg.cluster.temporal_namespace, "weird-ns");
+        let warnings = cfg.override_conflict_warnings();
+        // None of the warnings should mention temporal_namespace.
+        assert!(
+            warnings.iter().all(|w| !w.contains("temporal_namespace")),
+            "expected no temporal_namespace warning under core-only; got: {warnings:?}"
+        );
     }
 
     #[test]

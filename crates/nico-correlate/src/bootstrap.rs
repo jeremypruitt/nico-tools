@@ -323,6 +323,7 @@ pub async fn prepare_sources(
                     c.clone(),
                     cfg.config.cluster.namespace.clone(),
                     cfg.config.cluster.postgres_namespace.clone(),
+                    cfg.config.cluster.temporal_namespace.clone(),
                 ))
             }
             Err(e) => {

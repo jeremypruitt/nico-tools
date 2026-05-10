@@ -151,6 +151,23 @@ pub fn forgedb_skip_layer(
     ))
 }
 
+/// PRD-001 slice 10: when the resolved deployment-type lacks Temporal
+/// (only `core-only` today), return a [`SkippedLayer`] with reason
+/// `n/a in <type>: no Temporal`. Mirrors [`forgedb_skip_layer`].
+pub fn temporal_skip_layer(
+    name: &'static str,
+    deployment_type: Option<DeploymentType>,
+) -> Option<Box<dyn Layer>> {
+    let dt = deployment_type?;
+    if dt.temporal_present() {
+        return None;
+    }
+    Some(SkippedLayer::with_reason(
+        name,
+        format!("n/a in {}: no Temporal", dt.label()),
+    ))
+}
+
 pub struct UnconfiguredLayer {
     name: &'static str,
     reason: String,
@@ -279,6 +296,38 @@ mod tests {
     #[test]
     fn forgedb_skip_layer_returns_none_when_deployment_type_unresolved() {
         assert!(forgedb_skip_layer("hbn", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn temporal_skip_layer_returns_skip_with_reason_for_core_only() {
+        let layer = temporal_skip_layer("workflows", Some(DeploymentType::CoreOnly))
+            .expect("core-only has no Temporal → skip layer expected");
+        let r = layer.run(&opts()).await;
+        assert_eq!(r.name, "workflows");
+        assert_eq!(r.status, Status::Skipped);
+        assert_eq!(
+            r.skipped_reason.as_deref(),
+            Some("n/a in core-only: no Temporal"),
+        );
+    }
+
+    #[test]
+    fn temporal_skip_layer_returns_none_when_temporal_present() {
+        for dt in [
+            DeploymentType::Full,
+            DeploymentType::RestOnlyMock,
+            DeploymentType::Force,
+        ] {
+            assert!(
+                temporal_skip_layer("workflows", Some(dt)).is_none(),
+                "{dt:?}: temporal present → no skip",
+            );
+        }
+    }
+
+    #[test]
+    fn temporal_skip_layer_returns_none_when_deployment_type_unresolved() {
+        assert!(temporal_skip_layer("workflows", None).is_none());
     }
 
     #[tokio::test]
