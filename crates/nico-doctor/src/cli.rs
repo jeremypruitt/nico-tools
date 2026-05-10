@@ -117,6 +117,17 @@ pub enum DoctorCommand {
     /// stay in `nico doctor hbn`; the `network_config_error` headline
     /// is also owned by `hbn`.
     DpuHealth(DpuHealthArgs),
+
+    /// Single-DPU extension-service inventory drill-down (issue #263).
+    ///
+    /// Reads `network_status_observation->'extension_service_observation'->
+    /// 'extension_service_statuses'` and emits one detail per service,
+    /// classifying by `overall_state`: `Failed` / `Error` always warn,
+    /// `Pending` / `Unknown` warn only when the observation is older
+    /// than `--stale` (default 5m), `Running` is silent, `Terminating` /
+    /// `Terminated` and the `removed` flag are info-only. Stale
+    /// observation timestamp also warns.
+    DpuServices(DpuServicesArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -159,4 +170,17 @@ pub struct DpuHealthArgs {
     /// Accepts any humantime duration, e.g. `30m`, `4h`, `24h`.
     #[arg(long, value_name = "DURATION")]
     pub dhcp_stale: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DpuServicesArgs {
+    /// DPU machine ID to inspect.
+    pub dpu_id: String,
+
+    /// Override the `extension_service_observation` staleness threshold
+    /// (default 5m). Also gates whether transient `Pending` / `Unknown`
+    /// service states warn. Accepts any humantime duration, e.g. `30s`,
+    /// `5m`, `1h`.
+    #[arg(long, value_name = "DURATION")]
+    pub stale: Option<String>,
 }
