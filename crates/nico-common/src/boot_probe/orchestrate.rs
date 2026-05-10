@@ -143,6 +143,16 @@ impl Tracker {
         Self::repaint_tty(&mut g);
     }
 
+    /// Update the resolved InfiniBand presence on the live probe state
+    /// (PRD-004 slice 1). Called after `detect_infiniband_present`'s SQL
+    /// probe returns; the next render frame surfaces it as
+    /// `ib: present|absent|unknown` in the banner header.
+    pub async fn set_infiniband_present(&self, val: Option<bool>) {
+        let mut g = self.inner.lock().await;
+        g.state.infiniband_present = val;
+        Self::repaint_tty(&mut g);
+    }
+
     /// Mark every Pending step in `ids` as Skipped — used after a gate
     /// fails to short-circuit downstream sections.
     pub async fn skip_remaining(&self, ids: &[StepId]) {
@@ -462,6 +472,12 @@ pub fn standard_steps_with_grpc(
             section: Serving,
             budget: timeouts.postgres_reach,
         },
+        StepDef {
+            id: StepId::DetectInfinibandPresent,
+            label: "detect infiniband".into(),
+            section: Serving,
+            budget: timeouts.preflight,
+        },
     ]
 }
 
@@ -487,6 +503,9 @@ pub fn next_command_for(id: StepId, namespace: &str) -> String {
             "kubectl -n postgres port-forward svc/postgres 5432:5432".to_string()
         }
         StepId::ReachPostgres => "check postgres URL host:port reachability".into(),
+        StepId::DetectInfinibandPresent => {
+            "check forgedb / postgres connectivity, or pass --deployment-type=force".into()
+        }
     }
 }
 
@@ -810,10 +829,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_steps_includes_ten_steps() {
+    async fn standard_steps_includes_eleven_steps_with_infiniband_present() {
+        // PRD-004 slice 1: standard step list grows by one
+        // (`detect_infiniband_present`) ordered after `ReachPostgres`.
         let t = crate::config::BootstrapTimeouts::default();
         let s = standard_steps("nico", &t);
-        assert_eq!(s.len(), 10);
+        assert_eq!(s.len(), 11);
+    }
+
+    #[tokio::test]
+    async fn standard_steps_places_detect_infiniband_present_after_reach_postgres() {
+        let t = crate::config::BootstrapTimeouts::default();
+        let s = standard_steps("nico", &t);
+        let positions: std::collections::HashMap<StepId, usize> = s
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.id, i))
+            .collect();
+        let reach_pg = positions[&StepId::ReachPostgres];
+        let detect_ib = positions[&StepId::DetectInfinibandPresent];
+        assert!(
+            reach_pg < detect_ib,
+            "DetectInfinibandPresent must come after ReachPostgres (needs forgedb)"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_infiniband_present_lives_in_serving_section() {
+        let t = crate::config::BootstrapTimeouts::default();
+        let s = standard_steps("nico", &t);
+        let detect = s
+            .iter()
+            .find(|d| d.id == StepId::DetectInfinibandPresent)
+            .expect("DetectInfinibandPresent step missing from standard_steps");
+        assert_eq!(detect.section, crate::boot_probe::state::Section::Serving);
     }
 
     #[tokio::test]

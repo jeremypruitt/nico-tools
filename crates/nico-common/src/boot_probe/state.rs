@@ -31,6 +31,11 @@ pub enum StepId {
     PortForwardGrpc,
     PortForwardPostgres,
     ReachPostgres,
+    /// Capability-based InfiniBand presence probe (PRD-004 slice 1).
+    /// Runs after `ReachPostgres` because it queries
+    /// `machines.inventory->'infiniband_interfaces'`. Skipped when
+    /// `forgedb_present != Some(true)` or when `--deployment-type=force`.
+    DetectInfinibandPresent,
 }
 
 impl StepId {
@@ -49,6 +54,7 @@ impl StepId {
             Self::PortForwardGrpc => "port_forward_grpc",
             Self::PortForwardPostgres => "port_forward_postgres",
             Self::ReachPostgres => "postgres_reach",
+            Self::DetectInfinibandPresent => "detect_infiniband_present",
         }
     }
 }
@@ -131,6 +137,11 @@ pub struct ProbeState {
     /// Override-conflict warning rule"). One pre-formatted line per
     /// contradicting key.
     pub warnings: Vec<String>,
+    /// Resolved InfiniBand presence for the banner's `ib: …` segment
+    /// (PRD-004 slice 1). `None` renders `ib: unknown` (auto pre-probe,
+    /// `--deployment-type=force`, gate unmet, or detection skipped);
+    /// `Some(true)` → `present`; `Some(false)` → `absent`.
+    pub infiniband_present: Option<bool>,
     /// Total wall time elapsed since the probe started — used by the
     /// success receipt and the failure card.
     pub total_elapsed: Duration,
@@ -149,6 +160,7 @@ impl ProbeState {
             deployment_type: None,
             deployment_type_source: "auto".into(),
             warnings: Vec::new(),
+            infiniband_present: None,
             total_elapsed: Duration::ZERO,
         }
     }
@@ -171,6 +183,14 @@ impl ProbeState {
     /// header and the first section.
     pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
         self.warnings = warnings;
+        self
+    }
+
+    /// Builder-style chain to seed the resolved InfiniBand presence
+    /// (PRD-004 slice 1). Boot probe replaces this at runtime via the
+    /// `detect_infiniband_present` step's outcome.
+    pub fn with_infiniband_present(mut self, val: Option<bool>) -> Self {
+        self.infiniband_present = val;
         self
     }
 
@@ -269,6 +289,16 @@ mod tests {
             "port_forward_workflows"
         );
         assert_eq!(StepId::ReachPostgres.technical_name(), "postgres_reach");
+    }
+
+    #[test]
+    fn detect_infiniband_present_step_id_has_stable_technical_name() {
+        // PRD-004 slice 1: new boot-probe step name must be stable so the
+        // failure card / JSON `step:` fields are meaningful.
+        assert_eq!(
+            StepId::DetectInfinibandPresent.technical_name(),
+            "detect_infiniband_present"
+        );
     }
 
     #[test]
@@ -376,6 +406,30 @@ mod tests {
             },
         );
         assert!(s.all_passed());
+    }
+
+    #[test]
+    fn probe_state_default_infiniband_present_is_none() {
+        // PRD-004 slice 1: `infiniband_present` defaults to `None`
+        // (== "unknown"). The boot probe sets it to Some(_) after the
+        // detect step resolves.
+        let s = ProbeState::new(
+            vec![def(StepId::LoadKubeconfig, Section::Connecting)],
+            "port-forward",
+            "auto",
+        );
+        assert_eq!(s.infiniband_present, None);
+    }
+
+    #[test]
+    fn probe_state_with_infiniband_present_sets_field() {
+        let s = ProbeState::new(
+            vec![def(StepId::LoadKubeconfig, Section::Connecting)],
+            "port-forward",
+            "auto",
+        )
+        .with_infiniband_present(Some(true));
+        assert_eq!(s.infiniband_present, Some(true));
     }
 
     #[test]
