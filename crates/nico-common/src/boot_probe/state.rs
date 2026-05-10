@@ -17,12 +17,14 @@ use std::time::Duration;
 pub enum StepId {
     LoadKubeconfig,
     ReachApiServer,
-    Credentials,
-    /// Capability-based deployment-type detection (PRD-001 slice 1).
-    /// Sits between `Credentials` and `NamespaceExists` because the
-    /// latter needs the resolved namespace from the deployment-type's
-    /// capability bundle.
+    /// Capability-based deployment-type detection (PRD-001 slice 1,
+    /// re-placed by slice 9). Sits in the `Connecting` section as a
+    /// sequential gate between `ReachApiServer` and the validating
+    /// fan-out, because the detected type feeds the bundle layer of
+    /// `Config::load` and validating's labels (namespace, gRPC address)
+    /// depend on its result.
     DetectDeploymentType,
+    Credentials,
     NamespaceExists,
     Rbac,
     PortForwardWorkflows,
@@ -200,6 +202,34 @@ impl ProbeState {
         if let Some((_, s)) = self.steps.iter_mut().find(|(d, _)| d.id == id) {
             *s = new;
         }
+    }
+
+    /// Replace a step's plain-English label. PRD-001 slice 9 uses this
+    /// to re-render namespace / gRPC labels after detection updates the
+    /// resolved config.
+    pub fn set_label(&mut self, id: StepId, label: impl Into<String>) {
+        if let Some((d, _)) = self.steps.iter_mut().find(|(d, _)| d.id == id) {
+            d.label = label.into();
+        }
+    }
+
+    /// Replace the banner's deployment-type tag and source. Used post-
+    /// detection to flip `type: auto` → `type: <name> (auto)` once the
+    /// detection ladder resolves a type.
+    pub fn set_deployment_type(
+        &mut self,
+        deployment_type: Option<String>,
+        source: impl Into<String>,
+    ) {
+        self.deployment_type = deployment_type;
+        self.deployment_type_source = source.into();
+    }
+
+    /// Replace the override-conflict warning lines. Used post-detection
+    /// to surface contradictions between detected bundle defaults and
+    /// pinned file/env/CLI values.
+    pub fn set_warnings(&mut self, warnings: Vec<String>) {
+        self.warnings = warnings;
     }
 
     pub fn completed_count(&self) -> usize {

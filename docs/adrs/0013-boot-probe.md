@@ -2,7 +2,8 @@
 
 - **Status:** Proposed
 - **Date:** 2026-05-07
-- **Amended:** 2026-05-09 (PRD-001: `detect_deployment_type` step added to `validating` section)
+- **Amended:** 2026-05-09 (PRD-001: `detect_deployment_type` step added to `validating` section) — **superseded** by 2026-05-10
+- **Amended:** 2026-05-10 (PRD-001 slice 9 / #321: `detect_deployment_type` re-placed as a sequential gate at the end of `connecting`; supersedes the 2026-05-09 placement)
 
 ## Context
 
@@ -46,6 +47,8 @@ load kubeconfig                [seq, ~0.5s]
   ↓
 reach API server               [seq gate, ≤5s]
   ↓
+detect deployment-type         [seq gate, ≤5s]   (auto mode only;
+  ↓                                              instant-pass otherwise)
 fan out (parallel):
   ├ credentials                ≤5s     ┐
   ├ namespace '<ns>' exists    ≤5s     ├ "validating" section
@@ -207,24 +210,36 @@ Each step has an explicit, configurable timeout (see issue #1):
 
 Worst-case bound on the boot probe with all parallelism applied: ~10s.
 
-### `detect_deployment_type` step (2026-05-09 amendment)
+### `detect_deployment_type` step (2026-05-10 amendment, supersedes 2026-05-09)
 
-PRD-001 adds a fourth step to the `validating` section: `detect_deployment_type`
-(plain-English label `"detect deployment-type"`, technical name
-`detect_deployment_type`). It resolves the active cluster to one of the three
-named `DeploymentType` variants — `full`, `core-only`, `rest-only-mock` — so
-the rest of bootstrap (namespace existence check, gRPC address) can use the
-deployment-type's defaults instead of failing on a hardcoded namespace that
-doesn't exist on the active cluster.
+PRD-001 adds a `detect_deployment_type` step (plain-English label
+`"detect deployment-type"`, technical name `detect_deployment_type`) that
+resolves the active cluster to one of the three named `DeploymentType`
+variants — `full`, `core-only`, `rest-only-mock` — so the rest of
+bootstrap (namespace existence check, gRPC address) can use the
+deployment-type's defaults instead of failing on a hardcoded namespace
+that doesn't exist on the active cluster.
 
-**Placement.** After `credentials`, before `namespace_exists`, in the
-`validating` section. The ordering matters: `namespace_exists` checks the
-controller namespace, and the resolved `DeploymentType` supplies that
-namespace's default (`forge-system` for full / core-only,
-`nico-rest` for rest-only-mock). The four `validating` steps still run
-concurrently after the `reach API server` gate per the section's normal
-fail-aware semantics — the constraint is *which* namespace
-`namespace_exists` checks, not *when* it runs relative to detection.
+**Placement (re-amended 2026-05-10, slice 9 / #321).** Sequential gate at
+the end of the `connecting` section, between `reach API server` and the
+`validating` fan-out. The previous 2026-05-09 placement (peer of
+`credentials` / `namespace_exists` / `rbac` inside `validating`) is
+**superseded**. The reason for the re-placement: detection's result is
+the bundle layer of `Config::load`'s precedence chain (`defaults < bundle
+< file < env < CLI`), and the `validating` step labels (e.g. `namespace
+'<ns>' exists`, `port-forward: grpc → <addr>`) consume the resolved
+namespace and gRPC address. Running detection as a peer of those steps
+left the resolved type stranded — it appeared in the boot banner but
+the labels still rendered the pre-detection (hardcoded) values, so a
+`kind-nico-rest-local` cluster booted with `pre-flight failed:
+namespace 'forge-system' not found` even though detection had already
+identified it as `rest-only-mock` (closure case from slice 6 #283).
+Slice 9 makes detection a true sequential gate: bootstrap loads a
+minimal "boot config" (just enough for the kube client + reach gate),
+runs `connecting` (`load kubeconfig` → `reach API server` → `detect
+deployment-type`), then re-calls `Config::load(..., detected_dt)` and
+uses the resolved namespace/gRPC values to render `validating` and
+`serving`.
 
 **Force mode short-circuits the step.** When the user passed
 `--deployment-type=<value>` (CLI), set `[cluster] deployment_type` (config),
@@ -256,10 +271,12 @@ in red, error card below):
 In both cases the step's `next_command` is the same recovery hint:
 `pass --deployment-type=<full|core-only|rest-only-mock> or =force`.
 
-**Budget.** Same 5s as the other `validating` steps
-(`timeouts.preflight`). Adding it keeps the worst-case bound at ~10s
-because the four `validating` steps run concurrently within the
-section's parallel group.
+**Budget.** 5s (`timeouts.preflight`). The step is now sequential rather
+than concurrent with the validating fan-out, so the worst-case bound is
+~5s longer than the 2026-05-09 placement (concurrency no longer hides
+detection latency behind credentials/RBAC). On a responsive cluster the
+detection ladder typically resolves in ≤200ms because rung 1 (workload
+probe) hits a single Service and short-circuits.
 
 ## Consequences
 

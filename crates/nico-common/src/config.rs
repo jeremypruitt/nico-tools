@@ -429,6 +429,7 @@ impl Config {
         file_toml: Option<&str>,
         env: &HashMap<String, String>,
         overrides: &ConfigOverrides,
+        detected_deployment_type: Option<DeploymentType>,
     ) -> Result<Config> {
         let file: FileConfig = match file_toml {
             Some(s) => toml::from_str(s).context("failed to parse config file")?,
@@ -447,10 +448,14 @@ impl Config {
         // hardcoded fallbacks and file (PRD-001 §"Config precedence").
         // `Force` returns `None` from every default-method, so it
         // transparently falls through to the existing hardcoded values.
+        // `detected_deployment_type` slots into the bundle layer: it
+        // wins only when CLI / env / file are silent (auto mode), and
+        // its source tag is `Auto`. PRD-001 slice 9 (#321).
         let (deployment_type, deployment_type_source) = resolve_deployment_type(
             overrides.deployment_type_spec.as_deref(),
             env.get("NICO_DEPLOYMENT_TYPE").map(String::as_str),
             cluster.deployment_type.as_deref(),
+            detected_deployment_type,
         )?;
         let dt_namespace = deployment_type.and_then(|dt| dt.default_cluster_namespace());
         let dt_grpc = deployment_type.and_then(|dt| dt.default_grpc_address());
@@ -715,15 +720,20 @@ fn format_override_warning(key: &str, resolved: &str, type_label: &str, default:
 }
 
 /// Resolve `(deployment_type, source)` from the precedence chain
-/// CLI spec > env (`NICO_DEPLOYMENT_TYPE`) > file (`[cluster] deployment_type`).
-/// `auto` (or absent) → `(None, Auto)`. `force` → `(Some(Force), Force)`.
+/// CLI spec > env (`NICO_DEPLOYMENT_TYPE`) > file (`[cluster] deployment_type`) > detected.
+/// `auto` (or absent) with no detected type → `(None, Auto)`.
+/// `auto` with detected → `(Some(detected), Auto)` (PRD-001 slice 9).
+/// `force` → `(Some(Force), Force)`.
 /// Real types → `Some(...)` with `Flag` (CLI) or `Config` (env/file) source.
 fn resolve_deployment_type(
     cli_spec: Option<&str>,
     env_val: Option<&str>,
     file_val: Option<&str>,
+    detected: Option<DeploymentType>,
 ) -> Result<(Option<DeploymentType>, DeploymentTypeSource)> {
-    // Precedence walk. First non-None spec wins.
+    // Precedence walk. First non-None spec wins. `auto` is a meaningful
+    // value: it forces the auto path even when a lower layer pinned a
+    // type, so we don't fall through to env/file once we hit it.
     let (raw, origin): (&str, DeploymentTypeOrigin) = if let Some(s) = cli_spec {
         (s, DeploymentTypeOrigin::Cli)
     } else if let Some(s) = env_val {
@@ -731,12 +741,16 @@ fn resolve_deployment_type(
     } else if let Some(s) = file_val {
         (s, DeploymentTypeOrigin::EnvOrFile)
     } else {
-        return Ok((None, DeploymentTypeSource::Auto));
+        // No CLI / env / file declaration → bundle layer (detected) feeds
+        // the resolved type. `Auto` source either way.
+        return Ok((detected, DeploymentTypeSource::Auto));
     };
 
     let raw = raw.trim();
     if raw.eq_ignore_ascii_case("auto") {
-        return Ok((None, DeploymentTypeSource::Auto));
+        // Explicit `auto` opts into detection regardless of which layer
+        // it came from — the detected type slots into the bundle layer.
+        return Ok((detected, DeploymentTypeSource::Auto));
     }
 
     let dt = DeploymentType::parse(raw).ok_or_else(|| {
@@ -791,7 +805,7 @@ mod tests {
             postgres_url: Some("postgres://flag/db".to_string()),
             ..Default::default()
         };
-        let config = Config::load(None, &env, &overrides).unwrap();
+        let config = Config::load(None, &env, &overrides, None).unwrap();
         assert_eq!(config.cluster.namespace, "from-flag");
         assert_eq!(config.postgres.url, "postgres://flag/db");
         // env value wins where no flag override exists
@@ -806,7 +820,7 @@ mod tests {
         env.insert("NICO_POSTGRES_URL".to_string(), "postgres://env:pw@host:5432/db".to_string());
         env.insert("NICO_CONTEXT".to_string(), "env-context".to_string());
         env.insert("NICO_TEMPORAL_ADDRESS".to_string(), "env-temporal:7233".to_string());
-        let config = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        let config = Config::load(Some(toml), &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.namespace, "from-env");
         assert_eq!(config.cluster.context.as_deref(), Some("env-context"));
         assert_eq!(config.postgres.url, "postgres://env:pw@host:5432/db");
@@ -822,7 +836,7 @@ context = "prod-ctx"
 [postgres]
 url = "postgres://prod:secret@db:5432/prod"
 "#;
-        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.namespace, "prod");
         assert_eq!(config.cluster.context.as_deref(), Some("prod-ctx"));
         assert_eq!(config.postgres.url, "postgres://prod:secret@db:5432/prod");
@@ -832,7 +846,7 @@ url = "postgres://prod:secret@db:5432/prod"
 
     #[test]
     fn defaults_when_no_sources() {
-        let config = Config::load(None, &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let config = Config::load(None, &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.namespace, "nico");
         assert!(config.cluster.context.is_none());
         assert_eq!(config.postgres.url, "postgres://nico:nico@localhost:5432/nico");
@@ -850,7 +864,7 @@ url = "postgres://prod:secret@db:5432/prod"
     fn reach_mode_env_override() {
         let mut env = HashMap::new();
         env.insert("NICO_REACH_MODE".to_string(), "in-cluster".to_string());
-        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        let config = Config::load(None, &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.reach_mode, ReachMode::InCluster);
     }
 
@@ -860,14 +874,14 @@ url = "postgres://prod:secret@db:5432/prod"
             reach_mode: Some(ReachMode::InCluster),
             ..Default::default()
         };
-        let config = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        let config = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
         assert_eq!(config.cluster.reach_mode, ReachMode::InCluster);
     }
 
     #[test]
     fn reach_mode_file_override() {
         let toml = "[cluster]\nreach_mode = \"in-cluster\"";
-        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.reach_mode, ReachMode::InCluster);
     }
 
@@ -875,7 +889,7 @@ url = "postgres://prod:secret@db:5432/prod"
     fn kubernetes_service_host_selects_in_cluster() {
         let mut env = HashMap::new();
         env.insert("KUBERNETES_SERVICE_HOST".to_string(), "10.0.0.1".to_string());
-        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        let config = Config::load(None, &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.reach_mode, ReachMode::InCluster);
     }
 
@@ -883,13 +897,13 @@ url = "postgres://prod:secret@db:5432/prod"
     fn invalid_reach_mode_errors() {
         let mut env = HashMap::new();
         env.insert("NICO_REACH_MODE".to_string(), "bogus".to_string());
-        assert!(Config::load(None, &env, &ConfigOverrides::default()).is_err());
+        assert!(Config::load(None, &env, &ConfigOverrides::default(), None).is_err());
     }
 
     #[test]
     fn tui_refresh_from_file() {
         let toml = "[output]\ntui_refresh = \"10s\"";
-        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.output.tui_refresh, Duration::from_secs(10));
     }
 
@@ -898,7 +912,7 @@ url = "postgres://prod:secret@db:5432/prod"
         let toml = "[output]\ntui_refresh = \"10s\"";
         let mut env = HashMap::new();
         env.insert("NICO_TUI_REFRESH".to_string(), "20s".to_string());
-        let config = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        let config = Config::load(Some(toml), &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.output.tui_refresh, Duration::from_secs(20));
     }
 
@@ -911,13 +925,13 @@ url = "postgres://prod:secret@db:5432/prod"
             tui_refresh: Some(Duration::from_secs(5)),
             ..Default::default()
         };
-        let config = Config::load(Some(toml), &env, &overrides).unwrap();
+        let config = Config::load(Some(toml), &env, &overrides, None).unwrap();
         assert_eq!(config.output.tui_refresh, Duration::from_secs(5));
     }
 
     #[test]
     fn grpc_address_defaults_to_none() {
-        let config = Config::load(None, &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let config = Config::load(None, &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert!(config.cluster.grpc_address.is_none());
     }
 
@@ -925,14 +939,14 @@ url = "postgres://prod:secret@db:5432/prod"
     fn grpc_address_from_env() {
         let mut env = HashMap::new();
         env.insert("NICO_GRPC_ADDRESS".to_string(), "carbide-api:1079".to_string());
-        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        let config = Config::load(None, &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.grpc_address.as_deref(), Some("carbide-api:1079"));
     }
 
     #[test]
     fn grpc_address_from_file() {
         let toml = "[cluster]\ngrpc_address = \"carbide-api:1079\"";
-        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.grpc_address.as_deref(), Some("carbide-api:1079"));
     }
 
@@ -941,13 +955,13 @@ url = "postgres://prod:secret@db:5432/prod"
         let toml = "[cluster]\ngrpc_address = \"from-file:1079\"";
         let mut env = HashMap::new();
         env.insert("NICO_GRPC_ADDRESS".to_string(), "from-env:1079".to_string());
-        let config = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        let config = Config::load(Some(toml), &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.grpc_address.as_deref(), Some("from-env:1079"));
     }
 
     #[test]
     fn postgres_namespace_defaults_to_postgres() {
-        let config = Config::load(None, &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let config = Config::load(None, &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.postgres_namespace, "postgres");
     }
 
@@ -955,14 +969,14 @@ url = "postgres://prod:secret@db:5432/prod"
     fn postgres_namespace_from_env() {
         let mut env = HashMap::new();
         env.insert("NICO_POSTGRES_NAMESPACE".to_string(), "db-tier".to_string());
-        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        let config = Config::load(None, &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.postgres_namespace, "db-tier");
     }
 
     #[test]
     fn postgres_namespace_from_file() {
         let toml = "[cluster]\npostgres_namespace = \"data\"";
-        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.postgres_namespace, "data");
     }
 
@@ -971,7 +985,7 @@ url = "postgres://prod:secret@db:5432/prod"
         let toml = "[cluster]\npostgres_namespace = \"from-file\"";
         let mut env = HashMap::new();
         env.insert("NICO_POSTGRES_NAMESPACE".to_string(), "from-env".to_string());
-        let config = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        let config = Config::load(Some(toml), &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(config.cluster.postgres_namespace, "from-env");
     }
 
@@ -993,7 +1007,7 @@ kube_client = "9s"
 preflight = "2s"
 port_forward = "1s"
 "#;
-        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(cfg.bootstrap.timeouts.kube_client, Duration::from_secs(9));
         assert_eq!(cfg.bootstrap.timeouts.preflight, Duration::from_secs(2));
         assert_eq!(cfg.bootstrap.timeouts.port_forward, Duration::from_secs(1));
@@ -1007,7 +1021,7 @@ port_forward = "1s"
         let toml = "[bootstrap.timeouts]\npreflight = \"7s\"";
         let mut env = HashMap::new();
         env.insert("NICO_TIMEOUT_PREFLIGHT".to_string(), "1s".to_string());
-        let cfg = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        let cfg = Config::load(Some(toml), &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(cfg.bootstrap.timeouts.preflight, Duration::from_secs(1));
     }
 
@@ -1020,7 +1034,7 @@ port_forward = "1s"
             bootstrap_timeouts_spec: Some("preflight=500ms,port_forward=250ms".to_string()),
             ..Default::default()
         };
-        let cfg = Config::load(Some(toml), &env, &overrides).unwrap();
+        let cfg = Config::load(Some(toml), &env, &overrides, None).unwrap();
         assert_eq!(cfg.bootstrap.timeouts.preflight, Duration::from_millis(500));
         assert_eq!(cfg.bootstrap.timeouts.port_forward, Duration::from_millis(250));
     }
@@ -1031,7 +1045,7 @@ port_forward = "1s"
             bootstrap_timeouts_spec: Some("nonsense=1s".to_string()),
             ..Default::default()
         };
-        let err = Config::load(None, &HashMap::new(), &overrides).err().expect("expected err");
+        let err = Config::load(None, &HashMap::new(), &overrides, None).err().expect("expected err");
         let msg = format!("{err:#}");
         assert!(msg.contains("nonsense"), "msg = {msg}");
     }
@@ -1042,14 +1056,14 @@ port_forward = "1s"
             bootstrap_timeouts_spec: Some("preflight=NOTADURATION".to_string()),
             ..Default::default()
         };
-        assert!(Config::load(None, &HashMap::new(), &overrides).is_err());
+        assert!(Config::load(None, &HashMap::new(), &overrides, None).is_err());
     }
 
     #[test]
     fn grpc_address_independent_from_temporal_address() {
         let mut env = HashMap::new();
         env.insert("NICO_TEMPORAL_ADDRESS".to_string(), "temporal:7233".to_string());
-        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        let config = Config::load(None, &env, &ConfigOverrides::default(), None).unwrap();
         assert!(config.cluster.grpc_address.is_none());
         assert_eq!(config.temporal.address, "temporal:7233");
     }
@@ -1160,7 +1174,7 @@ port_forward = "1s"
 
     #[test]
     fn deployment_type_defaults_to_auto_when_no_overrides() {
-        let cfg = Config::load(None, &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert!(cfg.cluster.deployment_type.is_none());
         assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Auto);
     }
@@ -1172,7 +1186,7 @@ port_forward = "1s"
                 deployment_type_spec: Some(label.into()),
                 ..Default::default()
             };
-            let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+            let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
             assert_eq!(cfg.cluster.deployment_type, DeploymentType::parse(label));
             assert_eq!(
                 cfg.cluster.deployment_type_source,
@@ -1188,7 +1202,7 @@ port_forward = "1s"
             deployment_type_spec: Some("force".into()),
             ..Default::default()
         };
-        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
         assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Force));
         assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Force);
     }
@@ -1199,7 +1213,7 @@ port_forward = "1s"
             deployment_type_spec: Some("auto".into()),
             ..Default::default()
         };
-        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
         assert!(cfg.cluster.deployment_type.is_none());
         assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Auto);
     }
@@ -1211,7 +1225,7 @@ port_forward = "1s"
             "NICO_DEPLOYMENT_TYPE".to_string(),
             "rest-only-mock".to_string(),
         );
-        let cfg = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        let cfg = Config::load(None, &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(
             cfg.cluster.deployment_type,
             Some(DeploymentType::RestOnlyMock)
@@ -1227,7 +1241,7 @@ port_forward = "1s"
         let toml = r#"[cluster]
 deployment_type = "core-only"
 "#;
-        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::CoreOnly));
         assert_eq!(
             cfg.cluster.deployment_type_source,
@@ -1244,7 +1258,7 @@ deployment_type = "core-only"
             deployment_type_spec: Some("full".into()),
             ..Default::default()
         };
-        let cfg = Config::load(Some(toml), &env, &overrides).unwrap();
+        let cfg = Config::load(Some(toml), &env, &overrides, None).unwrap();
         assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Full));
         assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Flag);
     }
@@ -1254,7 +1268,7 @@ deployment_type = "core-only"
         let toml = "[cluster]\ndeployment_type = \"core-only\"";
         let mut env = HashMap::new();
         env.insert("NICO_DEPLOYMENT_TYPE".to_string(), "full".to_string());
-        let cfg = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        let cfg = Config::load(Some(toml), &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Full));
         assert_eq!(
             cfg.cluster.deployment_type_source,
@@ -1268,7 +1282,7 @@ deployment_type = "core-only"
         // banner reads `type: force (force)` for the no-enforcement path.
         let mut env = HashMap::new();
         env.insert("NICO_DEPLOYMENT_TYPE".to_string(), "force".to_string());
-        let cfg = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        let cfg = Config::load(None, &env, &ConfigOverrides::default(), None).unwrap();
         assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Force));
         assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Force);
     }
@@ -1279,7 +1293,7 @@ deployment_type = "core-only"
             deployment_type_spec: Some("nope".into()),
             ..Default::default()
         };
-        let err = Config::load(None, &HashMap::new(), &overrides).err().expect("expected err");
+        let err = Config::load(None, &HashMap::new(), &overrides, None).err().expect("expected err");
         let msg = format!("{err:#}");
         assert!(msg.contains("nope"), "msg = {msg}");
     }
@@ -1287,7 +1301,7 @@ deployment_type = "core-only"
     #[test]
     fn deployment_type_invalid_in_file_errors() {
         let toml = "[cluster]\ndeployment_type = \"weird\"";
-        assert!(Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).is_err());
+        assert!(Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).is_err());
     }
 
     // PRD-001 slice 5: capability bundle wiring.
@@ -1307,7 +1321,7 @@ deployment_type = "core-only"
             deployment_type_spec: Some("rest-only-mock".into()),
             ..Default::default()
         };
-        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
         assert_eq!(cfg.cluster.namespace, "nico-rest");
         assert!(cfg.override_conflict_warnings().is_empty());
     }
@@ -1318,7 +1332,7 @@ deployment_type = "core-only"
             deployment_type_spec: Some("full".into()),
             ..Default::default()
         };
-        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
         assert_eq!(
             cfg.cluster.grpc_address.as_deref(),
             Some("carbide-api.forge-system:1079")
@@ -1334,7 +1348,7 @@ deployment_type = "core-only"
             deployment_type_spec: Some("rest-only-mock".into()),
             ..Default::default()
         };
-        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides, None).unwrap();
         assert_eq!(cfg.cluster.namespace, "forge-system");
         let warnings = cfg.override_conflict_warnings();
         assert_eq!(warnings.len(), 1, "expected one warning, got: {warnings:?}");
@@ -1364,7 +1378,7 @@ deployment_type = "core-only"
             deployment_type_spec: Some("full".into()),
             ..Default::default()
         };
-        let cfg = Config::load(None, &env, &overrides).unwrap();
+        let cfg = Config::load(None, &env, &overrides, None).unwrap();
         assert_eq!(cfg.cluster.namespace, "weird-ns");
         let warnings = cfg.override_conflict_warnings();
         assert_eq!(warnings.len(), 1);
@@ -1381,7 +1395,7 @@ deployment_type = "core-only"
             deployment_type_spec: Some("full".into()),
             ..Default::default()
         };
-        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides, None).unwrap();
         assert_eq!(cfg.cluster.namespace, "forge-system");
         assert!(cfg.override_conflict_warnings().is_empty());
     }
@@ -1399,7 +1413,7 @@ grpc_address = "weird:9999"
             deployment_type_spec: Some("force".into()),
             ..Default::default()
         };
-        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides, None).unwrap();
         assert!(cfg.override_conflict_warnings().is_empty());
     }
 
@@ -1408,7 +1422,7 @@ grpc_address = "weird:9999"
         // No deployment-type resolved yet (auto, pre-detection) → nothing
         // to compare against, so no warnings.
         let toml = "[cluster]\nnamespace = \"weird-ns\"";
-        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert!(cfg.override_conflict_warnings().is_empty());
     }
 
@@ -1424,7 +1438,7 @@ grpc_address = "weird:9999"
             deployment_type_spec: Some("rest-only-mock".into()),
             ..Default::default()
         };
-        let cfg = Config::load(None, &env, &overrides).unwrap();
+        let cfg = Config::load(None, &env, &overrides, None).unwrap();
         let warnings = cfg.override_conflict_warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("cluster.grpc_address=carbide-api.forge-system:1079"));
@@ -1444,7 +1458,7 @@ grpc_address = "weird:9999"
             deployment_type_spec: Some("full".into()),
             ..Default::default()
         };
-        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides, None).unwrap();
         let warnings = cfg.override_conflict_warnings();
         assert_eq!(warnings.len(), 2, "got: {warnings:?}");
     }
@@ -1457,7 +1471,7 @@ grpc_address = "weird:9999"
             deployment_type_spec: Some("rest-only-mock".into()),
             ..Default::default()
         };
-        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides, None).unwrap();
         let warnings = cfg.override_conflict_warnings();
         assert_eq!(
             warnings[0],
@@ -1475,18 +1489,201 @@ grpc_address = "weird:9999"
             namespace: Some("forge-system".into()),
             ..Default::default()
         };
-        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
         assert_eq!(cfg.cluster.namespace, "forge-system");
         let warnings = cfg.override_conflict_warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("cluster.namespace=forge-system"));
     }
 
+    // PRD-001 slice 9 (#321): detect-first-then-load.
+    //
+    // `Config::load` accepts a `detected_deployment_type` parameter that
+    // slots into the precedence chain at the bundle layer:
+    //   hardcoded < detected (bundle) < file < env < CLI
+    // Source tag follows the layer that wins:
+    //   - detected wins → Auto
+    //   - file/env wins → Config
+    //   - CLI wins (real type) → Flag
+    //   - CLI wins (force) → Force
+
+    #[test]
+    fn detected_deployment_type_resolves_when_no_user_declaration() {
+        // Auto path: no CLI / env / file declaration; the boot-probe's
+        // detection ladder produced `RestOnlyMock`. Source stays `Auto`.
+        let cfg = Config::load(
+            None,
+            &HashMap::new(),
+            &ConfigOverrides::default(),
+            Some(DeploymentType::RestOnlyMock),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.cluster.deployment_type,
+            Some(DeploymentType::RestOnlyMock)
+        );
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Auto
+        );
+        // The bundle layer applies — namespace and grpc come from
+        // RestOnlyMock's defaults.
+        assert_eq!(cfg.cluster.namespace, "nico-rest");
+        assert_eq!(
+            cfg.cluster.grpc_address.as_deref(),
+            Some("nico-rest-mock-core.nico-rest:11079")
+        );
+    }
+
+    #[test]
+    fn detected_deployment_type_loses_to_cli_flag() {
+        // CLI flag pins to full; detection said rest-only-mock.
+        // Resolved type follows CLI; source = Flag.
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("full".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(
+            None,
+            &HashMap::new(),
+            &overrides,
+            Some(DeploymentType::RestOnlyMock),
+        )
+        .unwrap();
+        assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Full));
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Flag
+        );
+    }
+
+    #[test]
+    fn detected_deployment_type_loses_to_env_pin() {
+        let mut env = HashMap::new();
+        env.insert("NICO_DEPLOYMENT_TYPE".into(), "full".into());
+        let cfg = Config::load(
+            None,
+            &env,
+            &ConfigOverrides::default(),
+            Some(DeploymentType::RestOnlyMock),
+        )
+        .unwrap();
+        assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Full));
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Config
+        );
+    }
+
+    #[test]
+    fn detected_deployment_type_loses_to_file_pin() {
+        let toml = "[cluster]\ndeployment_type = \"core-only\"";
+        let cfg = Config::load(
+            Some(toml),
+            &HashMap::new(),
+            &ConfigOverrides::default(),
+            Some(DeploymentType::RestOnlyMock),
+        )
+        .unwrap();
+        assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::CoreOnly));
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Config
+        );
+    }
+
+    #[test]
+    fn explicit_auto_cli_falls_through_to_detected() {
+        // `--deployment-type=auto` explicitly opts into detection. Even
+        // with a file pin to `core-only`, the auto override means the
+        // detected type wins; source = Auto.
+        let toml = "[cluster]\ndeployment_type = \"core-only\"";
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("auto".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(
+            Some(toml),
+            &HashMap::new(),
+            &overrides,
+            Some(DeploymentType::RestOnlyMock),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.cluster.deployment_type,
+            Some(DeploymentType::RestOnlyMock)
+        );
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Auto
+        );
+    }
+
+    #[test]
+    fn auto_with_no_detection_yields_unresolved() {
+        // Auto path with no detection (e.g., probe failed) → no resolved
+        // type; banner reads `auto`.
+        let cfg = Config::load(None, &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
+        assert!(cfg.cluster.deployment_type.is_none());
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Auto
+        );
+    }
+
+    #[test]
+    fn detected_rest_only_mock_drives_capability_bundle_with_file_override_warning() {
+        // Closure case: legacy file pin to `forge-system` with no
+        // deployment-type declaration. Detection resolves to
+        // RestOnlyMock; the resolved namespace comes from the file
+        // (higher layer than bundle), but the override-conflict warning
+        // fires because the file value contradicts the bundle's default.
+        let toml = "[cluster]\nnamespace = \"forge-system\"";
+        let cfg = Config::load(
+            Some(toml),
+            &HashMap::new(),
+            &ConfigOverrides::default(),
+            Some(DeploymentType::RestOnlyMock),
+        )
+        .unwrap();
+        assert_eq!(cfg.cluster.namespace, "forge-system");
+        let warnings = cfg.override_conflict_warnings();
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("cluster.namespace=forge-system"));
+        assert!(warnings[0].contains("rest-only-mock"));
+        assert!(warnings[0].contains("nico-rest"));
+    }
+
+    #[test]
+    fn cli_force_silences_detection_and_warnings() {
+        // `--deployment-type=force` short-circuits the bundle layer
+        // entirely (Force returns None from every default-method) and
+        // silences override warnings. Detection result is ignored.
+        let toml = "[cluster]\nnamespace = \"weird-ns\"";
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("force".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(
+            Some(toml),
+            &HashMap::new(),
+            &overrides,
+            Some(DeploymentType::RestOnlyMock),
+        )
+        .unwrap();
+        assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Force));
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Force
+        );
+        assert!(cfg.override_conflict_warnings().is_empty());
+    }
+
     #[test]
     fn deployment_type_default_only_applies_when_no_higher_layer_set() {
         // Hardcoded default for namespace is "nico". Without a
         // deployment-type, that's the resolved value.
-        let cfg = Config::load(None, &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &ConfigOverrides::default(), None).unwrap();
         assert_eq!(cfg.cluster.namespace, "nico");
         // With deployment-type=full, the deployment-type default replaces
         // the hardcoded fallback (no file/env/CLI in play).
@@ -1494,7 +1691,7 @@ grpc_address = "weird:9999"
             deployment_type_spec: Some("full".into()),
             ..Default::default()
         };
-        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
         assert_eq!(cfg.cluster.namespace, "forge-system");
     }
 }

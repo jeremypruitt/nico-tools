@@ -115,6 +115,34 @@ impl Tracker {
         g.state.any_failed()
     }
 
+    /// Replace a step's plain-English label and trigger a repaint.
+    /// PRD-001 slice 9 (#321) uses this to re-render namespace / gRPC
+    /// labels after detection settles the resolved config.
+    pub async fn set_label(&self, id: StepId, label: impl Into<String>) {
+        let mut g = self.inner.lock().await;
+        g.state.set_label(id, label);
+        Self::repaint_tty(&mut g);
+    }
+
+    /// Replace the banner's deployment-type tag and trigger a repaint.
+    /// Flips `type: auto` → `type: <name> (auto)` once detection lands.
+    pub async fn set_deployment_type(
+        &self,
+        deployment_type: Option<String>,
+        source: impl Into<String>,
+    ) {
+        let mut g = self.inner.lock().await;
+        g.state.set_deployment_type(deployment_type, source);
+        Self::repaint_tty(&mut g);
+    }
+
+    /// Replace the override-conflict warnings and trigger a repaint.
+    pub async fn set_warnings(&self, warnings: Vec<String>) {
+        let mut g = self.inner.lock().await;
+        g.state.set_warnings(warnings);
+        Self::repaint_tty(&mut g);
+    }
+
     /// Update the resolved InfiniBand presence on the live probe state
     /// (PRD-004 slice 1). Called after `detect_infiniband_present`'s SQL
     /// probe returns; the next render frame surfaces it as
@@ -397,14 +425,14 @@ pub fn standard_steps_with_grpc(
             budget: timeouts.reach_api,
         },
         StepDef {
-            id: StepId::Credentials,
-            label: "credentials".into(),
-            section: Validating,
+            id: StepId::DetectDeploymentType,
+            label: "detect deployment-type".into(),
+            section: Connecting,
             budget: timeouts.preflight,
         },
         StepDef {
-            id: StepId::DetectDeploymentType,
-            label: "detect deployment-type".into(),
+            id: StepId::Credentials,
+            label: "credentials".into(),
             section: Validating,
             budget: timeouts.preflight,
         },
@@ -619,6 +647,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracker_set_label_replaces_step_label_for_render() {
+        // PRD-001 slice 9 (#321): post-detection label updates. The
+        // bootstrap mutates `namespace_exists` and `port-forward: grpc`
+        // labels after detection settles, so the renderer paints the
+        // resolved values rather than the boot-config placeholders.
+        let state = ProbeState::new(
+            vec![def(StepId::NamespaceExists, Section::Validating)],
+            "port-forward",
+            "auto",
+        );
+        let probe = BootProbe::new(state, ProbeMode::Json, Box::new(Vec::<u8>::new()));
+        let tracker = probe.tracker();
+        tracker
+            .set_label(StepId::NamespaceExists, "namespace 'nico-rest' exists")
+            .await;
+        let g = probe.inner.lock().await;
+        let label = g
+            .state
+            .steps
+            .iter()
+            .find(|(d, _)| d.id == StepId::NamespaceExists)
+            .map(|(d, _)| d.label.clone())
+            .unwrap();
+        assert_eq!(label, "namespace 'nico-rest' exists");
+    }
+
+    #[tokio::test]
+    async fn tracker_set_deployment_type_updates_banner_metadata() {
+        // After detection lands the auto path, the banner flips from
+        // `type: auto` → `type: rest-only-mock (auto)`.
+        let state = ProbeState::new(
+            vec![def(StepId::DetectDeploymentType, Section::Connecting)],
+            "port-forward",
+            "auto",
+        );
+        let probe = BootProbe::new(state, ProbeMode::Json, Box::new(Vec::<u8>::new()));
+        let tracker = probe.tracker();
+        tracker
+            .set_deployment_type(Some("rest-only-mock".to_string()), "auto")
+            .await;
+        let g = probe.inner.lock().await;
+        assert_eq!(g.state.deployment_type.as_deref(), Some("rest-only-mock"));
+        assert_eq!(g.state.deployment_type_source, "auto");
+    }
+
+    #[tokio::test]
+    async fn tracker_set_warnings_replaces_warning_lines() {
+        // Override-conflict warnings are computed against the resolved
+        // (post-detection) config. The bootstrap re-pushes them once
+        // detection lands; the tracker handles it as a single mutation.
+        let state = ProbeState::new(
+            vec![def(StepId::DetectDeploymentType, Section::Connecting)],
+            "port-forward",
+            "auto",
+        );
+        let probe = BootProbe::new(state, ProbeMode::Json, Box::new(Vec::<u8>::new()));
+        let tracker = probe.tracker();
+        tracker
+            .set_warnings(vec![
+                "⚠  cluster.namespace=forge-system overrides \
+                 deployment-type rest-only-mock default (nico-rest)"
+                    .to_string(),
+            ])
+            .await;
+        let g = probe.inner.lock().await;
+        assert_eq!(g.state.warnings.len(), 1);
+        assert!(g.state.warnings[0].contains("rest-only-mock"));
+    }
+
+    #[tokio::test]
     async fn fail_aware_siblings_run_to_completion() {
         // Simulates ADR-0013 fail-aware semantics: the orchestrator
         // does not cancel siblings, so all parallel results land in
@@ -768,7 +866,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_steps_places_detect_deployment_type_after_credentials_before_namespace() {
+    async fn standard_steps_places_detect_deployment_type_after_reach_api_before_credentials() {
+        // PRD-001 slice 9 (#321): detect-first-then-load. The step is a
+        // sequential gate between Connecting and Validating; visually it
+        // sits at the end of Connecting because the validating fan-out
+        // consumes its result via the resolved cluster.namespace label.
         let t = crate::config::BootstrapTimeouts::default();
         let s = standard_steps("nico", &t);
         let positions: std::collections::HashMap<StepId, usize> = s
@@ -776,19 +878,23 @@ mod tests {
             .enumerate()
             .map(|(i, d)| (d.id, i))
             .collect();
-        let cred = positions[&StepId::Credentials];
+        let reach = positions[&StepId::ReachApiServer];
         let detect = positions[&StepId::DetectDeploymentType];
-        let ns = positions[&StepId::NamespaceExists];
-        assert!(cred < detect, "Credentials must come before DetectDeploymentType");
-        assert!(detect < ns, "DetectDeploymentType must come before NamespaceExists");
+        let cred = positions[&StepId::Credentials];
+        assert!(reach < detect, "ReachApiServer must come before DetectDeploymentType");
+        assert!(detect < cred, "DetectDeploymentType must gate before Credentials");
     }
 
     #[tokio::test]
-    async fn detect_deployment_type_lives_in_validating_section() {
+    async fn detect_deployment_type_lives_in_connecting_section() {
+        // PRD-001 slice 9 (#321) re-placed the step from Validating to
+        // Connecting so its result can feed Config::load before the
+        // validating step labels (`namespace 'X' exists`,
+        // `port-forward: grpc → addr`) are rendered.
         let t = crate::config::BootstrapTimeouts::default();
         let s = standard_steps("nico", &t);
         let detect = s.iter().find(|d| d.id == StepId::DetectDeploymentType).unwrap();
-        assert_eq!(detect.section, crate::boot_probe::state::Section::Validating);
+        assert_eq!(detect.section, crate::boot_probe::state::Section::Connecting);
     }
 
     #[tokio::test]
@@ -833,7 +939,7 @@ mod tests {
             deployment_type_spec: Some("rest-only-mock".into()),
             ..Default::default()
         };
-        let cfg = Config::load(None, &env, &overrides).expect("config load");
+        let cfg = Config::load(None, &env, &overrides, None).expect("config load");
         assert_eq!(cfg.cluster.namespace, "nico-rest");
         assert_eq!(
             cfg.cluster.grpc_address.as_deref(),
@@ -851,6 +957,116 @@ mod tests {
         assert_eq!(
             grpc.label,
             "port-forward: grpc → nico-rest-mock-core.nico-rest:11079"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_first_then_load_resolves_closure_case_labels_via_workload_probe() {
+        // PRD-001 slice 9 (#321) closure-case integration test.
+        //
+        // The bug we're closing: a `kind-nico-rest-local` cluster with no
+        // `--deployment-type` flag and no config-file pin. Detection
+        // resolves the cluster shape from the `nico-rest-mock-core`
+        // workload probe; `Config::load` slots the detected type into
+        // the bundle layer so downstream boot-probe step labels render
+        // `namespace 'nico-rest' exists` and
+        // `port-forward: grpc → nico-rest-mock-core.nico-rest:11079`.
+        //
+        // Prior to this slice the detection result was thrown away — the
+        // step labels stayed pinned to pre-detection (hardcoded) values
+        // and `nico ops` failed at `namespace 'forge-system' not found`.
+        use crate::config::{
+            Config, ConfigOverrides, DeploymentType, DeploymentTypeSource,
+        };
+        use crate::deployment_detect::{run_detection_ladder, testing::MockClusterShapeProbe};
+
+        let probe = MockClusterShapeProbe::new()
+            .with_service("nico-rest", "nico-rest-mock-core");
+        let outcome = run_detection_ladder(&probe).await.expect("ladder");
+        assert_eq!(
+            outcome.matched,
+            Some(DeploymentType::RestOnlyMock),
+            "workload probe should match RestOnlyMock from nico-rest-mock-core@nico-rest",
+        );
+        assert!(
+            outcome
+                .observed_services
+                .iter()
+                .any(|s| s == "nico-rest-mock-core@nico-rest"),
+            "diagnostic should record observed mock-core service: {:?}",
+            outcome.observed_services,
+        );
+
+        // Re-load Config with the detected type — auto path with no
+        // CLI/env/file declaration. Source stays `Auto`.
+        let env = std::collections::HashMap::new();
+        let cfg = Config::load(None, &env, &ConfigOverrides::default(), outcome.matched)
+            .expect("config load");
+        assert_eq!(
+            cfg.cluster.deployment_type,
+            Some(DeploymentType::RestOnlyMock)
+        );
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Auto
+        );
+        assert_eq!(cfg.cluster.namespace, "nico-rest");
+        assert_eq!(
+            cfg.cluster.grpc_address.as_deref(),
+            Some("nico-rest-mock-core.nico-rest:11079")
+        );
+        assert!(
+            cfg.override_conflict_warnings().is_empty(),
+            "no overrides → no warnings",
+        );
+
+        // Boot-probe step labels reflect the post-detection config.
+        let steps = standard_steps_with_grpc(
+            &cfg.cluster.namespace,
+            &cfg.bootstrap.timeouts,
+            cfg.cluster.grpc_address.as_deref(),
+        );
+        let ns_step = steps
+            .iter()
+            .find(|d| d.id == StepId::NamespaceExists)
+            .expect("namespace_exists step");
+        let grpc_step = steps
+            .iter()
+            .find(|d| d.id == StepId::PortForwardGrpc)
+            .expect("port_forward_grpc step");
+        assert_eq!(ns_step.label, "namespace 'nico-rest' exists");
+        assert_eq!(
+            grpc_step.label,
+            "port-forward: grpc → nico-rest-mock-core.nico-rest:11079"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_first_then_load_emits_override_warning_for_legacy_forge_system_pin() {
+        // The user's other failure mode: legacy file pin to
+        // `cluster.namespace = "forge-system"` against a `nico-rest`
+        // cluster. Detection resolves RestOnlyMock; the file value wins
+        // for the resolved namespace (file > bundle), but the
+        // override-conflict warning fires.
+        use crate::config::{Config, ConfigOverrides, DeploymentType};
+        use crate::deployment_detect::{run_detection_ladder, testing::MockClusterShapeProbe};
+
+        let probe = MockClusterShapeProbe::new()
+            .with_service("nico-rest", "nico-rest-mock-core");
+        let outcome = run_detection_ladder(&probe).await.expect("ladder");
+        assert_eq!(outcome.matched, Some(DeploymentType::RestOnlyMock));
+
+        let toml = "[cluster]\nnamespace = \"forge-system\"";
+        let env = std::collections::HashMap::new();
+        let cfg = Config::load(Some(toml), &env, &ConfigOverrides::default(), outcome.matched)
+            .expect("config load");
+        assert_eq!(cfg.cluster.namespace, "forge-system");
+        let warnings = cfg.override_conflict_warnings();
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert_eq!(
+            warnings[0],
+            "⚠  cluster.namespace=forge-system overrides deployment-type \
+             rest-only-mock default (nico-rest)",
         );
     }
 

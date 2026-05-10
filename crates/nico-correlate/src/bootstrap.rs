@@ -75,7 +75,7 @@ pub fn resolve_config(args: &CorrelateArgs) -> Result<CorrelateConfig, Bootstrap
     };
 
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    let config = Config::load(file_toml.as_deref(), &env, &overrides).map_err(|e| {
+    let config = Config::load(file_toml.as_deref(), &env, &overrides, None).map_err(|e| {
         BootstrapErr::Fatal {
             message: format!("error loading config: {e}"),
             code: 1,

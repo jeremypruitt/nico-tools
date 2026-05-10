@@ -212,14 +212,21 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
     };
 
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    let config = Config::load(file_toml.as_deref(), &env, &overrides).map_err(|e| {
+    // PRD-001 slice 9 (#321): detect-first-then-load. The boot config
+    // is built without a detected deployment-type so we can drive the
+    // boot probe's connecting section (kubeconfig + reach API + detect
+    // gate) before re-resolving the config with detection's result.
+    // Detection only contributes to the bundle layer of the precedence
+    // chain — flag/config/force users get the same single-load behavior
+    // they had pre-slice-9 because their resolved type doesn't change.
+    let boot_config = Config::load(file_toml.as_deref(), &env, &overrides, None).map_err(|e| {
         BootstrapErr::Fatal {
             message: format!("error loading config: {e}"),
             code: 1,
         }
     })?;
 
-    let reach_mode = config.cluster.reach_mode;
+    let reach_mode = boot_config.cluster.reach_mode;
     let reach_source = if mode_override.is_some() {
         "--mode flag"
     } else if env.contains_key("NICO_REACH_MODE") {
@@ -231,7 +238,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
     };
 
     let output_mode = OutputMode {
-        color: match config.output.color {
+        color: match boot_config.output.color {
             ColorMode::Always => true,
             ColorMode::Never => false,
             ColorMode::Auto => std::env::var("NO_COLOR").is_err(),
@@ -241,32 +248,36 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
 
     let since = humantime::parse_duration(&args.since).unwrap_or(Duration::from_secs(600));
     let timeout = humantime::parse_duration(&args.timeout).unwrap_or(Duration::from_secs(5));
-    let opts = RunOpts {
-        namespace: config.cluster.namespace.clone(),
-        since,
-        timeout,
-        ..Default::default()
-    };
 
     let probe_outcome = run_boot_probe(
-        &config,
+        boot_config,
+        file_toml.as_deref(),
+        &env,
+        &overrides,
         reach_mode,
         reach_source,
         &output_mode,
     )
     .await;
 
-    let BootProbeResult {
+    let (config, BootProbeResult {
         k8s_client,
         reach_mgr,
         temporal_address,
         postgres_url,
         mut pf_guards,
-    } = match probe_outcome {
+    }) = match probe_outcome {
         Ok(r) => r,
         Err(failure) => {
             return Err(failure);
         }
+    };
+
+    let opts = RunOpts {
+        namespace: config.cluster.namespace.clone(),
+        since,
+        timeout,
+        ..Default::default()
     };
 
     let pf_budget = config.bootstrap.timeouts.port_forward;
@@ -397,12 +408,15 @@ struct BootProbeResult {
 }
 
 async fn run_boot_probe(
-    config: &Config,
+    boot_config: Config,
+    file_toml: Option<&str>,
+    env: &std::collections::HashMap<String, String>,
+    overrides: &ConfigOverrides,
     reach_mode: ReachMode,
     reach_source: &str,
     output_mode: &OutputMode,
-) -> Result<BootProbeResult, BootstrapErr> {
-    let probe_mode = if config.output.format == OutputFormat::Json {
+) -> Result<(Config, BootProbeResult), BootstrapErr> {
+    let probe_mode = if boot_config.output.format == OutputFormat::Json {
         ProbeMode::Json
     } else if !std::io::stderr().is_terminal() {
         ProbeMode::NonTty
@@ -414,22 +428,26 @@ async fn run_boot_probe(
     };
 
     let steps = standard_steps_with_grpc(
-        &config.cluster.namespace,
-        &config.bootstrap.timeouts,
-        config.cluster.grpc_address.as_deref(),
+        &boot_config.cluster.namespace,
+        &boot_config.bootstrap.timeouts,
+        boot_config.cluster.grpc_address.as_deref(),
     );
     let probe_state = ProbeState::new(steps, reach_mode.as_str(), reach_source)
         .with_deployment_type(
-            config.cluster.deployment_type.map(|d| d.label().to_string()),
-            config.cluster.deployment_type_source.label(),
+            boot_config
+                .cluster
+                .deployment_type
+                .map(|d| d.label().to_string()),
+            boot_config.cluster.deployment_type_source.label(),
         )
-        .with_warnings(config.override_conflict_warnings());
+        .with_warnings(boot_config.override_conflict_warnings());
     let mut probe = BootProbe::new(probe_state, probe_mode, Box::new(StderrSink));
     probe.start_ticking();
     let tracker = probe.tracker();
 
-    let ns = config.cluster.namespace.clone();
-    let timeouts = config.bootstrap.timeouts;
+    let initial_ns = boot_config.cluster.namespace.clone();
+    let timeouts = boot_config.bootstrap.timeouts;
+    let user_resolved_dt = boot_config.cluster.deployment_type;
 
     // ---------- Connecting (sequential gate) ----------
 
@@ -437,7 +455,7 @@ async fn run_boot_probe(
     tracker.started(StepId::LoadKubeconfig).await;
     let t = Instant::now();
     let kube_result = nico_common::k8s::KubeRsK8sClient::try_new(
-        config.cluster.context.as_deref(),
+        boot_config.cluster.context.as_deref(),
         timeouts.kube_client,
     )
     .await;
@@ -462,7 +480,7 @@ async fn run_boot_probe(
                         elapsed,
                         message: e.to_string(),
                         timed_out,
-                        next_command: next_command_for(StepId::LoadKubeconfig, &ns),
+                        next_command: next_command_for(StepId::LoadKubeconfig, &initial_ns),
                     },
                 )
                 .await;
@@ -470,8 +488,8 @@ async fn run_boot_probe(
             tracker
                 .skip_remaining(&[
                     StepId::ReachApiServer,
-                    StepId::Credentials,
                     StepId::DetectDeploymentType,
+                    StepId::Credentials,
                     StepId::NamespaceExists,
                     StepId::Rbac,
                     StepId::PortForwardWorkflows,
@@ -483,15 +501,21 @@ async fn run_boot_probe(
                 .await;
             // Graceful degradation — probe completes (with the failed
             // kubeconfig step rendered), bootstrap continues without
-            // a client.
-            let _ = probe.finish_failure(&ns).await;
-            return Ok(BootProbeResult {
-                k8s_client: None,
-                reach_mgr: None,
-                temporal_address: config.temporal.address.clone(),
-                postgres_url: config.postgres.url.clone(),
-                pf_guards: vec![],
-            });
+            // a client. Pre-detection boot config is the final config
+            // because no reach to the cluster means no detection result.
+            let _ = probe.finish_failure(&initial_ns).await;
+            let temporal_address = boot_config.temporal.address.clone();
+            let postgres_url = boot_config.postgres.url.clone();
+            return Ok((
+                boot_config,
+                BootProbeResult {
+                    k8s_client: None,
+                    reach_mgr: None,
+                    temporal_address,
+                    postgres_url,
+                    pf_guards: vec![],
+                },
+            ));
         }
     };
 
@@ -522,14 +546,14 @@ async fn run_boot_probe(
                     elapsed,
                     message: e.to_string(),
                     timed_out,
-                    next_command: next_command_for(StepId::ReachApiServer, &ns),
+                    next_command: next_command_for(StepId::ReachApiServer, &initial_ns),
                 },
             )
             .await;
         tracker
             .skip_remaining(&[
-                StepId::Credentials,
                 StepId::DetectDeploymentType,
+                StepId::Credentials,
                 StepId::NamespaceExists,
                 StepId::Rbac,
                 StepId::PortForwardWorkflows,
@@ -539,7 +563,7 @@ async fn run_boot_probe(
                 StepId::DetectInfinibandPresent,
             ])
             .await;
-        return Err(probe_to_preflight_err(probe, config).await);
+        return Err(probe_to_preflight_err(probe, &boot_config).await);
     }
     tracker
         .finished(
@@ -548,10 +572,99 @@ async fn run_boot_probe(
         )
         .await;
 
+    // 3. DetectDeploymentType — sequential gate (auto mode only).
+    //    PRD-001 slice 9 (#321): runs before the full Config materializes
+    //    so the resolved type can slot into the bundle layer of
+    //    Config::load and validating's labels reflect the post-detection
+    //    namespace / gRPC address.
+    let shape_probe = KubeClusterShapeProbe::new(raw.clone());
+    tracker.started(StepId::DetectDeploymentType).await;
+    let t = Instant::now();
+    let detect_result = nico_common::bootstrap::run_with_budget(
+        timeouts.preflight,
+        detect_deployment_type_step(user_resolved_dt, Some(&shape_probe)),
+    )
+    .await;
+    let detected_dt = match detect_result {
+        Ok(opt) => {
+            tracker
+                .finished(
+                    StepId::DetectDeploymentType,
+                    StepState::Passed { elapsed: t.elapsed() },
+                )
+                .await;
+            opt
+        }
+        Err(e) => {
+            let elapsed = t.elapsed();
+            let timed_out = e.is_timed_out();
+            tracker
+                .finished(
+                    StepId::DetectDeploymentType,
+                    StepState::Failed {
+                        elapsed,
+                        message: e.to_string(),
+                        timed_out,
+                        next_command: next_command_for(StepId::DetectDeploymentType, &initial_ns),
+                    },
+                )
+                .await;
+            tracker
+                .skip_remaining(&[
+                    StepId::Credentials,
+                    StepId::NamespaceExists,
+                    StepId::Rbac,
+                    StepId::PortForwardWorkflows,
+                    StepId::PortForwardGrpc,
+                    StepId::PortForwardPostgres,
+                    StepId::ReachPostgres,
+                    StepId::DetectInfinibandPresent,
+                ])
+                .await;
+            return Err(probe_to_preflight_err(probe, &boot_config).await);
+        }
+    };
+
+    // Re-load Config with the detected type slotted into the bundle
+    // layer. When user_resolved_dt was already Some(_), detected_dt is
+    // None and the final config equals boot_config; the re-load is a
+    // cheap idempotent rebuild rather than a special case.
+    let config = Config::load(file_toml, env, overrides, detected_dt).map_err(|e| {
+        BootstrapErr::Fatal {
+            message: format!("error re-loading config after detection: {e}"),
+            code: 1,
+        }
+    })?;
+
+    // Update probe metadata to reflect post-detection resolution. In
+    // flag/config/force runs these are no-op writes (same values); in
+    // auto runs they snap labels to the resolved namespace and gRPC.
+    tracker
+        .set_label(
+            StepId::NamespaceExists,
+            format!("namespace '{}' exists", config.cluster.namespace),
+        )
+        .await;
+    let grpc_label = match config.cluster.grpc_address.as_deref() {
+        Some(addr) => format!("port-forward: grpc → {addr}"),
+        None => "port-forward: grpc".to_string(),
+    };
+    tracker.set_label(StepId::PortForwardGrpc, grpc_label).await;
+    tracker
+        .set_deployment_type(
+            config.cluster.deployment_type.map(|d| d.label().to_string()),
+            config.cluster.deployment_type_source.label(),
+        )
+        .await;
+    tracker
+        .set_warnings(config.override_conflict_warnings())
+        .await;
+
+    let ns = config.cluster.namespace.clone();
+
     // ---------- Validating + Serving in parallel ----------
 
     let pf = preflight::KubePreflightClient::new(raw.clone());
-    let shape_probe = KubeClusterShapeProbe::new(raw.clone());
     let reach_mgr = ReachManager::new(
         reach_mode,
         raw.clone(),
@@ -560,18 +673,11 @@ async fn run_boot_probe(
     );
 
     let (validating_ok, serving_results) = tokio::join!(
-        run_validating_section(
-            &tracker,
-            &pf,
-            &shape_probe,
-            &ns,
-            timeouts.preflight,
-            config.cluster.deployment_type,
-        ),
+        run_validating_section(&tracker, &pf, &ns, timeouts.preflight),
         run_serving_section(
             &tracker,
             &reach_mgr,
-            config,
+            &config,
             timeouts.port_forward,
             timeouts.postgres_reach,
             timeouts.preflight,
@@ -579,11 +685,8 @@ async fn run_boot_probe(
     );
 
     if !validating_ok {
-        // Mark serving steps that may have started or are still pending as
-        // appropriate; serving may have run concurrently — we leave its
-        // state as-is (each step recorded its own outcome). Validating
-        // failure is fatal regardless.
-        return Err(probe_to_preflight_err(probe, config).await);
+        // Validating failure is fatal regardless of serving outcome.
+        return Err(probe_to_preflight_err(probe, &config).await);
     }
 
     let (temporal_address, postgres_url, pf_guards) = serving_results;
@@ -597,13 +700,18 @@ async fn run_boot_probe(
         probe.finish_success(&ns).await
     };
 
-    Ok(BootProbeResult {
-        k8s_client: Some(Arc::new(kube_client.unwrap()) as Arc<dyn nico_common::k8s::K8sClient>),
-        reach_mgr: Some(reach_mgr),
-        temporal_address,
-        postgres_url,
-        pf_guards,
-    })
+    Ok((
+        config,
+        BootProbeResult {
+            k8s_client: Some(
+                Arc::new(kube_client.unwrap()) as Arc<dyn nico_common::k8s::K8sClient>,
+            ),
+            reach_mgr: Some(reach_mgr),
+            temporal_address,
+            postgres_url,
+            pf_guards,
+        },
+    ))
 }
 
 async fn probe_state_any_failed(probe: &BootProbe) -> bool {
@@ -619,10 +727,8 @@ async fn probe_state_any_failed(probe: &BootProbe) -> bool {
 async fn run_validating_section(
     tracker: &nico_common::boot_probe::Tracker,
     pf: &preflight::KubePreflightClient,
-    shape_probe: &dyn ClusterShapeProbe,
     ns: &str,
     budget: Duration,
-    deployment_type: Option<DeploymentType>,
 ) -> bool {
     let cred_fut = run_step(
         tracker,
@@ -630,13 +736,6 @@ async fn run_validating_section(
         ns,
         budget,
         async { pf.check_token_valid().await },
-    );
-    let detect_fut = run_step(
-        tracker,
-        StepId::DetectDeploymentType,
-        ns,
-        budget,
-        async move { detect_deployment_type_step(deployment_type, Some(shape_probe)).await },
     );
     let ns_fut = run_step(
         tracker,
@@ -652,32 +751,31 @@ async fn run_validating_section(
         budget,
         async { pf.check_rbac(ns).await },
     );
-    let (cred_ok, detect_ok, ns_ok, rbac_ok) =
-        tokio::join!(cred_fut, detect_fut, ns_fut, rbac_fut);
-    cred_ok && detect_ok && ns_ok && rbac_ok
+    let (cred_ok, ns_ok, rbac_ok) = tokio::join!(cred_fut, ns_fut, rbac_fut);
+    cred_ok && ns_ok && rbac_ok
 }
 
-/// Behavior of the `detect_deployment_type` step:
+/// Behavior of the `detect_deployment_type` step (PRD-001 slice 9):
 ///
 /// - `Some(_)` (resolved from CLI / env / file, including `Force`) →
-///   pass instantly; detection is skipped per PRD-001's hybrid trust
-///   model.
+///   instant-pass with `Ok(None)`; detection is skipped per PRD-001's
+///   hybrid trust model. The caller already has the resolved type, so
+///   the detection result has nothing to add.
 /// - `None` (auto) + a shape probe is wired → run the full detection
-///   ladder (workload → namespace → CRD). Pass on first match; fail
-///   on no-match with a diagnostic listing observed namespaces,
-///   services, and CRDs.
+///   ladder (workload → namespace → CRD). On first match, return
+///   `Ok(Some(matched))` so the caller can re-load `Config` with the
+///   detected type slotted into the bundle layer of the precedence
+///   chain. On no-match, return `Err` with a diagnostic listing
+///   observed namespaces, services, and CRDs.
 /// - `None` + no shape probe → preserve the slice-1 fallback so
 ///   non-cluster code paths (tests, degraded boot) still surface a
 ///   clear "no detection signals" error.
-///
-/// The matched type is intentionally *not* wired back into config —
-/// capability re-pointing lands in slice 5 (#282).
 async fn detect_deployment_type_step(
-    deployment_type: Option<DeploymentType>,
+    user_resolved: Option<DeploymentType>,
     shape_probe: Option<&dyn ClusterShapeProbe>,
-) -> anyhow::Result<()> {
-    if deployment_type.is_some() {
-        return Ok(());
+) -> anyhow::Result<Option<DeploymentType>> {
+    if user_resolved.is_some() {
+        return Ok(None);
     }
     let Some(probe) = shape_probe else {
         return Err(anyhow::anyhow!(
@@ -685,8 +783,8 @@ async fn detect_deployment_type_step(
         ));
     };
     let outcome = run_detection_ladder(probe).await?;
-    if outcome.matched.is_some() {
-        return Ok(());
+    if let Some(dt) = outcome.matched {
+        return Ok(Some(dt));
     }
     let fmt_list = |xs: &[String]| -> String {
         if xs.is_empty() {
@@ -1167,17 +1265,30 @@ mod tests {
 
     #[tokio::test]
     async fn detect_step_passes_when_explicit_deployment_type_provided() {
+        // PRD-001 slice 9 (#321): when the user pinned a type via
+        // CLI/env/file, detection has nothing to add — the step returns
+        // Ok(None) without consulting the cluster.
         for dt in [
             DeploymentType::Full,
             DeploymentType::CoreOnly,
             DeploymentType::RestOnlyMock,
             DeploymentType::Force,
         ] {
-            assert!(
-                detect_deployment_type_step(Some(dt), None).await.is_ok(),
-                "expected pass for {dt:?}"
-            );
+            let res = detect_deployment_type_step(Some(dt), None).await;
+            assert!(matches!(res, Ok(None)), "expected Ok(None) for {dt:?}, got {res:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn detect_step_returns_matched_type_in_auto_mode() {
+        // PRD-001 slice 9 (#321): the auto path returns the matched
+        // type so the caller can re-load Config with it slotted into
+        // the bundle layer.
+        use nico_common::deployment_detect::testing::MockClusterShapeProbe;
+        let probe = MockClusterShapeProbe::new()
+            .with_service("nico-rest", "nico-rest-mock-core");
+        let res = detect_deployment_type_step(None, Some(&probe)).await;
+        assert_eq!(res.unwrap(), Some(DeploymentType::RestOnlyMock));
     }
 
     #[tokio::test]

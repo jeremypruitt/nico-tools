@@ -326,7 +326,7 @@ fn load_minimal_config(args: &CorrelateArgs) -> Result<Config, String> {
     };
 
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    Config::load(file_toml.as_deref(), &env, &overrides)
+    Config::load(file_toml.as_deref(), &env, &overrides, None)
         .map_err(|e| format!("error loading config: {e}"))
 }
 

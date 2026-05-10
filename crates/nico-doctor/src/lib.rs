@@ -650,7 +650,7 @@ pub fn load_minimal_config(args: &DoctorArgs) -> Result<Config, String> {
     let overrides = doctor_args_to_overrides(args);
 
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    Config::load(file_toml.as_deref(), &env, &overrides)
+    Config::load(file_toml.as_deref(), &env, &overrides, None)
         .map_err(|e| format!("error loading config: {e}"))
 }
 
@@ -709,7 +709,7 @@ mod tests {
         for label in ["full", "core-only", "rest-only-mock", "force"] {
             let args = args_with_deployment_type(Some(label));
             let overrides = doctor_args_to_overrides(&args);
-            let cfg = Config::load(None, &HashMap::new(), &overrides)
+            let cfg = Config::load(None, &HashMap::new(), &overrides, None)
                 .expect("load with synthetic args should not fail");
             assert_eq!(
                 cfg.cluster.deployment_type,
@@ -723,7 +723,7 @@ mod tests {
     fn load_minimal_config_auto_flag_round_trips_to_unresolved() {
         let args = args_with_deployment_type(Some("auto"));
         let overrides = doctor_args_to_overrides(&args);
-        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
         assert!(cfg.cluster.deployment_type.is_none());
     }
 
@@ -731,7 +731,7 @@ mod tests {
     fn load_minimal_config_no_flag_leaves_deployment_type_unresolved() {
         let args = args_with_deployment_type(None);
         let overrides = doctor_args_to_overrides(&args);
-        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
         assert!(cfg.cluster.deployment_type.is_none());
     }
 }
