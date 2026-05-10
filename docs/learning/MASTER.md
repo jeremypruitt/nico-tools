@@ -20,7 +20,7 @@ It is a syllabus, a manifest, and a workflow guide in one file. It does **not** 
 
 **Starting a topic.** Open Claude Code in this repo and say:
 
-> Read `docs/learning/MASTER.md`, then start topic `01-hbn`. Use the prompt template in the Workflow section. The NICo repos are at `../ncx-infra-controller-core` and `../ncx-infra-controller-rest` (clone them as siblings if not present).
+> Read `docs/learning/MASTER.md`, then start topic `01-hbn`. Use the prompt template in the Workflow section. The NICo repos are at `../infra-controller-core` and `../infra-controller-rest` (clone them as siblings if not present).
 
 Claude Code reads the master, reads the topic’s scope from the manifest, clones/reads the NICo repos, and produces `docs/learning/topics/01-hbn.md` plus any kata, diagrams, or CLI feature stubs.
 
@@ -47,9 +47,10 @@ Topic for this conversation: [NN-slug, e.g. 01-hbn]
 Topic file (create if absent): docs/learning/topics/[NN-slug].md
 
 Sources of truth:
-- ../ncx-infra-controller-core (NVIDIA/ncx-infra-controller-core, Rust + gRPC)
-- ../ncx-infra-controller-rest (NVIDIA/ncx-infra-controller-rest, REST/Go)
-- NICo book: ncx-infra-controller-core/book/src/
+- ../infra-controller-core (NVIDIA/infra-controller-core, Rust + gRPC)
+- ../infra-controller-rest (NVIDIA/infra-controller-rest, REST/Go)
+- NICo docs: ../infra-controller-core/docs/ (architecture, components, dpu-operations, ...)
+- This repo's CONTEXT.md, docs/prds/, docs/adrs/ — for the doctor/correlate side of the world (already-shipped vocabulary and decisions)
 - NVIDIA NCP Software Reference Guide (web, when needed)
 
 My background: 17 years at Juniper in roles other than network engineering;
