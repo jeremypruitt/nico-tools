@@ -130,9 +130,9 @@ mod tests {
     async fn alert_runs_as_fail_layer() {
         let mut snap = snap_healthy();
         snap.alerts = vec![AgentAlert {
-            id: "IbPortDown".into(),
-            target: None,
-            message: "2 of 8 ports down".into(),
+            id: "HeartbeatTimeout".into(),
+            target: Some("dpu-42".into()),
+            message: "no health report received".into(),
             in_alert_since: None,
         }];
         let layer = DpuHealthLayer::new(StubClient::ok(Some(snap)), "dpu-42");

@@ -104,12 +104,15 @@ pub struct SqlxIbClient {
 }
 
 /// SQL columns the per-DPU snapshot reads. Extracted as constants so
-/// the schema choice is pinned by a unit test.
+/// the schema choice is pinned by a unit test. `dpu_agent_health_report`
+/// supplies the IB-typed alerts the layer carved out of `dpu_health` in
+/// PRD-004 slice 3.
 pub(crate) const FETCH_SNAPSHOT_COLS: &str = "\
     m.id, \
     (m.infiniband_status_observation->>'observed_at')::timestamptz, \
     (m.infiniband_status_observation->>'ufm_observable')::boolean, \
-    m.infiniband_status_observation->'ports'";
+    m.infiniband_status_observation->'ports', \
+    m.dpu_agent_health_report";
 
 pub(crate) const FETCH_SNAPSHOT_FROM: &str = "FROM machines m";
 
@@ -150,13 +153,14 @@ impl IbClient for SqlxIbClient {
             Option<DateTime<Utc>>,
             Option<bool>,
             Option<serde_json::Value>,
+            Option<serde_json::Value>,
         )> = sqlx::query_as(&sql)
             .bind(dpu_id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| anyhow::anyhow!("infiniband snapshot query failed: {e}"))?;
 
-        let Some((id, observed_at, ufm_observable, ports_blob)) = row else {
+        let Some((id, observed_at, ufm_observable, ports_blob, health_report)) = row else {
             return Ok(None);
         };
 
@@ -165,7 +169,7 @@ impl IbClient for SqlxIbClient {
             observed_at,
             ufm_observable,
             ports: parse_ports(ports_blob.as_ref()),
-            ib_alerts: Vec::new(),
+            ib_alerts: parse_ib_alerts(health_report.as_ref()),
         }))
     }
 }
@@ -211,6 +215,58 @@ pub fn parse_ports(blob: Option<&serde_json::Value>) -> Vec<IbPort> {
         .collect()
 }
 
+/// Extract IB-typed [`IbAlert`]s from the raw `dpu_agent_health_report`
+/// JSON. Tolerates the column being NULL or having no `alerts` array.
+/// Keeps only entries whose `id` starts with `Ib` — symmetric with the
+/// `dpu_health` carve-out (which drops the same prefix). Together the
+/// two layers partition the health-report alert stream so each alert
+/// surfaces in exactly one drill-down.
+pub fn parse_ib_alerts(blob: Option<&serde_json::Value>) -> Vec<IbAlert> {
+    let Some(v) = blob else { return Vec::new() };
+    let Some(arr) = v.get("alerts").and_then(|a| a.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?.to_owned();
+            if !id.starts_with("Ib") {
+                return None;
+            }
+            let target = entry
+                .get("target")
+                .and_then(|t| t.as_str())
+                .map(str::to_owned);
+            let message = entry
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let in_alert_since = entry.get("in_alert_since").and_then(parse_in_alert_since);
+            Some(IbAlert {
+                id,
+                target,
+                message,
+                in_alert_since,
+            })
+        })
+        .collect()
+}
+
+fn parse_in_alert_since(v: &serde_json::Value) -> Option<DateTime<Utc>> {
+    if v.is_null() {
+        return None;
+    }
+    if let Some(s) = v.as_str() {
+        return DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.with_timezone(&Utc));
+    }
+    if let Some(n) = v.as_i64() {
+        return DateTime::<Utc>::from_timestamp(n, 0);
+    }
+    None
+}
+
 /// Render the IB axis as a headline `Check` (sourced from
 /// [`ib_verdict`]) followed by IB-specific detail rows: per-port rows
 /// (full GUID, fabric_id, lid, port_state) and a freshness detail when
@@ -230,6 +286,10 @@ pub fn assemble_checks(
 
     for port in &snapshot.ports {
         checks.push(port_detail(port));
+    }
+
+    for alert in &snapshot.ib_alerts {
+        checks.push(ib_alert_detail(alert));
     }
 
     if let Some(observed_at) = snapshot.observed_at {
@@ -258,6 +318,29 @@ pub fn assemble_checks(
     }
 
     checks
+}
+
+fn ib_alert_detail(alert: &IbAlert) -> Check {
+    let target = alert
+        .target
+        .as_deref()
+        .map(|t| format!("[{t}] "))
+        .unwrap_or_default();
+    let message = if alert.message.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", alert.message)
+    };
+    Check {
+        name: "ib_alert",
+        status: Status::Warn,
+        value: format!("{target}{}{message}", alert.id),
+        next_command: Some(format!(
+            "nico correlate {} # trace this alert",
+            alert.target.as_deref().unwrap_or(alert.id.as_str())
+        )),
+        kind: CheckKind::Detail,
+    }
 }
 
 fn port_detail(port: &IbPort) -> Check {
@@ -449,6 +532,61 @@ mod tests {
     }
 
     #[test]
+    fn assemble_checks_surfaces_ib_alerts_as_warn_detail_rows() {
+        // PRD-004 slice 3 carve-out: Ib* alerts moved out of dpu_health.
+        // The infiniband layer surfaces each one as a detail row carrying
+        // the probe id + target + message, with status Warn (matching
+        // ib_verdict's Warn precedence path).
+        let mut snap = snap_with_one_active_port();
+        snap.ib_alerts = vec![
+            IbAlert {
+                id: "IbPortDown".into(),
+                message: "port 1 down".into(),
+                target: Some("fe80::1".into()),
+                in_alert_since: None,
+            },
+            IbAlert {
+                id: "IbCleanupPending".into(),
+                message: "cleanup queue".into(),
+                target: None,
+                in_alert_since: None,
+            },
+        ];
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_OBSERVATION_STALE_THRESHOLD);
+
+        let alert_details: Vec<&Check> = checks
+            .iter()
+            .filter(|c| c.name == "ib_alert")
+            .collect();
+        assert_eq!(alert_details.len(), 2, "one detail per IB alert");
+
+        for d in &alert_details {
+            assert_eq!(d.kind, CheckKind::Detail);
+            assert_eq!(d.status, Status::Warn);
+        }
+        assert!(
+            alert_details
+                .iter()
+                .any(|d| d.value.contains("IbPortDown") && d.value.contains("port 1 down")),
+            "alert detail values: {:?}",
+            alert_details.iter().map(|d| &d.value).collect::<Vec<_>>(),
+        );
+        assert!(
+            alert_details
+                .iter()
+                .any(|d| d.value.contains("IbCleanupPending")),
+            "alert detail values: {:?}",
+            alert_details.iter().map(|d| &d.value).collect::<Vec<_>>(),
+        );
+
+        let headline = checks
+            .iter()
+            .find(|c| c.kind == CheckKind::Headline)
+            .unwrap();
+        assert_eq!(headline.status, Status::Warn);
+    }
+
+    #[test]
     fn assemble_checks_emits_freshness_detail_when_observation_stale() {
         let now = Utc::now();
         let mut snap = snap_with_one_active_port();
@@ -517,5 +655,76 @@ mod tests {
         assert!(FETCH_SNAPSHOT_COLS.contains("ufm_observable"));
         assert!(FETCH_SNAPSHOT_COLS.contains("'ports'"));
         assert_eq!(FETCH_SNAPSHOT_FROM, "FROM machines m");
+    }
+
+    #[test]
+    fn fetch_snapshot_cols_pins_dpu_agent_health_report_for_ib_alerts() {
+        // PRD-004 slice 3 carve-out: infiniband layer reads
+        // dpu_agent_health_report so it can surface Ib* alerts that
+        // dpu_health no longer renders.
+        assert!(
+            FETCH_SNAPSHOT_COLS.contains("dpu_agent_health_report"),
+            "must read dpu_agent_health_report JSON: {FETCH_SNAPSHOT_COLS}",
+        );
+    }
+
+    // ── parse_ib_alerts ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ib_alerts_returns_empty_when_blob_absent() {
+        assert!(parse_ib_alerts(None).is_empty());
+    }
+
+    #[test]
+    fn parse_ib_alerts_returns_empty_when_alerts_array_missing() {
+        let blob = json!({"source": "forge-dpu-agent"});
+        assert!(parse_ib_alerts(Some(&blob)).is_empty());
+    }
+
+    #[test]
+    fn parse_ib_alerts_keeps_only_ib_prefixed_probe_ids() {
+        // Symmetric carve-out: parse_alerts in dpu_health drops Ib*;
+        // here we keep ONLY Ib*. Together the two layers partition the
+        // health-report alert stream.
+        let blob = json!({
+            "alerts": [
+                {"id": "IbPortDown", "target": "fe80::1", "message": "down"},
+                {"id": "IbCleanupPending", "target": null, "message": "queue"},
+                {"id": "HeartbeatTimeout", "target": "dpu-42", "message": "no report"},
+                {"id": "BgpPeerDown", "target": "peer1", "message": "peer"},
+                {"id": "NetworkConfigError", "target": null, "message": "apply"}
+            ]
+        });
+        let out = parse_ib_alerts(Some(&blob));
+        assert_eq!(out.len(), 2);
+        let ids: Vec<&str> = out.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"IbPortDown"));
+        assert!(ids.contains(&"IbCleanupPending"));
+        assert!(!ids.contains(&"HeartbeatTimeout"));
+        assert!(!ids.contains(&"BgpPeerDown"));
+        assert!(!ids.contains(&"NetworkConfigError"));
+    }
+
+    #[test]
+    fn parse_ib_alerts_extracts_id_target_message() {
+        let blob = json!({
+            "alerts": [
+                {
+                    "id": "IbPortDown",
+                    "target": "fe80::1",
+                    "message": "port 1 down",
+                    "in_alert_since": "2024-01-15T12:34:56Z"
+                }
+            ]
+        });
+        let out = parse_ib_alerts(Some(&blob));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "IbPortDown");
+        assert_eq!(out[0].target.as_deref(), Some("fe80::1"));
+        assert_eq!(out[0].message, "port 1 down");
+        assert_eq!(
+            out[0].in_alert_since,
+            Some("2024-01-15T12:34:56Z".parse().unwrap()),
+        );
     }
 }
