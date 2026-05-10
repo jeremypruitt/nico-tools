@@ -11,6 +11,14 @@
 //! Pure `assemble_checks` over a small [`ServicesSnapshot`]; the
 //! [`DpuServicesClient`] trait is the seam over forgedb. Tests inject
 //! mocks.
+//!
+//! Since PRD-003 Slice 4 (#308) the rolled-up `(Status, message)` lives
+//! in the shared [`crate::verdicts::services_verdict`] primitive
+//! (returning an [`crate::verdicts::AxisSummary`] that downstream
+//! holistic rollups consume); [`assemble_checks`] here is the per-layer
+//! renderer that turns that summary into a headline `Check` plus
+//! one detail row per extension service. The [`DpuServicesClient`] trait
+//! remains the I/O seam.
 
 use std::time::Duration;
 use anyhow::Result;
@@ -19,6 +27,7 @@ use chrono::{DateTime, Utc};
 use nico_common::output::Status;
 
 use crate::layer::{Check, CheckKind};
+use crate::verdicts::{services_verdict, AxisSummary};
 
 /// Default staleness threshold for the extension-service observation.
 /// 5m is comfortably longer than the controller's normal observation
@@ -193,17 +202,16 @@ fn classify_state(state: &str) -> StateBucket {
     }
 }
 
-/// Assemble the per-DPU `dpu_services` check list from a snapshot.
+/// Render the `dpu_services` axis as a headline `Check` (sourced from
+/// [`services_verdict`]) followed by services-specific detail rows:
+/// the stale-observation warning when applicable, plus exactly one
+/// detail row per extension service (sorted by `service_name`). The
+/// per-service rows preserve the inventory the layer used to surface;
+/// the rollup layers (PRD-003 slices 5 + 6) consume only the headline.
 ///
-/// Headline summarises the worst-of across staleness and per-service
-/// state. Detail bullets are emitted in this order:
-///
-/// 1. Stale-observation warning (when `observed_at` is older than
-///    `stale_threshold`).
-/// 2. One detail per service, sorted by service_name. Bucket maps to
-///    Status: Bad → Warn, Transient (only if stale) → Warn, Lifecycle
-///    → Ok (info-only), Healthy → no detail emitted, removed → Ok
-///    (info-only with reason).
+/// Detail ordering — issue #308 acceptance criteria: headline first
+/// (`kind: "headline"`), then `observation_stale` (when applicable),
+/// then per-service detail rows sorted by `service_name`.
 ///
 /// Pure — no I/O, no clock reads (caller supplies `now`).
 pub fn assemble_checks(
@@ -211,7 +219,8 @@ pub fn assemble_checks(
     now: DateTime<Utc>,
     stale_threshold: Duration,
 ) -> Vec<Check> {
-    let mut details: Vec<Check> = Vec::new();
+    let summary = services_verdict(snapshot, now, stale_threshold);
+    let mut checks = vec![headline_from(&summary)];
 
     let observation_is_stale = match snapshot.observed_at {
         Some(ts) => (now - ts).to_std().unwrap_or(Duration::ZERO) > stale_threshold,
@@ -222,7 +231,7 @@ pub fn assemble_checks(
         && observation_is_stale
     {
         let age = (now - ts).to_std().unwrap_or(Duration::ZERO);
-        details.push(Check {
+        checks.push(Check {
             name: "observation_stale",
             status: Status::Warn,
             value: format!(
@@ -242,29 +251,61 @@ pub fn assemble_checks(
     sorted.sort_by(|a, b| a.service_name.cmp(&b.service_name));
 
     for svc in sorted {
-        if let Some(reason) = svc.removed.as_deref() {
-            details.push(removed_check(svc, reason));
-            continue;
-        }
-        match classify_state(&svc.overall_state) {
-            StateBucket::Healthy => {}
-            StateBucket::Lifecycle => details.push(lifecycle_check(svc)),
-            StateBucket::Transient => {
-                if observation_is_stale {
-                    details.push(non_running_check(svc, Status::Warn));
-                }
-            }
-            StateBucket::Bad => details.push(non_running_check(svc, Status::Warn)),
-        }
+        checks.push(service_detail(svc, observation_is_stale));
     }
 
-    let aggregate = aggregate_status(&details);
-    let headline = headline_check(snapshot, aggregate, &details);
+    checks
+}
 
-    let mut out = Vec::with_capacity(details.len() + 1);
-    out.push(headline);
-    out.extend(details);
-    out
+fn headline_from(summary: &AxisSummary) -> Check {
+    Check {
+        name: summary.axis,
+        status: summary.status.clone(),
+        value: summary.message.clone(),
+        next_command: summary.next_command.clone(),
+        kind: CheckKind::Headline,
+    }
+}
+
+fn service_detail(svc: &ServiceStatus, observation_is_stale: bool) -> Check {
+    if let Some(reason) = svc.removed.as_deref() {
+        return removed_check(svc, reason);
+    }
+    match classify_state(&svc.overall_state) {
+        StateBucket::Healthy => running_check(svc),
+        StateBucket::Lifecycle => lifecycle_check(svc),
+        StateBucket::Transient => {
+            if observation_is_stale {
+                non_running_check(svc, Status::Warn)
+            } else {
+                transient_check(svc)
+            }
+        }
+        StateBucket::Bad => non_running_check(svc, Status::Warn),
+    }
+}
+
+fn running_check(svc: &ServiceStatus) -> Check {
+    Check {
+        name: "service_state",
+        status: Status::Ok,
+        value: format!("{} v{} Running", svc.service_name, svc.version),
+        next_command: None,
+        kind: CheckKind::Detail,
+    }
+}
+
+fn transient_check(svc: &ServiceStatus) -> Check {
+    Check {
+        name: "service_state",
+        status: Status::Ok,
+        value: format!(
+            "{} v{} {} (transient)",
+            svc.service_name, svc.version, svc.overall_state
+        ),
+        next_command: None,
+        kind: CheckKind::Detail,
+    }
 }
 
 /// "No machines row for this DPU" headline — single Unknown line.
@@ -332,45 +373,6 @@ fn removed_check(svc: &ServiceStatus, reason: &str) -> Check {
         value: format!("{} v{} removed: {reason}", svc.service_name, svc.version),
         next_command: None,
         kind: CheckKind::Detail,
-    }
-}
-
-fn aggregate_status(checks: &[Check]) -> Status {
-    if checks.iter().any(|c| c.status == Status::Fail) {
-        Status::Fail
-    } else if checks.iter().any(|c| c.status == Status::Warn) {
-        Status::Warn
-    } else if checks.iter().any(|c| c.status == Status::Unknown) {
-        Status::Unknown
-    } else {
-        Status::Ok
-    }
-}
-
-fn headline_check(snapshot: &ServicesSnapshot, aggregate: Status, details: &[Check]) -> Check {
-    let value = match aggregate {
-        Status::Ok => format!(
-            "dpu {} services healthy ({} reported)",
-            snapshot.dpu_id,
-            snapshot.services.len()
-        ),
-        Status::Skipped => format!("dpu {} services skipped", snapshot.dpu_id),
-        Status::Unknown => format!("dpu {} services unknown", snapshot.dpu_id),
-        Status::Warn | Status::Fail => {
-            let bad: Vec<&str> = details
-                .iter()
-                .filter(|c| matches!(c.status, Status::Warn | Status::Fail))
-                .map(|c| c.name)
-                .collect();
-            format!("dpu {} services issues: {}", snapshot.dpu_id, bad.join(", "))
-        }
-    };
-    Check {
-        name: "dpu_services",
-        status: aggregate,
-        value,
-        next_command: None,
-        kind: CheckKind::Headline,
     }
 }
 
@@ -491,17 +493,27 @@ mod tests {
         assert_eq!(checks[0].kind, CheckKind::Headline);
         assert_eq!(checks[0].status, Status::Ok);
         assert!(checks[0].value.contains("dpu-42"));
-        assert!(checks[0].value.contains("healthy"));
+        assert!(checks[0].value.contains("services: ok"));
     }
 
     #[test]
-    fn all_running_services_yield_ok_headline_no_details() {
+    fn all_running_services_yield_ok_headline_plus_one_running_detail_per_service() {
         let mut snap = snap_empty();
         snap.services = vec![svc("doca-bfb", "Running"), svc("doca-telemetry", "Running")];
         let checks = assemble_checks(&snap, Utc::now(), DEFAULT_OBSERVATION_STALE_THRESHOLD);
-        assert_eq!(checks.len(), 1, "no details for healthy services");
+
+        // Headline + one detail per service (every service surfaced).
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].kind, CheckKind::Headline);
         assert_eq!(checks[0].status, Status::Ok);
-        assert!(checks[0].value.contains("2 reported"));
+        assert!(checks[0].value.contains("2/2 ready"));
+
+        let details: Vec<&Check> = checks
+            .iter()
+            .filter(|c| c.kind == CheckKind::Detail)
+            .collect();
+        assert_eq!(details.len(), 2);
+        assert!(details.iter().all(|d| d.status == Status::Ok));
     }
 
     // ── per-service state verdicts ────────────────────────────────────────
@@ -531,6 +543,8 @@ mod tests {
             .unwrap();
         assert_eq!(headline.status, Status::Warn);
         assert!(headline.value.contains("dpu-42"));
+        assert!(headline.value.contains("0/1 ready"));
+        assert!(headline.value.contains("1 degraded"));
     }
 
     #[test]
@@ -547,15 +561,21 @@ mod tests {
     }
 
     #[test]
-    fn pending_service_silent_when_observation_fresh() {
+    fn pending_service_emits_ok_transient_detail_when_observation_fresh() {
         let now = Utc::now();
         let mut snap = snap_empty();
         snap.observed_at = Some(now - chrono::Duration::seconds(30));
         snap.services = vec![svc("doca-x", "Pending")];
         let checks = assemble_checks(&snap, now, DEFAULT_OBSERVATION_STALE_THRESHOLD);
-        // Pending + fresh observation ⇒ silent (transient)
-        assert_eq!(checks.len(), 1);
+        // Pending + fresh observation ⇒ Ok transient detail (informational).
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].kind, CheckKind::Headline);
         assert_eq!(checks[0].status, Status::Ok);
+        let detail = &checks[1];
+        assert_eq!(detail.kind, CheckKind::Detail);
+        assert_eq!(detail.status, Status::Ok);
+        assert!(detail.value.contains("Pending"));
+        assert!(detail.value.contains("transient"));
     }
 
     #[test]
@@ -617,6 +637,31 @@ mod tests {
             .find(|c| c.kind == CheckKind::Headline)
             .unwrap();
         assert_eq!(headline.status, Status::Ok);
+    }
+
+    // ── headline-first ordering, no detail dropped ────────────────────────
+
+    #[test]
+    fn headline_is_always_first_followed_by_per_service_details() {
+        let mut snap = snap_empty();
+        snap.services = vec![
+            svc("alpha", "Running"),
+            svc("beta", "Failed"),
+            svc("gamma", "Terminating"),
+        ];
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_OBSERVATION_STALE_THRESHOLD);
+        assert_eq!(checks[0].kind, CheckKind::Headline);
+        assert!(
+            checks[1..].iter().all(|c| c.kind == CheckKind::Detail),
+            "all post-headline checks must be Detail",
+        );
+
+        // Every service appears in the detail rows — no detail dropped.
+        let details: Vec<&Check> = checks
+            .iter()
+            .filter(|c| c.kind == CheckKind::Detail)
+            .collect();
+        assert_eq!(details.len(), 3);
     }
 
     // ── stale observation ─────────────────────────────────────────────────

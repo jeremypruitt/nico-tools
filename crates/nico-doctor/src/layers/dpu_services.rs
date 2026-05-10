@@ -121,7 +121,8 @@ mod tests {
         let result = layer.run(&RunOpts::default()).await;
         assert_eq!(result.name, "dpu_services");
         assert_eq!(result.status, Status::Ok);
-        assert!(result.checks[0].value.contains("healthy"));
+        // Headline now uses the shared verdict's "M/N ready" form.
+        assert!(result.checks[0].value.contains("1/1 ready"));
     }
 
     #[tokio::test]
