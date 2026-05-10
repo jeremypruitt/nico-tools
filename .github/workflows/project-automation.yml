@@ -10,10 +10,12 @@ on:
     types: [opened, labeled, closed, reopened]
   pull_request:
     types: [opened, ready_for_review, converted_to_draft, closed, reopened]
+  projects_v2_item:
+    types: [edited]
 
 permissions:
   contents: read
-  issues: read
+  issues: write
   pull-requests: read
 
 env:
@@ -24,9 +26,17 @@ env:
   STATUS_IN_PROGRESS: 7c242164
   STATUS_VALIDATING: f5779989
   STATUS_DONE: a8a3d908
+  SCORE_FIELD_ID: PVTF_lAHOAAE0oM4BXFC0zhSUczU
+  PRIORITY_FIELD_ID: PVTSSF_lAHOAAE0oM4BXFC0zhSUcyc
+  PRIORITY_OPT_CRIT: c3817455
+  PRIORITY_OPT_TOP: c34e5106
+  PRIORITY_OPT_HIGH: 695030ca
+  PRIORITY_OPT_MED: 8401f72b
+  PRIORITY_OPT_LOW: 77940e7e
 
 jobs:
   sync:
+    if: github.event_name != 'projects_v2_item'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.PROJECT_PAT }}
@@ -146,3 +156,117 @@ jobs:
 
             echo "synced $CID → $STATE"
           done
+
+  priority:
+    # Fires on Score field changes; derives band, sets Priority single-select +
+    # band label. Manual edits to Priority/label stick until Score changes again.
+    if: github.event_name == 'projects_v2_item' && github.event.action == 'edited'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+    steps:
+      - name: Filter to Score field changes
+        id: filter
+        env:
+          CHANGED_FIELD_ID: ${{ github.event.changes.field_value.field_node_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$CHANGED_FIELD_ID" != "$SCORE_FIELD_ID" ]]; then
+            echo "field-change is not Score (was $CHANGED_FIELD_ID); skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read item, derive band, propagate
+        if: steps.filter.outputs.skip == 'false'
+        env:
+          ITEM_NODE_ID: ${{ github.event.projects_v2_item.node_id }}
+        run: |
+          set -euo pipefail
+
+          # Read current Score value + linked issue (if content is an Issue).
+          PAYLOAD=$(gh api graphql \
+            -f query='query($id: ID!, $field: ID!) {
+              node(id: $id) {
+                ... on ProjectV2Item {
+                  content {
+                    __typename
+                    ... on Issue { number repository { nameWithOwner } }
+                  }
+                  fieldValueByName(name: "Score") {
+                    ... on ProjectV2ItemFieldNumberValue { number }
+                  }
+                }
+              }
+            }' \
+            -F id="$ITEM_NODE_ID" \
+            -F field="$SCORE_FIELD_ID")
+
+          TYPENAME=$(echo "$PAYLOAD" | jq -r '.data.node.content.__typename')
+          if [[ "$TYPENAME" != "Issue" ]]; then
+            echo "content is $TYPENAME (not Issue); skipping label propagation"
+            exit 0
+          fi
+
+          ISSUE_NUMBER=$(echo "$PAYLOAD" | jq -r '.data.node.content.number')
+          REPO=$(echo "$PAYLOAD" | jq -r '.data.node.content.repository.nameWithOwner')
+          SCORE=$(echo "$PAYLOAD" | jq -r '.data.node.fieldValueByName.number // empty')
+
+          # Score cleared → strip band label + clear Priority field.
+          if [[ -z "$SCORE" ]]; then
+            echo "Score cleared on #$ISSUE_NUMBER; removing band labels + Priority field"
+            for LABEL in crit top high med low; do
+              gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label "$LABEL" 2>/dev/null || true
+            done
+            gh api graphql \
+              -f query='mutation($project: ID!, $item: ID!, $field: ID!) {
+                clearProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field}) {
+                  projectV2Item { id }
+                }
+              }' \
+              -F project="$PROJECT_ID" \
+              -F item="$ITEM_NODE_ID" \
+              -F field="$PRIORITY_FIELD_ID" > /dev/null
+            exit 0
+          fi
+
+          # Clamp + derive band.
+          SCORE_INT=$(printf '%.0f' "$SCORE")
+          if (( SCORE_INT > 100 )); then SCORE_INT=100; fi
+          if (( SCORE_INT < 1 )); then SCORE_INT=1; fi
+
+          if   (( SCORE_INT >= 50 )); then BAND="crit"; OPT="$PRIORITY_OPT_CRIT"
+          elif (( SCORE_INT >= 25 )); then BAND="top";  OPT="$PRIORITY_OPT_TOP"
+          elif (( SCORE_INT >= 13 )); then BAND="high"; OPT="$PRIORITY_OPT_HIGH"
+          elif (( SCORE_INT >= 5  )); then BAND="med";  OPT="$PRIORITY_OPT_MED"
+          else                            BAND="low";  OPT="$PRIORITY_OPT_LOW"
+          fi
+
+          echo "Score=$SCORE_INT → band=$BAND on #$ISSUE_NUMBER"
+
+          # Update Priority single-select.
+          gh api graphql \
+            -f query='mutation($project: ID!, $item: ID!, $field: ID!, $value: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project,
+                itemId: $item,
+                fieldId: $field,
+                value: { singleSelectOptionId: $value }
+              }) {
+                projectV2Item { id }
+              }
+            }' \
+            -F project="$PROJECT_ID" \
+            -F item="$ITEM_NODE_ID" \
+            -F field="$PRIORITY_FIELD_ID" \
+            -F value="$OPT" > /dev/null
+
+          # Add the band label, remove the others.
+          REMOVE=""
+          for L in crit top high med low; do
+            if [[ "$L" != "$BAND" ]]; then
+              REMOVE+="${REMOVE:+,}$L"
+            fi
+          done
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "$BAND" --remove-label "$REMOVE"

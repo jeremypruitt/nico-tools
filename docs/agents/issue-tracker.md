@@ -53,6 +53,58 @@ gh label create adr-0014 --description "Touches ADR-0014 (<short title>)" --colo
 
 Conventional colors: `5319e7` (epic, purple), `1d76db` (prd-NNN, blue), `0e8a16` (adr-NNNN, green).
 
+A fourth family, the **priority bands** (`crit`/`top`/`high`/`med`/`low`), is described in §"Priority scoring" below — those labels are derived from the Score project field, never set by hand.
+
+## Priority scoring
+
+Every issue carries a 1-100 priority score, tracked across three coupled surfaces. The score drives the board's pickup order and informs triage/cleanup decisions. The math is `(Breadth × Depth) / Cost × 4`, capped at 100; see the `/priority-score` skill for litmus tests.
+
+### The three surfaces
+
+| Surface | Role | Source of truth? |
+|---------|------|------------------|
+| **Score** project field (number, 1-100) | Sortable on the board; canonical numeric value | **Yes** |
+| **Priority** project field (single-select: `crit`/`top`/`high`/`med`/`low`) | Coarse band, visible on board cards | Derived from Score |
+| **Label** (one of `crit`/`top`/`high`/`med`/`low`) | Queryable via `gh issue list --label crit` | Derived from Score |
+| **`## Priority` section in issue body** | One-liner rationale + b/d/c breakdown | Authored by Claude |
+
+Score → band mapping (matches priority-score skill bands):
+
+| Score | Band | Action |
+|------:|------|--------|
+| 50-100 | `crit` | Stop what you are doing |
+| 25-49  | `top`  | Current or next sprint |
+| 13-24  | `high` | Schedule in a future sprint |
+| 5-12   | `med`  | Only if nothing better exists |
+| 1-4    | `low`  | Backlog or kill |
+
+### Auto-maintenance workflow
+
+`.github/workflows/project-automation.yml` has a `priority` job that fires on `projects_v2_item.edited`. When the Score field changes, it derives the band, updates the Priority single-select, and applies the band label (removing the others). Manual edits to Priority or label are **not reverted** — they stick until the next Score change. This lets a human override the derived band temporarily while keeping Score as the canonical numeric anchor.
+
+Field IDs are baked into the workflow `env:` block (Score, Priority, plus the five Priority option IDs). Re-resolve via the same GraphQL query used for Status field IDs (see §"Project board automation") if the project is rebuilt.
+
+### When scoring happens
+
+- **At issue creation** (autonomous): Claude runs `/priority-score` and writes the Score field. The workflow propagates.
+- **During triage** (ratification): the `triage` skill verifies the score's `b/d/c` assumptions still hold and re-scores if they shifted.
+- **On context change** (manual): user invokes `/priority-score <issue>` when something material changes — a related issue ships, a deadline appears, an operator cites the gap.
+- **Never on a clock.** Drift-by-time is not a refresh signal.
+
+### How priority drives execution
+
+- **Board sort.** The Ready column is sorted by Score descending — top of the column is the next thing to pick up.
+- **Triage cleanup.** `low`-band items idle >30 days are candidates for triage to close (`wontfix — score never moved`). No auto-close — triage's call.
+- **`crit` callouts.** When Claude scores something into `crit`, it surfaces this explicitly in chat ("scored #N as `crit` — recommend stopping current work").
+
+### Override path
+
+If Claude (or a human) judges the band wrong despite the math, write Score per the math AND directly write Priority field + label to the desired band. Note the override + reason in chat / triage notes. The override sticks until next Score change reverts it. If the override has lasting reasons, the underlying b/d/c judgment should change — re-score instead of leaving a permanent override.
+
+### Label colors
+
+`crit` = `b60205` (red) · `top` = `d93f0b` (orange) · `high` = `fbca04` (yellow) · `med` = `c5def5` (light blue) · `low` = `cccccc` (gray). Hot-to-cold, mirrors the action urgency.
+
 ## Dependency tracking between issues
 
 Use these GitHub features in order of preference:
