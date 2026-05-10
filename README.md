@@ -165,12 +165,15 @@ Both `nico-doctor` and `nico-correlate` load `~/.config/nico-tools/config.toml` 
 # ~/.config/nico-tools/config.toml
 
 [cluster]
-namespace = "nico"
-context   = "my-cluster"      # optional — omit to use current kubeconfig context
+namespace          = "nico"
+context            = "my-cluster"   # optional — omit to use current kubeconfig context
+postgres_namespace = "postgres"     # k8s namespace where Postgres lives
+temporal_namespace = "temporal"     # k8s namespace where temporal-frontend lives
+                                    # (distinct from [temporal] namespace below)
 
 [temporal]
 address          = "localhost:7233"
-namespace        = "default"
+namespace        = "default"        # Temporal tenancy namespace (workflow visibility)
 stuck_threshold  = "30m"
 
 [postgres]
@@ -188,7 +191,7 @@ nico-doctor --config /etc/nico/config.toml
 nico-correlate --config ~/my-cluster.toml host-r12u5
 ```
 
-Environment variables (`NICO_TEMPORAL_ADDRESS`, `NICO_POSTGRES_URL`, `NICO_NAMESPACE`, etc.) still work and override the config file. CLI flags override everything.
+Environment variables (`NICO_TEMPORAL_ADDRESS`, `NICO_POSTGRES_URL`, `NICO_NAMESPACE`, `NICO_TEMPORAL_K8S_NAMESPACE`, etc.) still work and override the config file. CLI flags override everything.
 
 ---
 

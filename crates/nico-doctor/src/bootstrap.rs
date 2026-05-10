@@ -670,6 +670,7 @@ async fn run_boot_probe(
         raw.clone(),
         config.cluster.namespace.clone(),
         config.cluster.postgres_namespace.clone(),
+        config.cluster.temporal_namespace.clone(),
     );
 
     let (validating_ok, serving_results) = tokio::join!(
@@ -840,6 +841,19 @@ async fn probe_infiniband_present(postgres_url: &str) -> anyhow::Result<bool> {
     Ok(row.0)
 }
 
+/// PRD-001 slice 10 gate: should the `port-forward: workflows` boot-probe
+/// step short-circuit to [`StepState::Skipped`]?
+///
+/// Skips when the resolved `DeploymentType` reports `temporal_present() ==
+/// false` (only `core-only` today). `None` (auto pre-detection) preserves
+/// pre-PRD-001 behavior — the step runs.
+fn should_skip_workflows_pf(deployment_type: Option<DeploymentType>) -> bool {
+    let Some(dt) = deployment_type else {
+        return false;
+    };
+    !dt.temporal_present()
+}
+
 /// PRD-004 slice 1 gate: should the `detect_infiniband_present` step
 /// run a SQL probe, or short-circuit to `Skipped`?
 ///
@@ -913,8 +927,18 @@ async fn run_serving_section(
 ) -> (String, String, Vec<nico_common::reach::ForwardedEndpoint>) {
     let ns = config.cluster.namespace.clone();
 
-    // Workflows port-forward
+    // Workflows port-forward — PRD-001 slice 10: skip when the resolved
+    // deployment-type lacks Temporal (only `core-only` today). Mirrors
+    // the existing `dpu` skip on `forgedb_present`. `temporal_present()`
+    // returns true for `Force` so the escape hatch flows through.
+    let skip_workflows_pf = should_skip_workflows_pf(config.cluster.deployment_type);
     let temporal_fut = async {
+        if skip_workflows_pf {
+            tracker
+                .finished(StepId::PortForwardWorkflows, StepState::Skipped)
+                .await;
+            return (config.temporal.address.clone(), None);
+        }
         tracker.started(StepId::PortForwardWorkflows).await;
         let t = Instant::now();
         match reach_mgr.temporal_address(pf_budget).await {
@@ -1145,6 +1169,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflows_layer_skips_with_reason_when_deployment_type_lacks_temporal() {
+        // PRD-001 slice 10: core-only has no Temporal — workflows layer
+        // skips with reason. Mirror of the `dpu` skip pattern.
+        let mut inputs = empty_inputs();
+        inputs.deployment_type = Some(DeploymentType::CoreOnly);
+        let layers = prepare_layers(&inputs);
+        let workflows = layers
+            .iter()
+            .find(|l| l.name() == "workflows")
+            .expect("workflows layer present");
+        let result = workflows.run(&RunOpts::default()).await;
+        assert_eq!(
+            result.status,
+            nico_common::output::Status::Skipped,
+            "workflows must skip when temporal absent",
+        );
+        assert_eq!(
+            result.skipped_reason.as_deref(),
+            Some("n/a in core-only: no Temporal"),
+        );
+    }
+
+    #[tokio::test]
+    async fn workflows_layer_runs_normally_when_temporal_present() {
+        // Full / RestOnlyMock / Force all have Temporal — workflows must
+        // not skip on the deployment-type axis (it can still fail on the
+        // gRPC call to a stub address; that is not a Skipped status).
+        for dt in [
+            DeploymentType::Full,
+            DeploymentType::RestOnlyMock,
+            DeploymentType::Force,
+        ] {
+            let mut inputs = empty_inputs();
+            inputs.deployment_type = Some(dt);
+            let layers = prepare_layers(&inputs);
+            let workflows = layers
+                .iter()
+                .find(|l| l.name() == "workflows")
+                .expect("workflows layer present");
+            let result = workflows.run(&RunOpts::default()).await;
+            assert_ne!(
+                result.status,
+                nico_common::output::Status::Skipped,
+                "workflows must NOT skip in {dt:?} (temporal present)",
+            );
+            assert_eq!(result.skipped_reason, None, "{dt:?}: no skip reason expected");
+        }
+    }
+
+    #[tokio::test]
+    async fn workflows_layer_runs_normally_when_deployment_type_unresolved() {
+        // None means auto-detect didn't resolve — preserve pre-PRD-001
+        // behavior: don't gate.
+        let mut inputs = empty_inputs();
+        inputs.deployment_type = None;
+        let layers = prepare_layers(&inputs);
+        let workflows = layers
+            .iter()
+            .find(|l| l.name() == "workflows")
+            .expect("workflows layer present");
+        let result = workflows.run(&RunOpts::default()).await;
+        assert_ne!(result.status, nico_common::output::Status::Skipped);
+    }
+
+    #[tokio::test]
     async fn dpu_layer_skips_with_reason_when_deployment_type_lacks_forgedb() {
         let mut inputs = empty_inputs();
         inputs.deployment_type = Some(DeploymentType::RestOnlyMock);
@@ -1216,6 +1305,29 @@ mod tests {
             names,
             vec!["cluster", "logs", "workflows", "health", "grpc", "postgres", "dpu"]
         );
+    }
+
+    #[test]
+    fn should_skip_workflows_pf_skips_only_core_only() {
+        // PRD-001 slice 10: only `core-only` lacks Temporal.
+        assert!(should_skip_workflows_pf(Some(DeploymentType::CoreOnly)));
+        for dt in [
+            DeploymentType::Full,
+            DeploymentType::RestOnlyMock,
+            DeploymentType::Force,
+        ] {
+            assert!(
+                !should_skip_workflows_pf(Some(dt)),
+                "{dt:?} has Temporal — pf step must run",
+            );
+        }
+    }
+
+    #[test]
+    fn should_skip_workflows_pf_runs_when_deployment_type_unresolved() {
+        // None means auto pre-detection; preserve pre-PRD-001 behavior
+        // (run the step).
+        assert!(!should_skip_workflows_pf(None));
     }
 
     #[test]

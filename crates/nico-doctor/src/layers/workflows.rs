@@ -7,12 +7,23 @@ use nico_common::temporal::{GrpcTemporalClient, TemporalClient};
 use temporal_sdk_core_protos::temporal::api::workflow::v1::WorkflowExecutionInfo;
 
 use crate::bootstrap::LayerInputs;
-use crate::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
+use crate::layer::{self, Check, CheckKind, Layer, LayerOutcome, RunOpts};
 
 pub const NAME: &str = "workflows";
 
 /// Factory consumed by `bootstrap::prepare_layers`.
+///
+/// Two resolution paths:
+///
+/// 1. Resolved deployment-type without Temporal (`core-only`) →
+///    [`SkippedLayer`] with reason `n/a in <type>: no Temporal` per
+///    PRD-001 slice 10. Mirrors the `dpu` layer's `forgedb_skip_layer`
+///    pattern from slice 7.
+/// 2. Otherwise → live [`WorkflowsLayer`].
 pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
+    if let Some(skip) = layer::temporal_skip_layer(NAME, inputs.deployment_type) {
+        return skip;
+    }
     Box::new(WorkflowsLayer::new(
         Arc::new(GrpcTemporalClient::new(inputs.temporal_address.clone())),
         inputs.temporal_namespace.clone(),

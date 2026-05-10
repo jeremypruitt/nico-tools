@@ -34,13 +34,16 @@ Avoid: heavy TUI crates (ratatui, cursive). Both tools print and exit.
 Config file at ~/.config/nico-tools/config.toml, overridable via env vars and flags. Keep it small.
 toml
 [cluster]
-context = "kind-nico-dev"
-namespace = "nico"
+context            = "kind-nico-dev"
+namespace          = "nico"
+postgres_namespace = "postgres"   # k8s namespace where Postgres lives
+temporal_namespace = "temporal"   # k8s namespace where temporal-frontend lives
+                                  # (distinct from [temporal] namespace below)
 [postgres]
 url = "postgres://nico:[nico@localhost:5432](mailto:nico@localhost:5432)/nico"
 [temporal]
 address = "localhost:7233"
-namespace = "default"
+namespace = "default"             # Temporal tenancy namespace (workflow visibility)
 [services]
 # service name -> { port, health_path, grpc_health_method }
 core    = { port = 9090, health = "/healthz", ready = "/readyz" }
