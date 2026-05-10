@@ -3,6 +3,7 @@ pub mod dpu;
 pub mod dpu_cert;
 pub mod dpu_health;
 pub mod dpu_isolation;
+pub mod dpu_services;
 pub mod grpc;
 pub mod hbn;
 pub mod health;
