@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use nico_common::config::DeploymentType;
 use nico_common::output::{OutputMode, Status};
 use crate::baseline::Delta;
 use crate::layer::CheckKind;
@@ -108,13 +109,48 @@ pub fn format_report(
     out
 }
 
+/// Render the deployment-type-derived capability bundle (PRD-001
+/// `Capability vocabulary`) as a JSON object suitable for direct
+/// inclusion in the doctor `--json` output's top-level `capabilities`
+/// key. Issue #242. Each key mirrors a method on
+/// [`DeploymentType`]; capability accessors that return `None` render
+/// as JSON `null` so the key set is stable across deployment-types.
+pub fn build_capabilities(dt: DeploymentType) -> serde_json::Value {
+    serde_json::json!({
+        "cluster_namespace": dt.default_cluster_namespace(),
+        "grpc_address": dt.default_grpc_address(),
+        "postgres_namespace": dt.default_postgres_namespace(),
+        "temporal_address": dt.default_temporal_address(),
+        "temporal_k8s_namespace": dt.default_temporal_k8s_namespace(),
+        "forgedb_present": dt.forgedb_present(),
+        "temporal_present": dt.temporal_present(),
+        "infiniband_present": dt.infiniband_present(),
+    })
+}
+
 pub fn format_json(
     report: &Report,
     namespace: &str,
     preflight: serde_json::Value,
     deltas: &HashMap<String, Delta>,
 ) -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
+    format_json_with_capabilities(report, namespace, preflight, deltas, None)
+}
+
+/// `format_json` plus PRD-001's deployment-type-derived capability
+/// bundle (issue #242). When `deployment_type` is `Some`, the output
+/// gains a top-level `capabilities` object whose key set is pinned by
+/// [`build_capabilities`]. When `None`, the output is byte-for-byte
+/// identical to [`format_json`] — no schema regression for runs that
+/// never resolved a deployment-type.
+pub fn format_json_with_capabilities(
+    report: &Report,
+    namespace: &str,
+    preflight: serde_json::Value,
+    deltas: &HashMap<String, Delta>,
+    deployment_type: Option<DeploymentType>,
+) -> String {
+    let mut value = serde_json::json!({
         "version": 1,
         "namespace": namespace,
         "preflight": preflight,
@@ -149,7 +185,14 @@ pub fn format_json(
                 })).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
-    })).unwrap()
+    });
+    if let Some(dt) = deployment_type {
+        value
+            .as_object_mut()
+            .expect("format_json builds a JSON object")
+            .insert("capabilities".to_string(), build_capabilities(dt));
+    }
+    serde_json::to_string_pretty(&value).unwrap()
 }
 
 #[cfg(test)]
@@ -1219,5 +1262,152 @@ mod tests {
         assert!(out.contains("error_lines"));
         assert!(out.contains("pod_error"));
         assert!(out.contains("core: boom"));
+    }
+
+    // ── capabilities object (issue #242) ──────────────────────────────────────
+
+    use nico_common::config::DeploymentType;
+
+    #[test]
+    fn capabilities_rest_only_mock_matches_prd_table() {
+        let caps = build_capabilities(DeploymentType::RestOnlyMock);
+        assert_eq!(caps["cluster_namespace"], "nico-rest");
+        assert_eq!(caps["grpc_address"], "nico-rest-mock-core.nico-rest:11079");
+        assert_eq!(caps["forgedb_present"], false);
+        assert_eq!(caps["temporal_present"], true);
+        assert_eq!(caps["temporal_k8s_namespace"], "temporal");
+    }
+
+    #[test]
+    fn capabilities_full_matches_prd_table() {
+        let caps = build_capabilities(DeploymentType::Full);
+        assert_eq!(caps["cluster_namespace"], "forge-system");
+        assert_eq!(caps["grpc_address"], "carbide-api.forge-system:1079");
+        assert_eq!(caps["forgedb_present"], true);
+        assert_eq!(caps["temporal_present"], true);
+        assert_eq!(caps["temporal_k8s_namespace"], "temporal");
+    }
+
+    #[test]
+    fn capabilities_core_only_matches_prd_table() {
+        let caps = build_capabilities(DeploymentType::CoreOnly);
+        assert_eq!(caps["cluster_namespace"], "forge-system");
+        assert_eq!(caps["grpc_address"], "carbide-api.forge-system:1079");
+        assert_eq!(caps["forgedb_present"], true);
+        assert_eq!(caps["temporal_present"], false);
+        assert!(caps["temporal_k8s_namespace"].is_null(),
+            "core-only deploys no Temporal; k8s namespace must be null");
+    }
+
+    #[test]
+    fn capabilities_force_returns_null_defaults_and_true_gates() {
+        // PRD-001 §"Capability vocabulary": Force returns None for every
+        // default and true for both feature gates.
+        let caps = build_capabilities(DeploymentType::Force);
+        for key in [
+            "cluster_namespace",
+            "grpc_address",
+            "postgres_namespace",
+            "temporal_address",
+            "temporal_k8s_namespace",
+        ] {
+            assert!(caps[key].is_null(),
+                "force capability {key} must render as null, got {:?}", caps[key]);
+        }
+        assert_eq!(caps["forgedb_present"], true);
+        assert_eq!(caps["temporal_present"], true);
+    }
+
+    /// Stable key set per PRD-001 §"Capability vocabulary" + PRD-004
+    /// slice 1 (`infiniband_present`). Pinning this guards external
+    /// consumers from silent additions/removals: changes here must
+    /// land alongside CONTEXT.md updates.
+    const EXPECTED_CAPABILITY_KEYS: &[&str] = &[
+        "cluster_namespace",
+        "grpc_address",
+        "postgres_namespace",
+        "temporal_address",
+        "temporal_k8s_namespace",
+        "forgedb_present",
+        "temporal_present",
+        "infiniband_present",
+    ];
+
+    #[test]
+    fn capabilities_key_set_stable_across_deployment_types() {
+        for dt in [
+            DeploymentType::Full,
+            DeploymentType::CoreOnly,
+            DeploymentType::RestOnlyMock,
+            DeploymentType::Force,
+        ] {
+            let caps = build_capabilities(dt);
+            let obj = caps.as_object().expect("capabilities must be a JSON object");
+            let mut got: Vec<&str> = obj.keys().map(String::as_str).collect();
+            got.sort();
+            let mut want: Vec<&str> = EXPECTED_CAPABILITY_KEYS.to_vec();
+            want.sort();
+            assert_eq!(got, want,
+                "capability key set drift on {dt:?}: got {got:?}, want {want:?}");
+        }
+    }
+
+    #[test]
+    fn json_includes_capabilities_when_deployment_type_resolved() {
+        let report = all_ok_report();
+        let json: serde_json::Value = serde_json::from_str(&format_json_with_capabilities(
+            &report,
+            "nico",
+            serde_json::json!({"ok": true}),
+            &no_deltas(),
+            Some(DeploymentType::RestOnlyMock),
+        ))
+        .unwrap();
+        assert!(json.get("capabilities").is_some(),
+            "expected top-level `capabilities` object on resolved deployment-type");
+        assert_eq!(json["capabilities"]["forgedb_present"], false);
+        assert_eq!(json["capabilities"]["temporal_present"], true);
+    }
+
+    #[test]
+    fn json_omits_capabilities_when_deployment_type_unresolved() {
+        // Acceptance: no regressions in existing JSON-schema snapshot tests
+        // for runs without --deployment-type set. Existing format_json
+        // signature continues to omit the field; the with_capabilities
+        // form passes None to opt out.
+        let report = all_ok_report();
+        let json: serde_json::Value = serde_json::from_str(&format_json_with_capabilities(
+            &report,
+            "nico",
+            serde_json::json!({"ok": true}),
+            &no_deltas(),
+            None,
+        ))
+        .unwrap();
+        assert!(json.get("capabilities").is_none(),
+            "no --deployment-type set ⇒ no `capabilities` key, got: {json}");
+    }
+
+    #[test]
+    fn legacy_format_json_signature_preserves_pre_242_schema() {
+        // Backward compatibility: the original format_json (no
+        // deployment-type) emits identical bytes to the with_capabilities
+        // variant called with None. Locks in the "no regressions" clause
+        // of #242 acceptance criterion 5.
+        let report = all_ok_report();
+        let legacy = format_json(
+            &report,
+            "nico",
+            serde_json::json!({"ok": true}),
+            &no_deltas(),
+        );
+        let new = format_json_with_capabilities(
+            &report,
+            "nico",
+            serde_json::json!({"ok": true}),
+            &no_deltas(),
+            None,
+        );
+        assert_eq!(legacy, new);
     }
 }
