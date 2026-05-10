@@ -109,8 +109,14 @@ pub fn render_block(state: &ProbeState, mode: RenderMode, frame: usize) -> Strin
         Some(name) => format!("  ·  type: {} ({})", name, state.deployment_type_source),
         None => "  ·  type: auto".to_string(),
     };
+    let ib_label = match state.infiniband_present {
+        Some(true) => "present",
+        Some(false) => "absent",
+        None => "unknown",
+    };
+    let ib_segment = format!("  ·  ib: {ib_label}");
     let header = format!(
-        "  {header_glyph} booting nico  ·  reach: {} ({}){type_segment}",
+        "  {header_glyph} booting nico  ·  reach: {} ({}){type_segment}{ib_segment}",
         state.reach_mode, state.reach_source,
     );
     if mode.color {
@@ -409,6 +415,52 @@ mod tests {
         assert!(
             out.contains("type: force (force)"),
             "expected `type: force (force)` for force mode, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_block_header_renders_ib_unknown_when_unresolved() {
+        // PRD-004 slice 1: when `infiniband_present` is None (auto pre-probe,
+        // force mode, gate unmet), banner renders `ib: unknown`.
+        let s = three_step_state();
+        let out = render_block(&s, RenderMode::plain(), 0);
+        assert!(
+            out.contains("ib: unknown"),
+            "expected `ib: unknown` for unresolved IB, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_block_header_renders_ib_present_when_some_true() {
+        let s = three_step_state().with_infiniband_present(Some(true));
+        let out = render_block(&s, RenderMode::plain(), 0);
+        assert!(
+            out.contains("ib: present"),
+            "expected `ib: present`, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_block_header_renders_ib_absent_when_some_false() {
+        let s = three_step_state().with_infiniband_present(Some(false));
+        let out = render_block(&s, RenderMode::plain(), 0);
+        assert!(
+            out.contains("ib: absent"),
+            "expected `ib: absent`, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_block_ib_segment_appears_after_type_segment() {
+        let s = three_step_state()
+            .with_deployment_type(Some("force".into()), "force")
+            .with_infiniband_present(None);
+        let out = render_block(&s, RenderMode::plain(), 0);
+        let type_pos = out.find("type: force").expect("type segment missing");
+        let ib_pos = out.find("ib: unknown").expect("ib segment missing");
+        assert!(
+            type_pos < ib_pos,
+            "ib segment must follow type segment in header, got:\n{out}"
         );
     }
 

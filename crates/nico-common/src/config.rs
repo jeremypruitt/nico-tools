@@ -98,6 +98,17 @@ impl DeploymentType {
             Self::RestOnlyMock => false,
         }
     }
+
+    /// Capability: whether InfiniBand fabric is present on any DPU in
+    /// the fleet (PRD-004 slice 1). `None` for `Force` — the escape
+    /// hatch never probes. For other types the static method also
+    /// returns `None`: IB presence is a per-cluster fact, not a
+    /// deployment-type-class attribute, so the runtime value is
+    /// resolved by the `detect_infiniband_present` boot-probe step
+    /// and lives on `ProbeState`, not on the type.
+    pub fn infiniband_present(self) -> Option<bool> {
+        None
+    }
 }
 
 impl fmt::Display for DeploymentType {
@@ -1110,6 +1121,33 @@ port_forward = "1s"
         assert!(DeploymentType::Force.default_temporal_address().is_none());
         assert!(DeploymentType::Force.default_temporal_namespace().is_none());
         assert!(DeploymentType::Force.forgedb_present());
+    }
+
+    #[test]
+    fn deployment_type_infiniband_present_is_none_for_force() {
+        // PRD-004 slice 1 AC: `infiniband_present()` returns `None` for
+        // `Force`. The static method is a placeholder for the capability;
+        // the runtime value is resolved by `detect_infiniband_present`
+        // boot-probe step and lives on `ProbeState`, not on the type.
+        assert_eq!(DeploymentType::Force.infiniband_present(), None);
+    }
+
+    #[test]
+    fn deployment_type_infiniband_present_is_none_for_non_force_types() {
+        // The type itself never knows IB presence — that's a per-cluster
+        // fact resolved at runtime. Static method always reports `None`;
+        // boot probe sets the resolved value on ProbeState.
+        for dt in [
+            DeploymentType::Full,
+            DeploymentType::CoreOnly,
+            DeploymentType::RestOnlyMock,
+        ] {
+            assert_eq!(
+                dt.infiniband_present(),
+                None,
+                "{dt:?}::infiniband_present() should return None (resolved at runtime)"
+            );
+        }
     }
 
     #[test]

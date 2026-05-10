@@ -478,6 +478,7 @@ async fn run_boot_probe(
                     StepId::PortForwardGrpc,
                     StepId::PortForwardPostgres,
                     StepId::ReachPostgres,
+                    StepId::DetectInfinibandPresent,
                 ])
                 .await;
             // Graceful degradation — probe completes (with the failed
@@ -535,6 +536,7 @@ async fn run_boot_probe(
                 StepId::PortForwardGrpc,
                 StepId::PortForwardPostgres,
                 StepId::ReachPostgres,
+                StepId::DetectInfinibandPresent,
             ])
             .await;
         return Err(probe_to_preflight_err(probe, config).await);
@@ -566,7 +568,14 @@ async fn run_boot_probe(
             timeouts.preflight,
             config.cluster.deployment_type,
         ),
-        run_serving_section(&tracker, &reach_mgr, config, timeouts.port_forward, timeouts.postgres_reach),
+        run_serving_section(
+            &tracker,
+            &reach_mgr,
+            config,
+            timeouts.port_forward,
+            timeouts.postgres_reach,
+            timeouts.preflight,
+        ),
     );
 
     if !validating_ok {
@@ -696,6 +705,67 @@ async fn detect_deployment_type_step(
     ))
 }
 
+/// PRD-004 slice 1: SQL probe for InfiniBand presence in the fleet.
+/// Returns `true` if any DPU has a non-empty
+/// `machines.inventory->'infiniband_interfaces'` array, `false` otherwise.
+/// The `machines` table missing degrades to `false` so dev clusters that
+/// haven't run the carbide schema render `ib: absent` instead of failing.
+async fn probe_infiniband_present(postgres_url: &str) -> anyhow::Result<bool> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(2))
+        .connect(postgres_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to postgres: {e}"))?;
+
+    let table_exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_name = 'machines')",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("infiniband schema probe failed: {e}"))?;
+    if !table_exists.0 {
+        return Ok(false);
+    }
+
+    let row: (bool,) = sqlx::query_as(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM machines \
+           WHERE inventory->'infiniband_interfaces' IS NOT NULL \
+             AND jsonb_array_length(inventory->'infiniband_interfaces') > 0 \
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("infiniband presence query failed: {e}"))?;
+    Ok(row.0)
+}
+
+/// PRD-004 slice 1 gate: should the `detect_infiniband_present` step
+/// run a SQL probe, or short-circuit to `Skipped`?
+///
+/// Skips when:
+/// - postgres is not reachable (no point probing without a connection),
+/// - `deployment_type` is `None` (auto pre-detection),
+/// - `deployment_type == Force` (escape hatch — never probe), or
+/// - `forgedb_present()` is false (RestOnlyMock — no inventory column to read).
+fn should_probe_infiniband(
+    deployment_type: Option<DeploymentType>,
+    pg_reachable: bool,
+) -> bool {
+    if !pg_reachable {
+        return false;
+    }
+    let Some(dt) = deployment_type else {
+        return false;
+    };
+    if matches!(dt, DeploymentType::Force) {
+        return false;
+    }
+    dt.forgedb_present()
+}
+
 async fn run_step<F>(
     tracker: &nico_common::boot_probe::Tracker,
     id: StepId,
@@ -741,6 +811,7 @@ async fn run_serving_section(
     config: &Config,
     pf_budget: Duration,
     pg_reach_budget: Duration,
+    ib_probe_budget: Duration,
 ) -> (String, String, Vec<nico_common::reach::ForwardedEndpoint>) {
     let ns = config.cluster.namespace.clone();
 
@@ -837,12 +908,15 @@ async fn run_serving_section(
             tracker
                 .finished(StepId::ReachPostgres, StepState::Skipped)
                 .await;
+            tracker
+                .finished(StepId::DetectInfinibandPresent, StepState::Skipped)
+                .await;
             return (postgres_url, pf_guard);
         }
 
         tracker.started(StepId::ReachPostgres).await;
         let t = Instant::now();
-        match nico_common::bootstrap::probe_postgres(&postgres_url, pg_reach_budget).await {
+        let pg_reachable = match nico_common::bootstrap::probe_postgres(&postgres_url, pg_reach_budget).await {
             Ok(()) => {
                 tracker
                     .finished(
@@ -850,6 +924,7 @@ async fn run_serving_section(
                         StepState::Passed { elapsed: t.elapsed() },
                     )
                     .await;
+                true
             }
             Err(e) => {
                 let elapsed = t.elapsed();
@@ -865,6 +940,52 @@ async fn run_serving_section(
                         },
                     )
                     .await;
+                false
+            }
+        };
+
+        // PRD-004 slice 1: detect_infiniband_present — gated probe of
+        // `machines.inventory->'infiniband_interfaces'`.
+        if !should_probe_infiniband(config.cluster.deployment_type, pg_reachable) {
+            tracker
+                .finished(StepId::DetectInfinibandPresent, StepState::Skipped)
+                .await;
+        } else {
+            tracker.started(StepId::DetectInfinibandPresent).await;
+            let t = Instant::now();
+            match nico_common::bootstrap::run_with_budget(
+                ib_probe_budget,
+                probe_infiniband_present(&postgres_url),
+            )
+            .await
+            {
+                Ok(present) => {
+                    tracker.set_infiniband_present(Some(present)).await;
+                    tracker
+                        .finished(
+                            StepId::DetectInfinibandPresent,
+                            StepState::Passed { elapsed: t.elapsed() },
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    let elapsed = t.elapsed();
+                    let timed_out = e.is_timed_out();
+                    tracker
+                        .finished(
+                            StepId::DetectInfinibandPresent,
+                            StepState::Failed {
+                                elapsed,
+                                message: e.to_string(),
+                                timed_out,
+                                next_command: next_command_for(
+                                    StepId::DetectInfinibandPresent,
+                                    &ns,
+                                ),
+                            },
+                        )
+                        .await;
+                }
             }
         }
         (postgres_url, pf_guard)
@@ -997,6 +1118,51 @@ mod tests {
             names,
             vec!["cluster", "logs", "workflows", "health", "grpc", "postgres", "dpu"]
         );
+    }
+
+    #[test]
+    fn should_probe_infiniband_skips_force_mode() {
+        // PRD-004 slice 1: Force is the escape hatch — no probing,
+        // banner shows `ib: unknown`.
+        assert!(!should_probe_infiniband(Some(DeploymentType::Force), true));
+    }
+
+    #[test]
+    fn should_probe_infiniband_skips_when_postgres_unreachable() {
+        // No connection → no SQL probe possible.
+        for dt in [
+            DeploymentType::Full,
+            DeploymentType::CoreOnly,
+            DeploymentType::RestOnlyMock,
+            DeploymentType::Force,
+        ] {
+            assert!(!should_probe_infiniband(Some(dt), false));
+        }
+    }
+
+    #[test]
+    fn should_probe_infiniband_skips_when_deployment_type_unresolved() {
+        // Auto pre-detection: forgedb capability is unknown.
+        assert!(!should_probe_infiniband(None, true));
+    }
+
+    #[test]
+    fn should_probe_infiniband_skips_rest_only_mock() {
+        // No forgedb → no inventory column to read.
+        assert!(!should_probe_infiniband(
+            Some(DeploymentType::RestOnlyMock),
+            true
+        ));
+    }
+
+    #[test]
+    fn should_probe_infiniband_runs_for_full_and_core_only_with_postgres() {
+        for dt in [DeploymentType::Full, DeploymentType::CoreOnly] {
+            assert!(
+                should_probe_infiniband(Some(dt), true),
+                "{dt:?} with reachable pg should probe IB"
+            );
+        }
     }
 
     #[tokio::test]
