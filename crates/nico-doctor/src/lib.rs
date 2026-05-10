@@ -25,6 +25,7 @@ pub mod loki;
 pub mod postgres;
 pub mod preflight;
 pub mod runner;
+pub mod verdicts;
 
 pub use bootstrap::{bootstrap, prepare_layers, Bootstrapped, BootstrapErr, LayerInputs};
 pub use cli::{

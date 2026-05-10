@@ -12,9 +12,15 @@
 //! Four mutually-exclusive verdicts: `expired` > `expiring-soon` >
 //! `healthy`, plus `no-recent-status` for the case where the JSON
 //! column is absent or has no `client_certificate_expiry` field for
-//! this machine row. Pure `assess()` over a small [`CertSnapshot`]
-//! keeps the logic testable without touching Postgres; the
-//! [`DpuCertClient`] trait is the seam.
+//! this machine row.
+//!
+//! Since PRD-003 Slice 1 (#305) the verdict precedence lives in the
+//! shared [`crate::verdicts::cert_verdict`] primitive (returning an
+//! [`crate::verdicts::AxisSummary`] that downstream holistic rollups
+//! consume); [`assemble_checks`] here is the per-layer renderer that
+//! turns that summary into a headline `Check` plus cert-specific
+//! detail rows (absolute expiry, threshold echo). The
+//! [`DpuCertClient`] trait remains the I/O seam.
 
 use std::time::Duration;
 use anyhow::Result;
@@ -23,6 +29,7 @@ use chrono::{DateTime, Utc};
 use nico_common::output::Status;
 
 use crate::layer::{Check, CheckKind};
+use crate::verdicts::{cert_verdict, AxisSummary};
 
 /// Default warning window: warn when the cert expires within this
 /// duration. 30 days matches the issue's suggested default and gives
@@ -107,97 +114,50 @@ impl DpuCertClient for SqlxDpuCertClient {
     }
 }
 
-/// The four possible verdicts. `time_to_expiry` is included on the
-/// healthy / expiring-soon variants so the operator sees the actual
-/// number, not just a category. `expired_for` shows how long the cert
-/// has been past its expiry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CertVerdict {
-    NoRecentStatus,
-    Expired { expired_for: Duration },
-    ExpiringSoon { time_to_expiry: Duration, threshold: Duration },
-    Healthy { time_to_expiry: Duration },
-}
-
-/// Run the precedence ladder over a snapshot. `now` is the caller's
-/// clock so this stays pure.
-pub fn assess(
+/// Render the cert axis as a headline `Check` (sourced from
+/// [`cert_verdict`]) followed by cert-specific detail rows: the
+/// absolute expiry timestamp and a threshold echo. The detail rows
+/// give the operator raw data the punchy headline elides; the rollup
+/// layers (PRD-003 slices 5 + 6) consume only the headline.
+///
+/// JSON ordering — issue #305 acceptance criteria: headline first
+/// (`kind: "headline"`), then detail (`kind: "detail"`).
+pub fn assemble_checks(
     snapshot: &CertSnapshot,
     now: DateTime<Utc>,
     warn_threshold: Duration,
-) -> CertVerdict {
-    let Some(expiry) = snapshot.client_certificate_expiry else {
-        return CertVerdict::NoRecentStatus;
-    };
-    let delta = expiry - now;
-    if delta.num_seconds() <= 0 {
-        let expired_for = (-delta).to_std().unwrap_or(Duration::ZERO);
-        return CertVerdict::Expired { expired_for };
+) -> Vec<Check> {
+    let summary = cert_verdict(snapshot, now, warn_threshold);
+    let mut checks = vec![headline_from(&summary)];
+
+    if let Some(expiry) = snapshot.client_certificate_expiry {
+        checks.push(Check {
+            name: "expiry",
+            status: Status::Ok,
+            value: expiry.to_rfc3339(),
+            next_command: None,
+            kind: CheckKind::Detail,
+        });
+        checks.push(Check {
+            name: "warn-threshold",
+            status: Status::Ok,
+            value: format_days(warn_threshold),
+            next_command: None,
+            kind: CheckKind::Detail,
+        });
     }
-    let time_to_expiry = delta.to_std().unwrap_or(Duration::ZERO);
-    if time_to_expiry <= warn_threshold {
-        CertVerdict::ExpiringSoon {
-            time_to_expiry,
-            threshold: warn_threshold,
-        }
-    } else {
-        CertVerdict::Healthy { time_to_expiry }
-    }
+
+    checks
 }
 
-/// Render the verdict as a single headline [`Check`]. The doctor
-/// formatter already paints the per-status colour and the
-/// next-command hint, so the verdict is self-contained: one line, no
-/// detail bullets.
-pub fn assemble_checks(dpu_id: &str, verdict: &CertVerdict) -> Vec<Check> {
-    let (status, value, next_command) = match verdict {
-        CertVerdict::NoRecentStatus => (
-            Status::Unknown,
-            format!("dpu {dpu_id} cert: no recent network_status_observation to check"),
-            Some(format!(
-                "nico correlate {dpu_id} # last activity for this DPU"
-            )),
-        ),
-        CertVerdict::Expired { expired_for } => (
-            Status::Fail,
-            format!(
-                "dpu {dpu_id} cert expired {} ago",
-                format_days(*expired_for)
-            ),
-            Some(format!(
-                "rotate dpu-agent client cert for {dpu_id}"
-            )),
-        ),
-        CertVerdict::ExpiringSoon {
-            time_to_expiry,
-            threshold,
-        } => (
-            Status::Warn,
-            format!(
-                "dpu {dpu_id} cert expires in {} (threshold {})",
-                format_days(*time_to_expiry),
-                format_days(*threshold)
-            ),
-            Some(format!(
-                "plan dpu-agent cert rotation for {dpu_id}"
-            )),
-        ),
-        CertVerdict::Healthy { time_to_expiry } => (
-            Status::Ok,
-            format!(
-                "dpu {dpu_id} cert healthy: expires in {}",
-                format_days(*time_to_expiry)
-            ),
-            None,
-        ),
-    };
-    vec![Check {
-        name: "dpu_cert",
-        status,
-        value,
-        next_command,
+fn headline_from(summary: &AxisSummary) -> Check {
+    Check {
+        name: summary.axis,
+        status: summary.status.clone(),
+        value: summary.message.clone(),
+        next_command: summary.next_command.clone(),
         kind: CheckKind::Headline,
-    }]
+    }
 }
 
 /// Render a data-layer error as an `Unknown` headline so the verdict
@@ -230,164 +190,58 @@ fn format_days(d: Duration) -> String {
 mod tests {
     use super::*;
 
-    fn snap_healthy() -> CertSnapshot {
+    fn snap_with_expiry_in(days: i64) -> CertSnapshot {
         CertSnapshot {
             dpu_id: "dpu-42".into(),
-            client_certificate_expiry: Some(Utc::now() + chrono::Duration::days(180)),
+            client_certificate_expiry: Some(Utc::now() + chrono::Duration::days(days)),
         }
     }
 
+    // Verdict precedence + per-variant content live in
+    // [`crate::verdicts::cert`] tests. Tests here cover the layer
+    // renderer: headline-vs-detail ordering, detail-row population,
+    // and data-layer error surfacing.
+
     #[test]
-    fn cert_well_in_the_future_yields_healthy_with_days_remaining() {
-        let snap = snap_healthy();
-        let verdict = assess(&snap, Utc::now(), DEFAULT_WARN_THRESHOLD);
-        match verdict {
-            CertVerdict::Healthy { time_to_expiry } => {
-                let days = time_to_expiry.as_secs() / 86_400;
-                assert!((178..=180).contains(&days), "got {days}d");
-            }
-            other => panic!("expected Healthy, got {other:?}"),
-        }
+    fn assemble_checks_emits_headline_then_expiry_then_threshold() {
+        let snap = snap_with_expiry_in(180);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_WARN_THRESHOLD);
+
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].kind, CheckKind::Headline);
+        assert_eq!(checks[0].status, Status::Ok);
+        assert!(checks[0].value.contains("healthy"));
+
+        assert_eq!(checks[1].kind, CheckKind::Detail);
+        assert_eq!(checks[1].name, "expiry");
+        // RFC3339 timestamp — bare presence of `T` between date+time
+        // is enough to confirm the format without anchoring on the
+        // exact wall-clock value.
+        assert!(checks[1].value.contains('T'), "expiry: {}", checks[1].value);
+
+        assert_eq!(checks[2].kind, CheckKind::Detail);
+        assert_eq!(checks[2].name, "warn-threshold");
+        assert_eq!(checks[2].value, "30d");
     }
 
     #[test]
-    fn cert_within_warn_window_yields_expiring_soon_with_threshold() {
-        let mut snap = snap_healthy();
-        let now = Utc::now();
-        snap.client_certificate_expiry = Some(now + chrono::Duration::days(15));
-        let verdict = assess(&snap, now, DEFAULT_WARN_THRESHOLD);
-        match verdict {
-            CertVerdict::ExpiringSoon {
-                time_to_expiry,
-                threshold,
-            } => {
-                assert_eq!(threshold, DEFAULT_WARN_THRESHOLD);
-                let days = time_to_expiry.as_secs() / 86_400;
-                assert!((14..=15).contains(&days), "got {days}d");
-            }
-            other => panic!("expected ExpiringSoon, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cert_in_the_past_yields_expired_with_age() {
-        let mut snap = snap_healthy();
-        let now = Utc::now();
-        snap.client_certificate_expiry = Some(now - chrono::Duration::days(3));
-        let verdict = assess(&snap, now, DEFAULT_WARN_THRESHOLD);
-        match verdict {
-            CertVerdict::Expired { expired_for } => {
-                let days = expired_for.as_secs() / 86_400;
-                assert!((2..=3).contains(&days), "got {days}d");
-            }
-            other => panic!("expected Expired, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn no_status_row_yields_no_recent_status() {
+    fn assemble_checks_omits_detail_rows_when_no_expiry_to_anchor_them() {
         let snap = CertSnapshot {
             dpu_id: "dpu-42".into(),
             client_certificate_expiry: None,
         };
-        let verdict = assess(&snap, Utc::now(), DEFAULT_WARN_THRESHOLD);
-        assert_eq!(verdict, CertVerdict::NoRecentStatus);
-    }
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_WARN_THRESHOLD);
 
-    // ── boundary: exactly at the warn threshold counts as expiring-soon
-    #[test]
-    fn cert_exactly_at_threshold_yields_expiring_soon() {
-        let mut snap = snap_healthy();
-        let now = Utc::now();
-        snap.client_certificate_expiry = Some(now + chrono::Duration::days(30));
-        let verdict = assess(&snap, now, DEFAULT_WARN_THRESHOLD);
-        assert!(
-            matches!(verdict, CertVerdict::ExpiringSoon { .. }),
-            "got {verdict:?}"
-        );
-    }
-
-    // ── precedence: expired beats every other state
-    #[test]
-    fn expired_beats_within_warn_window() {
-        let mut snap = snap_healthy();
-        let now = Utc::now();
-        // 1 second past expiry — still expired, not expiring-soon.
-        snap.client_certificate_expiry = Some(now - chrono::Duration::seconds(1));
-        let verdict = assess(&snap, now, DEFAULT_WARN_THRESHOLD);
-        assert!(matches!(verdict, CertVerdict::Expired { .. }), "got {verdict:?}");
-    }
-
-    // ── assemble_checks: rendering each verdict as a headline ────────────
-
-    #[test]
-    fn healthy_check_is_single_ok_headline_no_next_command() {
-        let snap = snap_healthy();
-        let verdict = assess(&snap, Utc::now(), DEFAULT_WARN_THRESHOLD);
-        let checks = assemble_checks(&snap.dpu_id, &verdict);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].kind, CheckKind::Headline);
-        assert_eq!(checks[0].status, Status::Ok);
-        assert!(checks[0].value.contains("dpu-42"));
-        assert!(checks[0].value.contains("healthy"));
-        assert!(checks[0].next_command.is_none());
-    }
-
-    #[test]
-    fn expiring_soon_check_is_warn_with_threshold_and_rotation_hint() {
-        let verdict = CertVerdict::ExpiringSoon {
-            time_to_expiry: Duration::from_secs(15 * 86_400),
-            threshold: DEFAULT_WARN_THRESHOLD,
-        };
-        let checks = assemble_checks("dpu-42", &verdict);
-        assert_eq!(checks[0].status, Status::Warn);
-        assert!(checks[0].value.contains("15d"));
-        assert!(checks[0].value.contains("30d"));
-        assert!(
-            checks[0]
-                .next_command
-                .as_deref()
-                .unwrap()
-                .contains("rotation"),
-            "next_command: {:?}",
-            checks[0].next_command
-        );
-    }
-
-    #[test]
-    fn expired_check_is_fail_with_age_and_rotate_hint() {
-        let verdict = CertVerdict::Expired {
-            expired_for: Duration::from_secs(3 * 86_400),
-        };
-        let checks = assemble_checks("dpu-42", &verdict);
-        assert_eq!(checks[0].status, Status::Fail);
-        assert!(checks[0].value.contains("expired"));
-        assert!(checks[0].value.contains("3d"));
-        assert!(
-            checks[0]
-                .next_command
-                .as_deref()
-                .unwrap()
-                .contains("rotate"),
-        );
-    }
-
-    #[test]
-    fn no_recent_status_check_is_unknown_with_correlate_hint() {
-        let checks = assemble_checks("dpu-42", &CertVerdict::NoRecentStatus);
         assert_eq!(checks[0].status, Status::Unknown);
-        assert!(checks[0].value.contains("no recent"));
-        assert!(checks[0]
-            .next_command
-            .as_deref()
-            .unwrap()
-            .contains("nico correlate"));
     }
 
     #[test]
     fn assemble_error_checks_surfaces_underlying_error() {
         let checks = assemble_error_checks("dpu-42", "postgres unreachable");
         assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].kind, CheckKind::Headline);
         assert_eq!(checks[0].status, Status::Unknown);
         assert!(checks[0].value.contains("postgres unreachable"));
         assert!(checks[0].value.contains("dpu-42"));

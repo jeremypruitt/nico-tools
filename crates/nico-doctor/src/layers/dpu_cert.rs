@@ -1,8 +1,9 @@
 //! `nico doctor dpu-cert <dpu-id>` layer.
 //!
 //! Wraps a [`DpuCertClient`] and reduces the fetched [`CertSnapshot`]
-//! to a single headline [`Check`] via the pure [`assess`] /
-//! [`assemble_checks`] pair in [`crate::dpu_cert`].
+//! to a headline `Check` (sourced from
+//! [`crate::verdicts::cert_verdict`]) followed by cert-specific
+//! detail rows via [`crate::dpu_cert::assemble_checks`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,10 +44,11 @@ impl Layer for DpuCertLayer {
 
     async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
         match self.client.fetch_snapshot(&self.dpu_id).await {
-            Ok(snapshot) => {
-                let verdict = dpu_cert::assess(&snapshot, Utc::now(), self.warn_threshold);
-                LayerOutcome::Checks(dpu_cert::assemble_checks(&self.dpu_id, &verdict))
-            }
+            Ok(snapshot) => LayerOutcome::Checks(dpu_cert::assemble_checks(
+                &snapshot,
+                Utc::now(),
+                self.warn_threshold,
+            )),
             Err(e) => LayerOutcome::Checks(dpu_cert::assemble_error_checks(
                 &self.dpu_id,
                 &e.to_string(),
@@ -150,5 +152,64 @@ mod tests {
             .with_warn_threshold(Duration::from_secs(200 * 86_400));
         let result = layer.run(&RunOpts::default()).await;
         assert_eq!(result.status, Status::Warn);
+    }
+
+    // PRD-003 Slice 1 — issue #305: dpu_cert.checks ordering is headline
+    // first (`CheckKind::Headline`, sourced from `cert_verdict()`), then
+    // cert-specific detail rows (`CheckKind::Detail`). Holistic per-DPU
+    // and fleet rollups (slices 5 + 6) consume the headline; the
+    // operator gets the raw expiry timestamp + threshold echo as
+    // separate detail rows.
+    #[tokio::test]
+    async fn healthy_run_emits_headline_then_expiry_and_threshold_detail_rows() {
+        use crate::layer::CheckKind;
+
+        let layer = DpuCertLayer::new(StubClient::ok(snap_with_expiry_in(180)), "dpu-42");
+        let result = layer.run(&RunOpts::default()).await;
+
+        assert_eq!(result.status, Status::Ok);
+        assert_eq!(result.checks.len(), 3, "headline + 2 detail rows");
+        assert_eq!(result.checks[0].kind, CheckKind::Headline);
+        assert_eq!(result.checks[1].kind, CheckKind::Detail);
+        assert_eq!(result.checks[2].kind, CheckKind::Detail);
+        assert_eq!(result.checks[1].name, "expiry");
+        assert_eq!(result.checks[2].name, "warn-threshold");
+        assert!(
+            result.checks[2].value.contains("30d"),
+            "threshold detail: {:?}",
+            result.checks[2].value,
+        );
+    }
+
+    #[tokio::test]
+    async fn no_recent_status_run_omits_expiry_detail_row() {
+        use crate::layer::CheckKind;
+
+        let snap = CertSnapshot {
+            dpu_id: "dpu-42".into(),
+            client_certificate_expiry: None,
+        };
+        let layer = DpuCertLayer::new(StubClient::ok(snap), "dpu-42");
+        let result = layer.run(&RunOpts::default()).await;
+
+        // No expiry to render → only the headline. We deliberately do
+        // NOT echo a threshold detail when there's no expiry to compare
+        // it to (would be noise without the anchor).
+        assert_eq!(result.status, Status::Unknown);
+        assert_eq!(result.checks.len(), 1);
+        assert_eq!(result.checks[0].kind, CheckKind::Headline);
+    }
+
+    #[tokio::test]
+    async fn data_layer_error_run_emits_only_unknown_headline() {
+        use crate::layer::CheckKind;
+
+        let layer = DpuCertLayer::new(StubClient::err("postgres unreachable"), "dpu-42");
+        let result = layer.run(&RunOpts::default()).await;
+
+        assert_eq!(result.status, Status::Unknown);
+        assert_eq!(result.checks.len(), 1);
+        assert_eq!(result.checks[0].kind, CheckKind::Headline);
+        assert!(result.checks[0].value.contains("postgres unreachable"));
     }
 }
