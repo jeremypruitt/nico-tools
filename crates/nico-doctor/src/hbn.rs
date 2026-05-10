@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use nico_common::output::Status;
 
 use crate::layer::{Check, CheckKind};
+use crate::verdicts::{hbn_verdict, AxisSummary};
 
 /// Minimum HBN version required by NVUE-managed config flows.
 pub const NVUE_MINIMUM_HBN_VERSION: &str = "2.0.0-doca2.5.0";
@@ -352,13 +353,17 @@ pub fn compare_hbn_versions(lhs: &str, rhs: &str) -> Ordering {
 
 /// Assemble the per-DPU HBN check list from a snapshot.
 ///
-/// Produces exactly one `Headline` (the aggregate verdict line) plus
-/// one `Detail` per criterion in the order the issue lists them. Pure
-/// — no I/O, fully unit-testable.
+/// Produces exactly one `Headline` (sourced from
+/// [`crate::verdicts::hbn_verdict`]) followed by one `Detail` per signal
+/// in the order the issue lists them. Pure — no I/O, fully
+/// unit-testable.
 ///
-/// When `network_config_error` is set, the headline surfaces that error
-/// verbatim and pins the layer to `Fail` (PRD-002): an explicit error
-/// from the agent is more actionable than "versions disagree".
+/// Since PRD-003 Slice 3 (#307) the headline is the rolled-up verdict
+/// instead of one headline-per-signal. Every signal that previously
+/// surfaced as its own headline (drift / network-config-error / BGP
+/// alerts / freshness / version-below-minimum) is preserved as a detail
+/// row so nothing is dropped from the JSON output. JSON ordering:
+/// headline first (`kind: "headline"`), then detail rows.
 pub fn assemble_checks(
     snapshot: &HbnSnapshot,
     now: DateTime<Utc>,
@@ -524,13 +529,21 @@ pub fn assemble_checks(
         }
     });
 
-    let aggregate = aggregate_status(&details);
-    let headline = headline_check(snapshot, aggregate, &details);
-
+    let summary = hbn_verdict(snapshot, now, freshness_threshold);
     let mut out = Vec::with_capacity(details.len() + 1);
-    out.push(headline);
+    out.push(headline_from(&summary));
     out.extend(details);
     out
+}
+
+fn headline_from(summary: &AxisSummary) -> Check {
+    Check {
+        name: summary.axis,
+        status: summary.status.clone(),
+        value: summary.message.clone(),
+        next_command: summary.next_command.clone(),
+        kind: CheckKind::Headline,
+    }
 }
 
 /// Build the "no recent status row" check list — used when the data
@@ -585,52 +598,6 @@ fn version_match_check(name: &'static str, applied: &str, desired: &str) -> Chec
     }
 }
 
-fn aggregate_status(checks: &[Check]) -> Status {
-    if checks.iter().any(|c| c.status == Status::Fail) {
-        Status::Fail
-    } else if checks.iter().any(|c| c.status == Status::Warn) {
-        Status::Warn
-    } else if checks.iter().any(|c| c.status == Status::Unknown) {
-        Status::Unknown
-    } else {
-        Status::Ok
-    }
-}
-
-fn headline_check(snapshot: &HbnSnapshot, aggregate: Status, details: &[Check]) -> Check {
-    if let Some(err) = snapshot.network_config_error.as_deref().filter(|s| !s.is_empty()) {
-        return Check {
-            name: "hbn",
-            status: Status::Fail,
-            value: format!("dpu {} network_config_error: {err}", snapshot.dpu_id),
-            next_command: Some(format!(
-                "nico correlate {} # trace the failed config apply",
-                snapshot.dpu_id
-            )),
-            kind: CheckKind::Headline,
-        };
-    }
-    let value = match aggregate {
-        Status::Ok => format!("dpu {} hbn healthy", snapshot.dpu_id),
-        Status::Skipped => format!("dpu {} hbn skipped", snapshot.dpu_id),
-        Status::Unknown => format!("dpu {} hbn unknown", snapshot.dpu_id),
-        Status::Warn | Status::Fail => {
-            let bad: Vec<&str> = details
-                .iter()
-                .filter(|c| c.status != Status::Ok)
-                .map(|c| c.name)
-                .collect();
-            format!("dpu {} hbn issues: {}", snapshot.dpu_id, bad.join(", "))
-        }
-    };
-    Check {
-        name: "hbn",
-        status: aggregate,
-        value,
-        next_command: None,
-        kind: CheckKind::Headline,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -775,7 +742,7 @@ mod tests {
             .expect("headline check");
         assert_eq!(headline.status, Status::Ok);
         assert!(
-            headline.value.contains("dpu-42") && headline.value.contains("healthy"),
+            headline.value.contains("dpu-42") && headline.value.contains("ok"),
             "headline: {}",
             headline.value
         );
@@ -903,10 +870,15 @@ mod tests {
         assert!(last.value.contains("90s"), "value: {}", last.value);
     }
 
-    // ── headline lists every failing detail by name ──────────────────────
-
+    // ── headline is the rolled-up verdict (PRD-003 slice 3) ──────────────
+    //
+    // The headline is now a single rolled-up verdict instead of a list
+    // of failing-detail names. Drift outranks quarantine in the verdict
+    // precedence ladder, so when both signals are present the headline
+    // surfaces the drift axis. Every signal still appears as a detail
+    // row — verified separately above and in the layer tests.
     #[test]
-    fn unhealthy_headline_lists_failing_detail_names() {
+    fn unhealthy_headline_is_rolled_up_verdict_not_a_list_of_signal_names() {
         let mut snap = snap_healthy();
         snap.applied_instance_network_config_version = "v8".into();
         snap.desired_instance_network_config_version = "v9".into();
@@ -914,8 +886,14 @@ mod tests {
         let checks = assemble_checks(&snap, snap.last_seen_at, DEFAULT_FRESHNESS_THRESHOLD);
 
         let headline = checks.iter().find(|c| c.kind == CheckKind::Headline).unwrap();
-        assert!(headline.value.contains("instance_network_config"));
-        assert!(headline.value.contains("quarantine"));
+        assert_eq!(headline.status, Status::Fail);
+        assert!(headline.value.contains("drift"));
+        assert!(headline.value.contains("instance-network"));
+
+        // Quarantine still surfaces as a detail row.
+        let q = checks.iter().find(|c| c.name == "quarantine").unwrap();
+        assert_eq!(q.status, Status::Fail);
+        assert!(q.value.contains("auto"));
     }
 
     // ── network_config_error: top-line headline (PRD-002) ─────────────────

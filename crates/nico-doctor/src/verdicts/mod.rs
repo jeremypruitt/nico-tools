@@ -17,9 +17,11 @@
 //! reaching back into the per-layer renderer.
 
 pub mod cert;
+pub mod hbn;
 pub mod infiniband;
 
 pub use cert::cert_verdict;
+pub use hbn::hbn_verdict;
 pub use infiniband::ib_verdict;
 
 use nico_common::output::Status;

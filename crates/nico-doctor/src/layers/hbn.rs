@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(result.status, Status::Ok);
         let headline = result.checks.iter().find(|c| c.kind == CheckKind::Headline).unwrap();
         assert!(headline.value.contains("dpu-42"));
-        assert!(headline.value.contains("healthy"));
+        assert!(headline.value.contains("ok"));
     }
 
     #[tokio::test]
@@ -205,5 +205,70 @@ mod tests {
             .unwrap();
         assert_eq!(drift.status, Status::Fail);
         assert!(drift.value.contains("v8") && drift.value.contains("v9"));
+    }
+
+    // PRD-003 Slice 3 — issue #307: hbn.checks ordering is headline first
+    // (`CheckKind::Headline`, sourced from `hbn_verdict()`), then per-signal
+    // detail rows. Holistic per-DPU and fleet rollups (slices 4 + 5)
+    // consume the headline; the operator gets the full per-signal
+    // breakdown as detail rows beneath.
+    #[tokio::test]
+    async fn run_emits_exactly_one_headline_first_then_detail_rows() {
+        let layer = HbnLayer::new(StubClient::ok(snap_healthy()), "dpu-42");
+        let result = layer.run(&RunOpts::default()).await;
+
+        let headline_count = result
+            .checks
+            .iter()
+            .filter(|c| c.kind == CheckKind::Headline)
+            .count();
+        assert_eq!(headline_count, 1, "exactly one headline expected");
+        assert_eq!(
+            result.checks[0].kind,
+            CheckKind::Headline,
+            "headline must be first"
+        );
+        assert!(
+            result.checks[1..].iter().all(|c| c.kind == CheckKind::Detail),
+            "every check after the headline must be a detail row",
+        );
+    }
+
+    // Issue #307 acceptance: no detail dropped — every signal previously
+    // surfaced as a headline still appears in detail. Constructing a
+    // snapshot that triggers all five signals at once verifies that the
+    // detail-row layout preserves the full breakdown.
+    #[tokio::test]
+    async fn unhealthy_run_preserves_every_signal_as_a_detail_row() {
+        let mut snap = snap_healthy();
+        snap.network_config_error = Some("nvue apply failed".into());
+        snap.hbn_version = "1.9.0-doca2.4.0".into(); // below NVUE minimum
+        snap.applied_managed_host_config_version = "v16".into();
+        snap.desired_managed_host_config_version = "v17".into();
+        snap.bgp_alerts = vec!["BgpPeerDown".into()];
+        snap.last_seen_at = Utc::now() - chrono::Duration::seconds(600);
+
+        let layer = HbnLayer::new(StubClient::ok(snap), "dpu-42")
+            .with_freshness_threshold(Duration::from_secs(90));
+        let result = layer.run(&RunOpts::default()).await;
+
+        let names: Vec<&str> = result
+            .checks
+            .iter()
+            .filter(|c| c.kind == CheckKind::Detail)
+            .map(|c| c.name)
+            .collect();
+        for required in [
+            "network_config_error",
+            "version_nvue",
+            "managed_host_config",
+            "bgp",
+            "last_seen",
+        ] {
+            assert!(
+                names.contains(&required),
+                "expected detail row {required:?} in {names:?}"
+            );
+        }
     }
 }
