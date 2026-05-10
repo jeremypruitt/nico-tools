@@ -182,11 +182,12 @@ pub async fn run_doctor(args: DoctorArgs) -> i32 {
     if matches!(bootstrapped.output_format, OutputFormat::Json) {
         println!(
             "{}",
-            formatter::format_json(
+            formatter::format_json_with_capabilities(
                 &report,
                 &bootstrapped.namespace,
                 preflight::ok_section(),
-                &deltas
+                &deltas,
+                bootstrapped.deployment_type,
             )
         );
     } else {
@@ -270,11 +271,12 @@ pub async fn run_hbn(args: &DoctorArgs, hbn_args: HbnArgs) -> i32 {
     if matches!(config.output.format, OutputFormat::Json) {
         println!(
             "{}",
-            formatter::format_json(
+            formatter::format_json_with_capabilities(
                 &report,
                 &config.cluster.namespace,
                 preflight::ok_section(),
                 &std::collections::HashMap::new(),
+                config.cluster.deployment_type,
             )
         );
     } else {
@@ -357,11 +359,12 @@ pub async fn run_dpu_isolation(args: &DoctorArgs, iso_args: DpuIsolationArgs) ->
     if matches!(config.output.format, OutputFormat::Json) {
         println!(
             "{}",
-            formatter::format_json(
+            formatter::format_json_with_capabilities(
                 &report,
                 &config.cluster.namespace,
                 preflight::ok_section(),
                 &std::collections::HashMap::new(),
+                config.cluster.deployment_type,
             )
         );
     } else {
@@ -444,11 +447,12 @@ pub async fn run_dpu_cert(args: &DoctorArgs, cert_args: DpuCertArgs) -> i32 {
     if matches!(config.output.format, OutputFormat::Json) {
         println!(
             "{}",
-            formatter::format_json(
+            formatter::format_json_with_capabilities(
                 &report,
                 &config.cluster.namespace,
                 preflight::ok_section(),
                 &std::collections::HashMap::new(),
+                config.cluster.deployment_type,
             )
         );
     } else {
@@ -526,11 +530,12 @@ pub async fn run_dpu_health(args: &DoctorArgs, health_args: DpuHealthArgs) -> i3
     if matches!(config.output.format, OutputFormat::Json) {
         println!(
             "{}",
-            formatter::format_json(
+            formatter::format_json_with_capabilities(
                 &report,
                 &config.cluster.namespace,
                 preflight::ok_section(),
                 &std::collections::HashMap::new(),
+                config.cluster.deployment_type,
             )
         );
     } else {
@@ -614,11 +619,12 @@ pub async fn run_dpu_services(args: &DoctorArgs, svc_args: DpuServicesArgs) -> i
     if matches!(config.output.format, OutputFormat::Json) {
         println!(
             "{}",
-            formatter::format_json(
+            formatter::format_json_with_capabilities(
                 &report,
                 &config.cluster.namespace,
                 preflight::ok_section(),
                 &std::collections::HashMap::new(),
+                config.cluster.deployment_type,
             )
         );
     } else {
@@ -705,11 +711,12 @@ pub async fn run_infiniband(args: &DoctorArgs, ib_args: InfinibandArgs) -> i32 {
     if matches!(config.output.format, OutputFormat::Json) {
         println!(
             "{}",
-            formatter::format_json(
+            formatter::format_json_with_capabilities(
                 &report,
                 &config.cluster.namespace,
                 preflight::ok_section(),
                 &std::collections::HashMap::new(),
+                config.cluster.deployment_type,
             )
         );
     } else {

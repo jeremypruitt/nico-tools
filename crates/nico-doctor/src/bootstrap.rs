@@ -99,6 +99,12 @@ pub struct Bootstrapped {
     /// when no kubeconfig is reachable — layers fall back to direct
     /// fetches per their own contracts.
     pub log_collector: Option<Arc<LogCollectorStage>>,
+    /// Resolved deployment-type (PRD-001) — `Some(...)` once the
+    /// `--deployment-type` flag, config, env, or detection ladder has
+    /// produced a label; `None` for unresolved auto runs. Plumbed into
+    /// the JSON formatter so `--json` output gains the
+    /// `capabilities` object (issue #242).
+    pub deployment_type: Option<DeploymentType>,
     /// Kept alive until the caller is done running layers; dropping closes port-forwards.
     pub _pf_guards: Vec<nico_common::reach::ForwardedEndpoint>,
 }
@@ -388,6 +394,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         k8s_client: bootstrap_k8s,
         log_source,
         log_collector,
+        deployment_type: config.cluster.deployment_type,
         _pf_guards: pf_guards,
     })
 }
