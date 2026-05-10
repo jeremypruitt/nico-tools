@@ -647,7 +647,15 @@ pub fn load_minimal_config(args: &DoctorArgs) -> Result<Config, String> {
         });
     let file_toml = std::fs::read_to_string(&config_path).ok();
 
-    let overrides = ConfigOverrides {
+    let overrides = doctor_args_to_overrides(args);
+
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    Config::load(file_toml.as_deref(), &env, &overrides, None)
+        .map_err(|e| format!("error loading config: {e}"))
+}
+
+fn doctor_args_to_overrides(args: &DoctorArgs) -> ConfigOverrides {
+    ConfigOverrides {
         namespace: args.namespace.clone(),
         context: args.context.clone(),
         postgres_url: args.postgres_url.clone(),
@@ -657,10 +665,73 @@ pub fn load_minimal_config(args: &DoctorArgs) -> Result<Config, String> {
             None
         },
         format: if args.json { Some(OutputFormat::Json) } else { None },
+        deployment_type_spec: args.deployment_type.clone(),
         ..Default::default()
-    };
+    }
+}
 
-    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    Config::load(file_toml.as_deref(), &env, &overrides, None)
-        .map_err(|e| format!("error loading config: {e}"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nico_common::config::DeploymentType;
+    use std::collections::HashMap;
+
+    fn args_with_deployment_type(spec: Option<&str>) -> DoctorArgs {
+        DoctorArgs {
+            command: None,
+            namespace: None,
+            context: None,
+            skip: vec![],
+            since: "10m".into(),
+            timeout: "5s".into(),
+            timeouts: None,
+            json: false,
+            verbose: false,
+            spotlight: false,
+            ascii: false,
+            no_color: false,
+            postgres_url: None,
+            config: None,
+            mode: None,
+            theme: None,
+            deployment_type: spec.map(str::to_owned),
+        }
+    }
+
+    /// Regression for #299. Until this fix, `load_minimal_config` (used by
+    /// `run_hbn`, `run_dpu_isolation`, `run_dpu_cert`, `run_dpu_services`,
+    /// and `run_dpu_health`) dropped `args.deployment_type` on the floor —
+    /// so `--deployment-type=rest-only-mock <id>` ran the postgres path
+    /// instead of forgedb-skipping. Verify the CLI flag round-trips into
+    /// the resolved `cluster.deployment_type` for every label.
+    #[test]
+    fn load_minimal_config_round_trips_deployment_type_flag() {
+        for label in ["full", "core-only", "rest-only-mock", "force"] {
+            let args = args_with_deployment_type(Some(label));
+            let overrides = doctor_args_to_overrides(&args);
+            let cfg = Config::load(None, &HashMap::new(), &overrides, None)
+                .expect("load with synthetic args should not fail");
+            assert_eq!(
+                cfg.cluster.deployment_type,
+                DeploymentType::parse(label),
+                "expected --deployment-type={label} to resolve into cluster.deployment_type"
+            );
+        }
+    }
+
+    #[test]
+    fn load_minimal_config_auto_flag_round_trips_to_unresolved() {
+        let args = args_with_deployment_type(Some("auto"));
+        let overrides = doctor_args_to_overrides(&args);
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
+        assert!(cfg.cluster.deployment_type.is_none());
+    }
+
+    #[test]
+    fn load_minimal_config_no_flag_leaves_deployment_type_unresolved() {
+        let args = args_with_deployment_type(None);
+        let overrides = doctor_args_to_overrides(&args);
+        let cfg = Config::load(None, &HashMap::new(), &overrides, None).unwrap();
+        assert!(cfg.cluster.deployment_type.is_none());
+    }
 }
