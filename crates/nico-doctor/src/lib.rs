@@ -17,6 +17,7 @@ pub mod formatter;
 pub mod grpc;
 pub mod hbn;
 pub mod http;
+pub mod infiniband;
 pub mod layer;
 pub mod layers;
 pub mod log_collector;
@@ -30,7 +31,7 @@ pub mod verdicts;
 pub use bootstrap::{bootstrap, prepare_layers, Bootstrapped, BootstrapErr, LayerInputs};
 pub use cli::{
     DoctorArgs, DoctorCommand, DpuCertArgs, DpuHealthArgs, DpuIsolationArgs, DpuServicesArgs,
-    HbnArgs,
+    HbnArgs, InfinibandArgs,
 };
 pub use runner::Report;
 
@@ -135,6 +136,10 @@ pub async fn run_doctor(args: DoctorArgs) -> i32 {
 
     if let Some(DoctorCommand::DpuServices(svc_args)) = args.command.clone() {
         return run_dpu_services(&args, svc_args).await;
+    }
+
+    if let Some(DoctorCommand::Infiniband(ib_args)) = args.command.clone() {
+        return run_infiniband(&args, ib_args).await;
     }
 
     let bootstrapped = match bootstrap(&args).await {
@@ -593,6 +598,97 @@ pub async fn run_dpu_services(args: &DoctorArgs, svc_args: DpuServicesArgs) -> i
                 }
             };
         let l = layers::dpu_services::DpuServicesLayer::new(client, svc_args.dpu_id.clone())
+            .with_stale_threshold(stale_threshold);
+        vec![Box::new(l)]
+    };
+
+    let opts = layer::RunOpts {
+        namespace: config.cluster.namespace.clone(),
+        since: Duration::from_secs(600),
+        timeout: humantime::parse_duration(&args.timeout).unwrap_or(Duration::from_secs(5)),
+        ..Default::default()
+    };
+
+    let report = run_once(&layers, &opts).await;
+
+    if matches!(config.output.format, OutputFormat::Json) {
+        println!(
+            "{}",
+            formatter::format_json(
+                &report,
+                &config.cluster.namespace,
+                preflight::ok_section(),
+                &std::collections::HashMap::new(),
+            )
+        );
+    } else {
+        print!(
+            "{}",
+            formatter::format_report(
+                &report,
+                &output_mode,
+                args.verbose,
+                &std::collections::HashMap::new(),
+                args.spotlight,
+            )
+        );
+    }
+
+    exit_code(&report)
+}
+
+/// `nico doctor infiniband <dpu-id>` flow (PRD-004 slice 2). Same shape
+/// as [`run_dpu_services`]: bypasses the multi-layer ladder, reuses the
+/// standard config resolution and headline-vs-detail formatter, and
+/// only depends on Postgres reachability. Forgedb-gated: skips cleanly
+/// under `rest-only-mock`. The `infiniband_present` capability gate
+/// (PRD-004 slice 1) is not consulted here — the user explicitly asked
+/// for the IB drill-down on a specific DPU; we trust them and let the
+/// data layer surface "no machines row" if there is no observation.
+pub async fn run_infiniband(args: &DoctorArgs, ib_args: InfinibandArgs) -> i32 {
+    let config = match load_minimal_config(args) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 1;
+        }
+    };
+
+    let output_mode = nico_common::output::OutputMode {
+        color: match config.output.color {
+            nico_common::config::ColorMode::Always => true,
+            nico_common::config::ColorMode::Never => false,
+            nico_common::config::ColorMode::Auto => std::env::var("NO_COLOR").is_err(),
+        },
+        ascii: args.ascii,
+    };
+
+    let stale_threshold = match ib_args.stale.as_deref() {
+        Some(s) => match humantime::parse_duration(s) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("error: invalid --stale {s:?}: {e}");
+                return 1;
+            }
+        },
+        None => infiniband::DEFAULT_OBSERVATION_STALE_THRESHOLD,
+    };
+
+    let layers: Vec<Box<dyn layer::Layer>> = if let Some(skip) =
+        layer::forgedb_skip_layer("infiniband", config.cluster.deployment_type)
+    {
+        vec![skip]
+    } else {
+        let client: Arc<dyn infiniband::IbClient> =
+            match infiniband::SqlxIbClient::new(&config.postgres.url) {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    eprintln!("error: invalid postgres URL: {e}");
+                    eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
+                    return 1;
+                }
+            };
+        let l = layers::infiniband::InfinibandLayer::new(client, ib_args.dpu_id.clone())
             .with_stale_threshold(stale_threshold);
         vec![Box::new(l)]
     };

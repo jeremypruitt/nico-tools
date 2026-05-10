@@ -7,6 +7,7 @@ pub mod dpu_services;
 pub mod grpc;
 pub mod hbn;
 pub mod health;
+pub mod infiniband;
 pub mod logs;
 pub mod postgres;
 pub mod workflows;

@@ -168,6 +168,28 @@ pub fn temporal_skip_layer(
     ))
 }
 
+/// PRD-004 slice 2 IB capability gate: when the boot-probed
+/// `infiniband_present` is `Some(false)` (RoCE / ethernet-only fleet)
+/// or `None` (force mode / detection unavailable), return a
+/// [`SkippedLayer`] with an operator-readable reason. `Some(true)`
+/// returns `None` so the caller installs the real IB layer.
+pub fn infiniband_skip_layer(
+    name: &'static str,
+    infiniband_present: Option<bool>,
+) -> Option<Box<dyn Layer>> {
+    match infiniband_present {
+        Some(true) => None,
+        Some(false) => Some(SkippedLayer::with_reason(
+            name,
+            "n/a: no InfiniBand fabric detected",
+        )),
+        None => Some(SkippedLayer::with_reason(
+            name,
+            "n/a: InfiniBand presence not detected (force mode)",
+        )),
+    }
+}
+
 pub struct UnconfiguredLayer {
     name: &'static str,
     reason: String,
@@ -296,6 +318,39 @@ mod tests {
     #[test]
     fn forgedb_skip_layer_returns_none_when_deployment_type_unresolved() {
         assert!(forgedb_skip_layer("hbn", None).is_none());
+    }
+
+    // PRD-004 slice 2 — infiniband_skip_layer tests.
+
+    #[tokio::test]
+    async fn infiniband_skip_layer_skips_when_capability_some_false() {
+        let layer = infiniband_skip_layer("infiniband", Some(false))
+            .expect("Some(false) ⇒ skip layer expected");
+        let r = layer.run(&opts()).await;
+        assert_eq!(r.name, "infiniband");
+        assert_eq!(r.status, Status::Skipped);
+        assert_eq!(
+            r.skipped_reason.as_deref(),
+            Some("n/a: no InfiniBand fabric detected")
+        );
+    }
+
+    #[tokio::test]
+    async fn infiniband_skip_layer_skips_when_capability_none() {
+        let layer = infiniband_skip_layer("infiniband", None)
+            .expect("None ⇒ skip layer expected (force mode / detection unavailable)");
+        let r = layer.run(&opts()).await;
+        assert_eq!(r.status, Status::Skipped);
+        assert!(r
+            .skipped_reason
+            .as_deref()
+            .unwrap()
+            .contains("force mode"));
+    }
+
+    #[test]
+    fn infiniband_skip_layer_returns_none_when_capability_some_true() {
+        assert!(infiniband_skip_layer("infiniband", Some(true)).is_none());
     }
 
     #[tokio::test]

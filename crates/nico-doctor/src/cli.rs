@@ -128,6 +128,17 @@ pub enum DoctorCommand {
     /// `Terminated` and the `removed` flag are info-only. Stale
     /// observation timestamp also warns.
     DpuServices(DpuServicesArgs),
+
+    /// Single-DPU InfiniBand fabric drill-down (PRD-004 slice 2, issue
+    /// #312).
+    ///
+    /// Reads `machines.infiniband_status_observation` JSON and emits a
+    /// headline plus per-port detail rows (full GUID, fabric_id, lid,
+    /// port_state). Verdict precedence: Fail when any port has empty
+    /// `fabric_id` or `lid == 0xffff`; Warn when UFM is unobservable,
+    /// the observation is older than `--stale` (default 4h), or any
+    /// IB-typed `HealthReport` alert is present; Ok otherwise.
+    Infiniband(InfinibandArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -181,6 +192,18 @@ pub struct DpuServicesArgs {
     /// (default 5m). Also gates whether transient `Pending` / `Unknown`
     /// service states warn. Accepts any humantime duration, e.g. `30s`,
     /// `5m`, `1h`.
+    #[arg(long, value_name = "DURATION")]
+    pub stale: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct InfinibandArgs {
+    /// DPU machine ID to inspect.
+    pub dpu_id: String,
+
+    /// Override the `infiniband_status_observation` staleness threshold
+    /// (default 4h, inheriting the PRD-002 DHCP staleness baseline).
+    /// Accepts any humantime duration, e.g. `30s`, `5m`, `4h`.
     #[arg(long, value_name = "DURATION")]
     pub stale: Option<String>,
 }
