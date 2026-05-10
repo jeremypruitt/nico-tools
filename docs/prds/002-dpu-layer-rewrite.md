@@ -1,6 +1,6 @@
 # PRD-002 — DPU layer rewrite: schema realignment + new axes
 
-- **Status:** Specced (2026-05-09; amended same day to fold in the fleet-wide `dpu` layer after PR #241 landed); awaiting `/to-issues` breakdown.
+- **Status:** Specced (2026-05-09; amended same day to fold in the fleet-wide `dpu` layer after PR #241 landed; amended again 2026-05-09 to defer the `infiniband` layer to PRD-004 after the verdict-shape grilling triggered a wider holistic-summary scope expansion captured in PRD-003); awaiting `/to-issues` breakdown.
 - **Epic:** #253 (carries `prd-002` label; tracks slice progress).
 - **Touches:** `CONTEXT.md` (`dpu` layer entry; new layer entries for `dpu_health`, `dpu_services`, `infiniband`).
 - **Pre-existing bugs this fixes:** #213, #147.
@@ -187,17 +187,79 @@ Verdict shape:
 - Any service with `removed` flag → info-only line.
 - Stale `extension_service_observation->>'observed_at'` → `warn`.
 
-### `infiniband` (NEW)
+### `infiniband` (NEW — deferred to PRD-004)
 
-Consumes `machines.infiniband_status_observation` (separate JSON
-column, already populated by core via
-`update_infiniband_status_observation`). Decision 2026-05-09: in scope
-for nico-doctor — for GPU/IB clusters, IB fabric is often more
-operationally critical than HBN.
+Decision 2026-05-09 (verdict-shape grill, issue #264): the
+`infiniband` layer scope grew beyond what fits as a PRD-002 slice.
+The verdict-shape grilling reached three conclusions that warrant
+their own PRD epic:
 
-Schema needs a brief field-by-field study at implementation time
-(parallel to the network observation). Verdict shape (per-DPU
-rollup, per-port detail, both?) deferred to implementation.
+1. The layer should produce both per-DPU drill-down detail AND a
+   fleet rollup. The fleet rollup belongs as a headline inside the
+   existing `dpu` layer (not as a parallel fleet-IB layer), which
+   pulls in a holistic-summary refactor across all per-DPU axes.
+2. The detail-vs-rollup separation needs a shared verdict primitive
+   (one source of truth per axis, summary referenced everywhere)
+   to avoid two-source divergence as new axes (IB, future RoCE)
+   land. That primitive is broader than IB.
+3. IB-presence detection needs a new capability flag
+   (`infiniband_present`) parallel to `forgedb_present` from PRD-001.
+   Some clusters have no IB at all (RoCE / ethernet-only) and the
+   layer must skip cleanly.
+
+The shared-verdict refactor lands as **PRD-003** (per-DPU + fleet
+holistic summary refactor). The IB layer drops into the PRD-003
+pattern as **PRD-004** (`infiniband` layer). PRD-004 also amends
+`dpu_health` below (carve out IB-typed alerts in addition to
+BGP-typed and config-error).
+
+Field-by-field study of `machines.infiniband_status_observation`
+(per issue #264 acceptance criteria) is recorded inline here so
+PRD-002 captures the producer-side reality consistent with the
+other layers. The verdict-shape decision is recorded in PRD-004.
+
+#### Field study — `MachineInfinibandStatusObservation`
+
+Stored as JSONB on `machines.infiniband_status_observation`
+(nullable; populated by the IB fabric monitor on the core side).
+Defined at `infra-controller-core/crates/api-model/src/machine/infiniband.rs:30-61`.
+
+```rust
+pub struct MachineInfinibandStatusObservation {
+    pub ib_interfaces: Vec<MachineIbInterfaceStatusObservation>,
+    pub observed_at: DateTime<Utc>,
+}
+
+pub struct MachineIbInterfaceStatusObservation {
+    pub guid: String,
+    pub lid: u16,                                          // 0xffff = port not Active
+    pub fabric_id: String,                                 // empty = never seen on any fabric
+    pub associated_pkeys: Option<HashSet<PartitionKey>>,   // None = unobservable from UFM
+    pub associated_partition_ids: Option<HashSet<IBPartitionId>>,
+}
+```
+
+Per-port signal interpretation:
+
+| Field | Healthy | Unhealthy reading |
+|---|---|---|
+| `lid` | non-`0xffff` | `0xffff` ⇒ port not Active |
+| `fabric_id` | non-empty fabric id string | empty ⇒ GUID never observed on any fabric |
+| `associated_pkeys` | `Some(set)` | `None` ⇒ UFM reports unobservable |
+| `associated_partition_ids` | `Some(set)`; cardinality may differ from `pkeys` if a pkey doesn't map to a partition | `None` ⇒ same as above |
+| `observed_at` (parent) | recent | stale (threshold shared with DHCP staleness — open item below) |
+
+Producer: `IbFabricMonitor`
+(`infra-controller-core/crates/ib-fabric/src/lib.rs:788-1078`)
+queries UFM, populates the observation, and emits IB-typed alerts
+(`IbPortDown`, `IbCleanupPending`) in `dpu_agent_health_report`.
+
+Multiple ports per DPU is a first-class case (`ib_interfaces` is
+`Vec<...>`). There is a parallel "expected" config in core
+(`InstanceInfinibandConfig`, instance-level) and core's
+`ib_config_synced()` helper compares them — surfacing that
+comparison is **out of scope** for both PRD-004 and this PRD; see
+issue #301 (potential PRD-005).
 
 ## Decisions captured
 
@@ -207,14 +269,18 @@ rollup, per-port detail, both?) deferred to implementation.
 | Non-BGP alerts | New `dpu_health` layer | 2026-05-09 |
 | Extension services | New `dpu_services` layer | 2026-05-09 |
 | Agent-version drift | Surface in `dpu_health` with verdict | 2026-05-09 |
-| IB fabric | New `infiniband` layer | 2026-05-09 |
+| IB fabric | New `infiniband` layer (deferred to PRD-004; verdict shape recorded there) | 2026-05-09 |
 | DHCP staleness | New check inside `dpu_health` | 2026-05-09 |
 | `dpu_health` output grouping | By category | 2026-05-09 |
 
 ## Open items (resolve during implementation)
 
-- DHCP staleness threshold default (4h vs 24h vs operator-configurable)
-- IB fabric verdict shape (per-port, per-DPU rollup, both)
+- DHCP staleness threshold default (4h vs 24h vs operator-configurable).
+  Shared with PRD-004's `ib-observation-fresh` threshold; resolve here
+  and PRD-004 inherits.
+- ~~IB fabric verdict shape (per-port, per-DPU rollup, both)~~ —
+  resolved 2026-05-09 by deferral to PRD-004 (verdict shape
+  recorded there).
 - Extension-service "non-Ready for too long" threshold
 - Exact storage column for `last_dhcp_requests` (handler iterates;
   trace the persistence path during implementation)
@@ -274,5 +340,11 @@ rollup, per-port detail, both?) deferred to implementation.
 - Issue #214 / PR #241 — `nico doctor` fleet-wide `dpu` layer. Shipped
   2026-05-08 with the same missing-table bug; in scope of this PRD per
   the 2026-05-09 amendment.
+- Issue #264 — IB verdict-shape design spike. Resolved by this PRD's
+  field study + deferral to PRD-004.
+- PRD-003 — per-DPU + fleet holistic summary refactor. Refactors the
+  layer surface PRD-002 establishes; sequenced after this PRD.
+- PRD-004 — `infiniband` layer. Drops into PRD-003's pattern; amends
+  this PRD's `dpu_health` carve-out to also exclude IB-typed alerts.
 - CONTEXT.md `dpu` layer entry — fleet-wide rollup; data-source
   description updated alongside this PRD.
