@@ -31,15 +31,25 @@ use crate::layer::{Check, CheckKind};
 /// renewal stopped landing in the controller".
 pub const DEFAULT_DHCP_STALE_THRESHOLD: Duration = Duration::from_secs(4 * 60 * 60);
 
-/// IDs whose alerts surface elsewhere — `hbn` owns the BGP-typed alerts
-/// and the network-config-error headline. We deliberately drop these here
-/// to keep the drill-downs single-purpose.
+/// Per-layer carve-outs. `hbn` owns BGP-typed alerts and the
+/// network-config-error headline (PRD-002 carve-out); `infiniband` owns
+/// every `Ib*` probe id (PRD-004 slice 3 carve-out — `IbPortDown`,
+/// `IbCleanupPending`, and any future `Ib*` probe). We drop both
+/// families here to keep `dpu_health` focused on the agent-health,
+/// drift, and DHCP signals other layers deliberately leave behind.
 const HBN_OWNED_PROBE_IDS: &[&str] = &[
     "BgpPeerDown",
     "BgpRoutesMissing",
     "BgpStateInvalid",
     "NetworkConfigError",
 ];
+
+/// True for any probe id owned by the `infiniband` layer. Prefix-based
+/// rather than enumerated so a future `Ib*` probe id added upstream is
+/// carved out automatically without a code change here.
+fn is_infiniband_owned(id: &str) -> bool {
+    id.starts_with("Ib")
+}
 
 /// One alert from `HealthReport.alerts`, narrowed to fields the layer
 /// reads. `category` is derived from `id` (the agent's `HealthReport`
@@ -310,6 +320,7 @@ pub fn assemble_checks(
         .alerts
         .iter()
         .filter(|a| !HBN_OWNED_PROBE_IDS.contains(&a.id.as_str()))
+        .filter(|a| !is_infiniband_owned(&a.id))
         .collect();
     surfaced.sort_by(|a, b| a.category().cmp(b.category()).then_with(|| a.id.cmp(&b.id)));
     for alert in surfaced {
@@ -553,6 +564,37 @@ mod tests {
     // ── alerts: BGP and config-error are HBN-owned, not surfaced here ────
 
     #[test]
+    fn ib_typed_alerts_do_not_surface_in_dpu_health() {
+        // PRD-004 slice 3 carve-out: Ib* probe IDs are owned by the
+        // `infiniband` layer, mirror of the BGP→hbn carve-out PRD-002
+        // already established.
+        let mut snap = snap_healthy();
+        snap.alerts = vec![
+            AgentAlert {
+                id: "IbPortDown".into(),
+                target: Some("fe80::1".into()),
+                message: "port 1 down".into(),
+                in_alert_since: None,
+            },
+            AgentAlert {
+                id: "IbCleanupPending".into(),
+                target: None,
+                message: "cleanup queue".into(),
+                in_alert_since: None,
+            },
+            AgentAlert {
+                id: "IbFutureProbeId".into(),
+                target: None,
+                message: "any Ib* prefix".into(),
+                in_alert_since: None,
+            },
+        ];
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        assert_eq!(checks.len(), 1, "only headline expected, Ib* filtered out");
+        assert_eq!(checks[0].status, Status::Ok);
+    }
+
+    #[test]
     fn bgp_typed_alerts_do_not_surface_in_dpu_health() {
         let mut snap = snap_healthy();
         snap.alerts = vec![
@@ -588,15 +630,15 @@ mod tests {
         assert_eq!(checks[0].status, Status::Ok);
     }
 
-    // ── alerts: non-BGP categories surface as Fail details ────────────────
+    // ── alerts: non-BGP / non-Ib categories surface as Fail details ──────
 
     #[test]
-    fn ib_port_down_surfaces_as_fail_detail_with_ib_fabric_category() {
+    fn heartbeat_timeout_surfaces_as_fail_detail_with_agent_category() {
         let mut snap = snap_healthy();
         snap.alerts = vec![AgentAlert {
-            id: "IbPortDown".into(),
-            target: None,
-            message: "2 of 8 ports down".into(),
+            id: "HeartbeatTimeout".into(),
+            target: Some("dpu-42".into()),
+            message: "no health report received".into(),
             in_alert_since: None,
         }];
         let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
@@ -607,9 +649,9 @@ mod tests {
             .find(|c| c.kind == CheckKind::Detail)
             .unwrap();
         assert_eq!(detail.status, Status::Fail);
-        assert!(detail.value.contains("[ib_fabric]"), "value: {}", detail.value);
-        assert!(detail.value.contains("IbPortDown"));
-        assert!(detail.value.contains("2 of 8 ports down"));
+        assert!(detail.value.contains("[agent]"), "value: {}", detail.value);
+        assert!(detail.value.contains("HeartbeatTimeout"));
+        assert!(detail.value.contains("no health report received"));
 
         let headline = checks
             .iter()
@@ -624,7 +666,7 @@ mod tests {
         let mut snap = snap_healthy();
         snap.alerts = vec![
             AgentAlert {
-                id: "IbPortDown".into(),
+                id: "SkuValidation".into(),
                 target: None,
                 message: String::new(),
                 in_alert_since: None,
@@ -655,17 +697,17 @@ mod tests {
             .collect();
         assert_eq!(details.len(), 4);
 
-        // Categories sorted alphabetically: agent, ib_fabric, operator
+        // Categories sorted alphabetically: agent, operator, sku
         let cats: Vec<&str> = details
             .iter()
             .map(|c| {
                 if c.value.contains("[agent]") { "agent" }
-                else if c.value.contains("[ib_fabric]") { "ib_fabric" }
                 else if c.value.contains("[operator]") { "operator" }
+                else if c.value.contains("[sku]") { "sku" }
                 else { "?" }
             })
             .collect();
-        assert_eq!(cats, vec!["agent", "agent", "ib_fabric", "operator"]);
+        assert_eq!(cats, vec!["agent", "agent", "operator", "sku"]);
     }
 
     // ── agent-version drift ──────────────────────────────────────────────
@@ -800,8 +842,8 @@ mod tests {
 
         let mut s_alert = snap_healthy();
         s_alert.alerts = vec![AgentAlert {
-            id: "IbPortDown".into(),
-            target: None,
+            id: "HeartbeatTimeout".into(),
+            target: Some("dpu-42".into()),
             message: String::new(),
             in_alert_since: None,
         }];
