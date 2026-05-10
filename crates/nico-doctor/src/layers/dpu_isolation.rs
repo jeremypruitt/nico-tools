@@ -1,8 +1,10 @@
 //! `nico doctor dpu-isolation <machine-id>` layer.
 //!
 //! Wraps a [`DpuIsolationClient`] and reduces the fetched
-//! [`IsolationSnapshot`] to a single headline [`Check`] via the pure
-//! [`assess`] / [`assemble_checks`] pair in [`crate::dpu_isolation`].
+//! [`IsolationSnapshot`] to a headline `Check` (sourced from
+//! [`crate::verdicts::isolation_verdict`]) followed by
+//! isolation-specific detail rows via
+//! [`crate::dpu_isolation::assemble_checks`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,17 +45,11 @@ impl Layer for DpuIsolationLayer {
 
     async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
         match self.client.fetch_snapshot(&self.machine_id).await {
-            Ok(snapshot) => {
-                let verdict = dpu_isolation::assess(
-                    &snapshot,
-                    Utc::now(),
-                    self.freshness_threshold,
-                );
-                LayerOutcome::Checks(dpu_isolation::assemble_checks(
-                    &self.machine_id,
-                    &verdict,
-                ))
-            }
+            Ok(snapshot) => LayerOutcome::Checks(dpu_isolation::assemble_checks(
+                &snapshot,
+                Utc::now(),
+                self.freshness_threshold,
+            )),
             Err(e) => LayerOutcome::Checks(dpu_isolation::assemble_error_checks(
                 &self.machine_id,
                 &e.to_string(),
@@ -154,6 +150,64 @@ mod tests {
         let layer = DpuIsolationLayer::new(StubClient::err("postgres unreachable"), "machine-42");
         let result = layer.run(&RunOpts::default()).await;
         assert_eq!(result.status, Status::Unknown);
+        assert!(result.checks[0].value.contains("postgres unreachable"));
+    }
+
+    // PRD-003 Slice 2 — issue #306: dpu_isolation.checks ordering is
+    // headline first (`CheckKind::Headline`, sourced from
+    // `isolation_verdict()`), then isolation-specific detail rows
+    // (`CheckKind::Detail`). Holistic per-DPU and fleet rollups
+    // (slices 5 + 6) consume the headline; the operator gets the
+    // raw quarantine state / last-seen timestamp / threshold echo
+    // as separate detail rows.
+    #[tokio::test]
+    async fn healthy_run_emits_headline_then_last_seen_and_threshold_detail_rows() {
+        use crate::layer::CheckKind;
+
+        let layer = DpuIsolationLayer::new(StubClient::ok(snap_healthy()), "machine-42");
+        let result = layer.run(&RunOpts::default()).await;
+
+        assert_eq!(result.status, Status::Ok);
+        assert_eq!(result.checks.len(), 3, "headline + 2 detail rows");
+        assert_eq!(result.checks[0].kind, CheckKind::Headline);
+        assert_eq!(result.checks[1].kind, CheckKind::Detail);
+        assert_eq!(result.checks[2].kind, CheckKind::Detail);
+        assert_eq!(result.checks[1].name, "last-seen");
+        assert_eq!(result.checks[2].name, "freshness-threshold");
+        assert_eq!(result.checks[2].value, "90s");
+    }
+
+    #[tokio::test]
+    async fn quarantined_run_emits_headline_then_quarantine_state_detail() {
+        use crate::layer::CheckKind;
+
+        let mut snap = snap_healthy();
+        snap.quarantine_state = Some("BlockAllTraffic".into());
+        let layer = DpuIsolationLayer::new(StubClient::ok(snap), "machine-42");
+        let result = layer.run(&RunOpts::default()).await;
+
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(result.checks[0].kind, CheckKind::Headline);
+
+        let qstate = result
+            .checks
+            .iter()
+            .find(|c| c.name == "quarantine-state")
+            .expect("quarantine-state detail row");
+        assert_eq!(qstate.kind, CheckKind::Detail);
+        assert_eq!(qstate.value, "BlockAllTraffic");
+    }
+
+    #[tokio::test]
+    async fn data_layer_error_run_emits_only_unknown_headline() {
+        use crate::layer::CheckKind;
+
+        let layer = DpuIsolationLayer::new(StubClient::err("postgres unreachable"), "machine-42");
+        let result = layer.run(&RunOpts::default()).await;
+
+        assert_eq!(result.status, Status::Unknown);
+        assert_eq!(result.checks.len(), 1);
+        assert_eq!(result.checks[0].kind, CheckKind::Headline);
         assert!(result.checks[0].value.contains("postgres unreachable"));
     }
 }

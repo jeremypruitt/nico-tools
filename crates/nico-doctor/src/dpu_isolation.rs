@@ -17,6 +17,15 @@
 //! `assess()` over a small [`IsolationSnapshot`] keeps the logic
 //! testable without touching Postgres; the [`DpuIsolationClient`] trait
 //! is the seam.
+//!
+//! Since PRD-003 Slice 2 (#306) the verdict precedence's `AxisSummary`
+//! shape lives in the shared [`crate::verdicts::isolation_verdict`]
+//! primitive (returning an [`crate::verdicts::AxisSummary`] that
+//! downstream holistic rollups consume); [`assemble_checks`] here is
+//! the per-layer renderer that turns that summary into a headline
+//! `Check` plus isolation-specific detail rows (quarantine state,
+//! last-seen timestamp, freshness threshold echo). The
+//! [`DpuIsolationClient`] trait remains the I/O seam.
 
 use std::time::Duration;
 use anyhow::Result;
@@ -25,6 +34,7 @@ use chrono::{DateTime, Utc};
 use nico_common::output::Status;
 
 use crate::layer::{Check, CheckKind};
+use crate::verdicts::{isolation_verdict, AxisSummary};
 
 /// Default `last_seen_at` freshness window before we declare the DPU
 /// `lost-connection`. Matches the HBN verdict default so the two
@@ -213,72 +223,68 @@ pub fn assess(
     }
 }
 
-/// Render the verdict as a single headline [`Check`]. The doctor
-/// formatter already paints the per-status colour and the
-/// next-command hint, so the verdict is self-contained: one line, no
-/// detail bullets.
-pub fn assemble_checks(machine_id: &str, verdict: &IsolationVerdict) -> Vec<Check> {
-    let (status, value, next_command) = match verdict {
-        IsolationVerdict::NotYetKnown {
-            reason: NotYetKnownReason::NotRegistered,
-        } => (
-            Status::Unknown,
-            format!("dpu {machine_id} not-yet-known: no machines row"),
-            Some(format!(
-                "nico correlate {machine_id} # confirm the ID is correct"
-            )),
-        ),
-        IsolationVerdict::NotYetKnown {
-            reason: NotYetKnownReason::ScoutDiscoveryIncomplete,
-        } => (
-            Status::Unknown,
-            format!("dpu {machine_id} not-yet-known: scout discovery has not completed"),
-            Some(format!(
-                "nico correlate {machine_id} # last scout activity"
-            )),
-        ),
-        IsolationVerdict::Quarantined { state } => (
-            Status::Fail,
-            format!("dpu {machine_id} quarantine requested: {state}"),
-            Some(format!(
-                "nico correlate {machine_id} # see why this DPU was quarantined"
-            )),
-        ),
-        IsolationVerdict::LostConnection {
-            last_seen_age,
-            threshold,
-        } => (
-            Status::Fail,
-            match last_seen_age {
-                Some(age) => format!(
-                    "dpu {machine_id} lost-connection: last seen {}s ago (threshold {}s)",
-                    age.as_secs(),
-                    threshold.as_secs()
-                ),
-                None => format!(
-                    "dpu {machine_id} lost-connection: no network_status_observation ever recorded"
-                ),
-            },
-            Some(format!(
-                "nico correlate {machine_id} # check DPU agent connectivity"
-            )),
-        ),
-        IsolationVerdict::Healthy { last_seen_age } => (
-            Status::Ok,
-            format!(
-                "dpu {machine_id} healthy: last seen {}s ago",
-                last_seen_age.as_secs()
-            ),
-            None,
-        ),
-    };
-    vec![Check {
-        name: "dpu_isolation",
-        status,
-        value,
-        next_command,
+/// Render the isolation axis as a headline `Check` (sourced from
+/// [`isolation_verdict`]) followed by isolation-specific detail rows:
+/// the operator-set quarantine mode (when set), the absolute last-seen
+/// timestamp (when present), and the freshness-threshold echo. The
+/// detail rows give the operator the raw data the punchy headline
+/// elides; the rollup layers (PRD-003 slices 5 + 6) consume only the
+/// headline.
+///
+/// JSON ordering — issue #306 acceptance criteria: headline first
+/// (`kind: "headline"`), then detail (`kind: "detail"`).
+pub fn assemble_checks(
+    snapshot: &IsolationSnapshot,
+    now: DateTime<Utc>,
+    freshness_threshold: Duration,
+) -> Vec<Check> {
+    let summary = isolation_verdict(snapshot, now, freshness_threshold);
+    let mut checks = vec![headline_from(&summary)];
+
+    if let Some(state) = snapshot.quarantine_state.as_deref()
+        && !state.is_empty()
+    {
+        checks.push(Check {
+            name: "quarantine-state",
+            status: Status::Ok,
+            value: state.to_string(),
+            next_command: None,
+            kind: CheckKind::Detail,
+        });
+    }
+
+    if let Some(last_seen) = snapshot.last_seen_at {
+        checks.push(Check {
+            name: "last-seen",
+            status: Status::Ok,
+            value: last_seen.to_rfc3339(),
+            next_command: None,
+            kind: CheckKind::Detail,
+        });
+        checks.push(Check {
+            name: "freshness-threshold",
+            status: Status::Ok,
+            value: format_seconds(freshness_threshold),
+            next_command: None,
+            kind: CheckKind::Detail,
+        });
+    }
+
+    checks
+}
+
+fn headline_from(summary: &AxisSummary) -> Check {
+    Check {
+        name: summary.axis,
+        status: summary.status.clone(),
+        value: summary.message.clone(),
+        next_command: summary.next_command.clone(),
         kind: CheckKind::Headline,
-    }]
+    }
+}
+
+fn format_seconds(d: Duration) -> String {
+    format!("{}s", d.as_secs())
 }
 
 /// Render a data-layer error as an `Unknown` headline so the verdict
@@ -447,65 +453,101 @@ mod tests {
         );
     }
 
-    // ── assemble_checks: rendering each verdict as a headline ────────────
+    // ── assemble_checks: headline-then-detail ordering + detail population
+    //
+    // Verdict precedence + per-variant content live in
+    // [`crate::verdicts::isolation`] tests. Tests here cover the layer
+    // renderer: headline-vs-detail ordering, detail-row contents, and
+    // data-layer error surfacing.
 
     #[test]
-    fn healthy_check_is_single_ok_headline_no_next_command() {
+    fn healthy_check_is_headline_then_last_seen_and_threshold_detail_rows() {
         let snap = snap_healthy();
-        let verdict = assess(&snap, snap.last_seen_at.unwrap(), DEFAULT_FRESHNESS_THRESHOLD);
-        let checks = assemble_checks(&snap.machine_id, &verdict);
-        assert_eq!(checks.len(), 1);
+        let checks = assemble_checks(&snap, snap.last_seen_at.unwrap(), DEFAULT_FRESHNESS_THRESHOLD);
+
+        assert_eq!(checks.len(), 3, "headline + 2 detail rows");
         assert_eq!(checks[0].kind, CheckKind::Headline);
         assert_eq!(checks[0].status, Status::Ok);
         assert!(checks[0].value.contains("machine-42"));
         assert!(checks[0].value.contains("healthy"));
         assert!(checks[0].next_command.is_none());
+
+        assert_eq!(checks[1].kind, CheckKind::Detail);
+        assert_eq!(checks[1].name, "last-seen");
+        assert!(checks[1].value.contains('T'), "last-seen: {}", checks[1].value);
+
+        assert_eq!(checks[2].kind, CheckKind::Detail);
+        assert_eq!(checks[2].name, "freshness-threshold");
+        assert_eq!(checks[2].value, "90s");
     }
 
     #[test]
-    fn quarantined_check_is_fail_with_state_and_correlate_hint() {
-        let verdict = IsolationVerdict::Quarantined {
-            state: "BlockAllTraffic".into(),
-        };
-        let checks = assemble_checks("machine-42", &verdict);
+    fn quarantined_check_emits_quarantine_state_detail_row_with_mode() {
+        let mut snap = snap_healthy();
+        snap.quarantine_state = Some("BlockAllTraffic".into());
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_FRESHNESS_THRESHOLD);
+
+        assert_eq!(checks[0].kind, CheckKind::Headline);
         assert_eq!(checks[0].status, Status::Fail);
+        assert!(checks[0].value.contains("quarantine requested"));
         assert!(checks[0].value.contains("BlockAllTraffic"));
-        assert!(
-            checks[0].value.contains("quarantine requested"),
-            "value: {}",
-            checks[0].value,
-        );
-        assert!(checks[0]
-            .next_command
-            .as_deref()
-            .unwrap()
-            .contains("nico correlate"));
+
+        let qstate = checks
+            .iter()
+            .find(|c| c.name == "quarantine-state")
+            .expect("quarantine-state detail row");
+        assert_eq!(qstate.kind, CheckKind::Detail);
+        assert_eq!(qstate.value, "BlockAllTraffic");
     }
 
     #[test]
-    fn lost_connection_check_includes_age_and_threshold_seconds() {
-        let verdict = IsolationVerdict::LostConnection {
-            last_seen_age: Some(Duration::from_secs(180)),
-            threshold: Duration::from_secs(90),
-        };
-        let checks = assemble_checks("machine-42", &verdict);
+    fn lost_connection_check_headline_includes_age_and_threshold_seconds() {
+        let mut snap = snap_healthy();
+        let now = Utc::now();
+        snap.last_seen_at = Some(now - chrono::Duration::seconds(180));
+        let checks = assemble_checks(&snap, now, Duration::from_secs(90));
+
+        assert_eq!(checks[0].kind, CheckKind::Headline);
         assert_eq!(checks[0].status, Status::Fail);
         assert!(checks[0].value.contains("180s"));
         assert!(checks[0].value.contains("90s"));
     }
 
     #[test]
-    fn lost_connection_check_handles_no_last_seen_row() {
-        let verdict = IsolationVerdict::LostConnection {
-            last_seen_age: None,
-            threshold: Duration::from_secs(90),
-        };
-        let checks = assemble_checks("machine-42", &verdict);
+    fn lost_connection_no_last_seen_omits_last_seen_and_threshold_details() {
+        let mut snap = snap_healthy();
+        snap.last_seen_at = None;
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_FRESHNESS_THRESHOLD);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].kind, CheckKind::Headline);
         assert_eq!(checks[0].status, Status::Fail);
+        assert!(checks[0].value.contains("no network_status_observation"));
+    }
+
+    #[test]
+    fn unregistered_machine_emits_only_unknown_headline_no_detail() {
+        let mut snap = snap_healthy();
+        snap.registered = false;
+        snap.scout_discovery_complete = false;
+        snap.last_seen_at = None;
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_FRESHNESS_THRESHOLD);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].kind, CheckKind::Headline);
+        assert_eq!(checks[0].status, Status::Unknown);
+        assert!(checks[0].value.contains("machines row"));
+    }
+
+    #[test]
+    fn empty_string_quarantine_state_does_not_emit_detail_row() {
+        let mut snap = snap_healthy();
+        snap.quarantine_state = Some("".into());
+        let checks = assemble_checks(&snap, snap.last_seen_at.unwrap(), DEFAULT_FRESHNESS_THRESHOLD);
+
         assert!(
-            checks[0].value.contains("no network_status_observation"),
-            "value: {}",
-            checks[0].value,
+            checks.iter().all(|c| c.name != "quarantine-state"),
+            "empty quarantine_state should not produce a detail row",
         );
     }
 
@@ -536,22 +578,14 @@ mod tests {
     }
 
     #[test]
-    fn not_yet_known_unregistered_check_is_unknown_with_distinct_reason() {
-        let verdict = IsolationVerdict::NotYetKnown {
-            reason: NotYetKnownReason::NotRegistered,
-        };
-        let checks = assemble_checks("machine-42", &verdict);
-        assert_eq!(checks[0].status, Status::Unknown);
-        assert!(checks[0].value.contains("not-yet-known"));
-        assert!(checks[0].value.contains("machines row"));
-    }
+    fn not_yet_known_scout_incomplete_emits_only_unknown_headline_distinct_from_unregistered() {
+        let mut snap = snap_healthy();
+        snap.scout_discovery_complete = false;
+        snap.last_seen_at = None;
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_FRESHNESS_THRESHOLD);
 
-    #[test]
-    fn not_yet_known_scout_incomplete_check_distinguishes_from_unregistered() {
-        let verdict = IsolationVerdict::NotYetKnown {
-            reason: NotYetKnownReason::ScoutDiscoveryIncomplete,
-        };
-        let checks = assemble_checks("machine-42", &verdict);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].kind, CheckKind::Headline);
         assert_eq!(checks[0].status, Status::Unknown);
         assert!(checks[0].value.contains("scout"));
     }

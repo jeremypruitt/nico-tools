@@ -19,10 +19,12 @@
 pub mod cert;
 pub mod hbn;
 pub mod infiniband;
+pub mod isolation;
 
 pub use cert::cert_verdict;
 pub use hbn::hbn_verdict;
 pub use infiniband::ib_verdict;
+pub use isolation::isolation_verdict;
 
 use nico_common::output::Status;
 
