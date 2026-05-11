@@ -319,8 +319,12 @@ impl BootProbe {
         }
     }
 
-    /// Successful end-of-probe: cancel the tick task, replace the
-    /// multi-line block with the one-line success receipt (TTY only).
+    /// Successful end-of-probe: cancel the tick task and print the
+    /// one-line success receipt directly below the live block. The
+    /// inline viewport is left painted so it survives the TUI's
+    /// `EnterAlternateScreen` / `LeaveAlternateScreen` round-trip — when
+    /// the operator quits the TUI, the preflight checks are restored
+    /// from the main buffer.
     pub async fn finish_success(mut self, namespace: &str) -> ProbeOutcome {
         if let Some(h) = self.tick_handle.take() {
             h.abort();
@@ -399,25 +403,20 @@ impl BootProbe {
     }
 }
 
-/// Wind down the inline-viewport terminal cleanly and emit the success
-/// receipt where the boot block used to live. The viewport is cleared
-/// (cursor lands at the top-left of the prior viewport area), the
-/// receipt is written there, and the cursor is then positioned just
-/// below the original viewport so subsequent stderr output doesn't land
-/// on a half-cleared row.
+/// Wind down the inline-viewport terminal leaving the boot block in
+/// place, then emit the one-line success receipt just below it. The
+/// painted block stays in the main buffer so it survives `nico ops`'s
+/// `EnterAlternateScreen` / `LeaveAlternateScreen` round-trip — the
+/// operator sees the preflight checks again on TUI exit. Mirrors
+/// `emit_failure_card_tty`'s "no clear" approach.
 fn emit_completion_receipt_tty(g: &mut Inner, receipt: &str) {
     if let Some(mut t) = g.tty_terminal.take() {
         let area = t.get_frame().area();
-        let _ = t.clear();
-        // Write receipt at the top of the (now-empty) viewport area.
         let mut stderr = io::stderr();
+        let _ = queue!(stderr, MoveTo(0, area.bottom()));
+        let _ = stderr.flush();
         let _ = stderr.write_all(receipt.as_bytes());
         let _ = stderr.write_all(b"\n");
-        // Park cursor below the prior viewport area so any future
-        // stderr output starts on a fresh row, not inside the (now
-        // blank) reserved region.
-        let bottom_row = area.bottom();
-        let _ = queue!(stderr, MoveTo(0, bottom_row));
         let _ = stderr.flush();
         drop(t);
     } else {

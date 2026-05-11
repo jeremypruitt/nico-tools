@@ -6,6 +6,7 @@
 - **Amended:** 2026-05-10 (PRD-001 slice 9 / #321: `detect_deployment_type` re-placed as a sequential gate at the end of `connecting`; supersedes the 2026-05-09 placement)
 - **Amended:** 2026-05-10 (ADR-0016: TTY render layer switches from hand-rolled `\x1b[F`/`\x1b[J` cursor moves to ratatui's `Viewport::Inline`; layout shape unchanged)
 - **Amended:** 2026-05-10 (PRD-004 slice 6 / #316: `detect_infiniband_present` step added to the `serving` section, gated on `forgedb_present` and a reachable postgres)
+- **Amended:** 2026-05-11 (success path no longer clears the multi-line block — the rendered checks stay painted so they survive `nico ops`'s `EnterAlternateScreen` / `LeaveAlternateScreen` and remain visible after the TUI exits; the one-line receipt prints directly below the bar)
 
 ## Context
 
@@ -139,14 +140,18 @@ strict short-circuit semantics.
 
 ### Transitions
 
-**On success:** the multi-line block clears. A single one-line receipt remains
-scrolled above the TUI:
+**On success:** the multi-line block stays painted. The one-line receipt
+prints directly below the bar:
 
 ```
+▰▰▰▰▰▰▰▰▰  9 / 9 checks
 nico: cluster ready (9 checks · 1.6s)
 ```
 
-The TUI then enters.
+The TUI then enters. Because the block is in the main buffer (not the
+alternate buffer the TUI runs in), `LeaveAlternateScreen` on quit
+restores it — the operator sees the preflight checks again on exit.
+*(2026-05-11 amendment; superseded the prior "block clears on success" rule.)*
 
 **On failure:** the block stays rendered. The failed bullet does a clean
 instant glyph swap to `✗` (no animation theatre). The bar's already-completed
