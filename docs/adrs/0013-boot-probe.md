@@ -4,6 +4,7 @@
 - **Date:** 2026-05-07
 - **Amended:** 2026-05-09 (PRD-001: `detect_deployment_type` step added to `validating` section) — **superseded** by 2026-05-10
 - **Amended:** 2026-05-10 (PRD-001 slice 9 / #321: `detect_deployment_type` re-placed as a sequential gate at the end of `connecting`; supersedes the 2026-05-09 placement)
+- **Amended:** 2026-05-10 (ADR-0016: TTY render layer switches from hand-rolled `\x1b[F`/`\x1b[J` cursor moves to ratatui's `Viewport::Inline`; layout shape unchanged)
 
 ## Context
 
