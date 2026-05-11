@@ -121,8 +121,11 @@ every output line points at where to dig deeper.
 - `crates/nico-correlate` — library only. Public API: `CorrelateArgs`,
   `resolve_config`, `prepare_sources`, `collect_all`, `run_correlate`.
   No `[[bin]]` section, no `ratatui`/`crossterm` deps. (ADR-011)
-- `crates/nico-ops` — placeholder lib crate, exposes `run_ops()`. The new
-  TUI architecture (async Component event loop, ADR-012) will land here.
+- `crates/nico-ops` — interactive ratatui dashboard (~7,900 LOC). Exposes
+  `run_ops()` (Layout A scorecard / Layout B Mission Control / Spotlight),
+  the `App` reducer + `Action` enum, and the per-refresh `data::collect`
+  fan-out. Hosts the `dpu` HBN panel via `nico ops hbn`. ADR-012's async
+  Component event loop landed here in earlier slices.
 - `crates/nico-common` — shared config, theme, output, k8s, temporal,
   reach-manager primitives. Unchanged by the umbrella restructure.
 

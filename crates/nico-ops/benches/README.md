@@ -112,3 +112,32 @@ Render scales sub-linearly with N because off-screen cards are not
 painted — but the per-card work (sparkline recompute + the
 `evidence.clone()` from Finding #3) still runs for every snapshot.
 The N=250 row is the leading indicator for Findings #2 + #3.
+
+## Slice 0a.3 — integration tests
+
+Sibling to the criterion benches above, Slice 0a.3 ships three
+regression-guard integration tests in `crates/nico-ops/tests/perf.rs`.
+They exercise the same composable seams (`data::collect` +
+`App::handle`) but assert end-to-end behavior at the level the
+operator notices on screen, rather than measuring it in isolation.
+
+| Test | What it pins | Bound |
+| --- | --- | --- |
+| `cold_start_to_first_paint` | wall-clock from `data::collect` to first `Action::Snapshots` reduce | < 1 s (3 OOMs slack over local baseline) |
+| `idle_tick_does_not_re_render` | `Action::Tick` after a settled refresh does not flip `app.dirty()` | exactly 0 of 100 ticks |
+| `memory_bounded_after_n_refreshes` | live heap (dhat) after 1000 reduce cycles stays bounded | `dhat-heap` feature gated; 50 MiB ceiling |
+
+Run them with:
+
+```bash
+# Two of three (memory test no-ops without the feature):
+cargo test -p nico-ops --test perf
+
+# Includes the dhat-gated memory regression guard:
+cargo test -p nico-ops --test perf --features dhat-heap
+```
+
+The bounds are deliberately loose — they are tripwires for catastrophic
+regressions, not tight latency budgets. Tighten them only after a
+stable per-host baseline has been established and the tests have been
+running clean across enough CI runs to characterize variance.

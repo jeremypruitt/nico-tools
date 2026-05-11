@@ -107,6 +107,80 @@ impl LokiClient for RealLokiClient {
     }
 }
 
+/// Test fakes — parallel to `nico_common::k8s::testing::MockK8sClient`
+/// and `nico_common::temporal::testing::MockTemporalClient`. Tests
+/// configure the return value once at construction; calls return clones
+/// (or report `Unreachable`) without any HTTP.
+pub mod testing {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// In-memory fake. Defaults to `Unreachable` so the
+    /// `best_effort_chain` falls through to the next source unless a
+    /// test pre-loads lines or an error explicitly.
+    pub struct MockLokiClient {
+        result: Mutex<MockState>,
+    }
+
+    enum MockState {
+        Unreachable,
+        Lines(Vec<(String, String)>),
+        Err(String),
+    }
+
+    impl Default for MockLokiClient {
+        fn default() -> Self {
+            Self {
+                result: Mutex::new(MockState::Unreachable),
+            }
+        }
+    }
+
+    impl MockLokiClient {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Pre-load `(pod, line)` rows the next `query_errors` call
+        /// should return as `LokiQueryResult::Lines`.
+        pub fn with_lines(self, lines: Vec<(String, String)>) -> Self {
+            *self.result.lock().unwrap() = MockState::Lines(lines);
+            self
+        }
+
+        /// Force `query_errors` to return an `Err` (network panic etc.),
+        /// distinct from the soft `Unreachable` signal.
+        pub fn with_err(self, msg: impl Into<String>) -> Self {
+            *self.result.lock().unwrap() = MockState::Err(msg.into());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl LokiClient for MockLokiClient {
+        async fn query_errors(
+            &self,
+            _namespace: &str,
+            _since: Duration,
+            _limit: usize,
+        ) -> Result<LokiQueryResult> {
+            let guard = self.result.lock().unwrap();
+            match &*guard {
+                MockState::Unreachable => Ok(LokiQueryResult::Unreachable),
+                MockState::Lines(rows) => Ok(LokiQueryResult::Lines(
+                    rows.iter()
+                        .map(|(p, t)| LokiLine {
+                            pod: p.clone(),
+                            text: t.clone(),
+                        })
+                        .collect(),
+                )),
+                MockState::Err(msg) => Err(anyhow!("{msg}")),
+            }
+        }
+    }
+}
+
 pub struct LokiLogSource {
     client: Arc<dyn LokiClient>,
 }
