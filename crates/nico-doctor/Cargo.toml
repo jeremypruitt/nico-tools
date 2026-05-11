@@ -35,5 +35,33 @@ dhat-heap = []
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 serde_json = "1"
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.5", features = ["async_tokio"] }
 dhat = "0.3"
+
+[[bench]]
+name = "cluster_layer_bench"
+harness = false
+
+[[bench]]
+name = "logs_layer_bench"
+harness = false
+
+[[bench]]
+name = "workflows_layer_bench"
+harness = false
+
+[[bench]]
+name = "health_layer_bench"
+harness = false
+
+[[bench]]
+name = "grpc_layer_bench"
+harness = false
+
+[[bench]]
+name = "postgres_layer_bench"
+harness = false
+
+[[bench]]
+name = "dpu_layer_bench"
+harness = false
