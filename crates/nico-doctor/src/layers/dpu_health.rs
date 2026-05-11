@@ -19,6 +19,12 @@ pub struct DpuHealthLayer {
     client: Arc<dyn DpuHealthClient>,
     dpu_id: String,
     dhcp_stale_threshold: Duration,
+    /// Boot-probe-resolved IB capability gate (PRD-004 slice 1).
+    /// Threaded through to [`dpu_health::assemble_checks`] so the
+    /// holistic per-DPU summary omits the `infiniband` axis on
+    /// confirmed RoCE / ethernet-only fleets (`Some(false)`) and
+    /// renders an `Unknown` row on `None`.
+    infiniband_present: Option<bool>,
 }
 
 impl DpuHealthLayer {
@@ -27,11 +33,21 @@ impl DpuHealthLayer {
             client,
             dpu_id: dpu_id.into(),
             dhcp_stale_threshold: DEFAULT_DHCP_STALE_THRESHOLD,
+            infiniband_present: None,
         }
     }
 
     pub fn with_dhcp_stale_threshold(mut self, threshold: Duration) -> Self {
         self.dhcp_stale_threshold = threshold;
+        self
+    }
+
+    /// Set the IB capability gate. `Some(false)` ⇒ omit the IB axis
+    /// from the holistic summary; `Some(true)` ⇒ render via
+    /// `ib_verdict`; `None` ⇒ render an `Unknown` "presence not
+    /// detected" headline.
+    pub fn with_infiniband_present(mut self, val: Option<bool>) -> Self {
+        self.infiniband_present = val;
         self
     }
 }
@@ -48,6 +64,7 @@ impl Layer for DpuHealthLayer {
                 &snapshot,
                 Utc::now(),
                 self.dhcp_stale_threshold,
+                self.infiniband_present,
             )),
             Ok(None) => LayerOutcome::Checks(dpu_health::assemble_no_status_checks(&self.dpu_id)),
             Err(e) => LayerOutcome::Checks(dpu_health::assemble_error_checks(
@@ -121,12 +138,22 @@ mod tests {
             bgp_alerts: vec![],
             extension_services_observed_at: Some(now),
             extension_services: vec![],
+            infiniband_observed_at: Some(now),
+            infiniband_ufm_observable: Some(true),
+            infiniband_ports: vec![crate::infiniband::IbPort {
+                guid: "fe80::1".into(),
+                fabric_id: "ib-fabric-1".into(),
+                lid: 7,
+                port_state: "Active".into(),
+            }],
+            ib_alerts: vec![],
         }
     }
 
     #[tokio::test]
     async fn healthy_snapshot_runs_as_ok_layer() {
-        let layer = DpuHealthLayer::new(StubClient::ok(Some(snap_healthy())), "dpu-42");
+        let layer = DpuHealthLayer::new(StubClient::ok(Some(snap_healthy())), "dpu-42")
+            .with_infiniband_present(Some(true));
         let result = layer.run(&RunOpts::default()).await;
         assert_eq!(result.name, "dpu_health");
         assert_eq!(result.status, Status::Ok);
@@ -150,7 +177,8 @@ mod tests {
             message: "no health report received".into(),
             in_alert_since: None,
         }];
-        let layer = DpuHealthLayer::new(StubClient::ok(Some(snap)), "dpu-42");
+        let layer = DpuHealthLayer::new(StubClient::ok(Some(snap)), "dpu-42")
+            .with_infiniband_present(Some(true));
         let result = layer.run(&RunOpts::default()).await;
         assert_eq!(result.status, Status::Fail);
     }
@@ -159,9 +187,42 @@ mod tests {
     async fn agent_version_drift_runs_as_warn_layer() {
         let mut snap = snap_healthy();
         snap.agent_version_superseded_at = Some(Utc::now() - chrono::Duration::days(2));
-        let layer = DpuHealthLayer::new(StubClient::ok(Some(snap)), "dpu-42");
+        let layer = DpuHealthLayer::new(StubClient::ok(Some(snap)), "dpu-42")
+            .with_infiniband_present(Some(true));
         let result = layer.run(&RunOpts::default()).await;
         assert_eq!(result.status, Status::Warn);
+    }
+
+    /// PRD-004 slice 4 acceptance: when the boot probe reports no IB
+    /// fabric, the layer must omit the `infiniband` row entirely. When
+    /// the gate is `None` (force mode / probe skipped), the row renders
+    /// `Unknown`. When `Some(true)`, the verdict drives the row.
+    #[tokio::test]
+    async fn infiniband_capability_gate_some_false_omits_axis() {
+        let layer = DpuHealthLayer::new(StubClient::ok(Some(snap_healthy())), "dpu-42")
+            .with_infiniband_present(Some(false));
+        let result = layer.run(&RunOpts::default()).await;
+        assert!(
+            !result.checks.iter().any(|c| c.name == "infiniband"),
+            "infiniband row should be omitted under Some(false)",
+        );
+    }
+
+    #[tokio::test]
+    async fn infiniband_capability_gate_none_emits_unknown_axis() {
+        // Default `infiniband_present == None` — layer leaves it
+        // unresolved, matching the per-DPU CLI path that doesn't run
+        // the boot probe.
+        let layer = DpuHealthLayer::new(StubClient::ok(Some(snap_healthy())), "dpu-42");
+        let result = layer.run(&RunOpts::default()).await;
+        let h = result
+            .checks
+            .iter()
+            .find(|c| c.name == "infiniband")
+            .expect("infiniband row expected on None");
+        assert_eq!(h.status, Status::Unknown);
+        // Layer aggregate becomes Unknown via worst-of across headlines.
+        assert_eq!(result.status, Status::Unknown);
     }
 
     #[tokio::test]
@@ -180,7 +241,8 @@ mod tests {
             last_dhcp: Some(Utc::now() - chrono::Duration::minutes(45)),
         }];
         // Default 4h threshold ⇒ Ok
-        let layer_default = DpuHealthLayer::new(StubClient::ok(Some(snap.clone())), "dpu-42");
+        let layer_default = DpuHealthLayer::new(StubClient::ok(Some(snap.clone())), "dpu-42")
+            .with_infiniband_present(Some(true));
         assert_eq!(
             layer_default.run(&RunOpts::default()).await.status,
             Status::Ok
@@ -188,6 +250,7 @@ mod tests {
 
         // Tighter 30m threshold ⇒ Warn
         let layer_tight = DpuHealthLayer::new(StubClient::ok(Some(snap)), "dpu-42")
+            .with_infiniband_present(Some(true))
             .with_dhcp_stale_threshold(Duration::from_secs(30 * 60));
         assert_eq!(
             layer_tight.run(&RunOpts::default()).await.status,

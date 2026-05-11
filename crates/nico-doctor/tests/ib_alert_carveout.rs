@@ -92,6 +92,10 @@ async fn ib_alert_surfaces_in_infiniband_layer_only_not_dpu_health() {
         bgp_alerts: vec![],
         extension_services_observed_at: Some(now),
         extension_services: vec![],
+        infiniband_observed_at: None,
+        infiniband_ufm_observable: None,
+        infiniband_ports: vec![],
+        ib_alerts: vec![],
     };
     let ib_snap = IbSnapshot {
         dpu_id: "dpu-42".into(),

@@ -29,9 +29,12 @@ use crate::dpu_isolation::{
 };
 use crate::dpu_services::{ServicesSnapshot, DEFAULT_OBSERVATION_STALE_THRESHOLD};
 use crate::hbn::{HbnSnapshot, DEFAULT_FRESHNESS_THRESHOLD as HBN_FRESHNESS_THRESHOLD};
+use crate::infiniband::{
+    IbSnapshot, DEFAULT_OBSERVATION_STALE_THRESHOLD as IB_STALE_THRESHOLD,
+};
 use crate::layer::{Check, CheckKind};
 use crate::verdicts::{
-    cert_verdict, hbn_verdict, isolation_verdict, services_verdict, AxisSummary,
+    cert_verdict, hbn_verdict, ib_verdict, isolation_verdict, services_verdict, AxisSummary,
 };
 
 /// Default DHCP staleness threshold. PRD-002 lists 4h / 24h / configurable
@@ -178,6 +181,20 @@ pub struct HealthSnapshot {
     /// `extension_service_observation->'extension_service_statuses'`
     /// parsed into per-service rows. Consumed by `services_verdict`.
     pub extension_services: Vec<crate::dpu_services::ServiceStatus>,
+    // ── PRD-004 slice 4: infiniband verdict inputs ────────────────────
+    /// `infiniband_status_observation->>'observed_at'`. Consumed by
+    /// `ib_verdict` (treated as "no observation" when `None`).
+    pub infiniband_observed_at: Option<DateTime<Utc>>,
+    /// `infiniband_status_observation->>'ufm_observable'`. `Some(false)`
+    /// ⇒ UFM lost visibility ⇒ Warn via `ib_verdict`.
+    pub infiniband_ufm_observable: Option<bool>,
+    /// Parsed `infiniband_status_observation->'ports'` array. Consumed
+    /// by `ib_verdict` (empty `fabric_id` or `lid == 0xffff` ⇒ Fail).
+    pub infiniband_ports: Vec<crate::infiniband::IbPort>,
+    /// IB-typed alerts from `dpu_agent_health_report` (id prefix `Ib`).
+    /// Consumed by `ib_verdict` as a Warn trigger. Parsed via
+    /// `crate::infiniband::parse_ib_alerts`.
+    pub ib_alerts: Vec<crate::infiniband::IbAlert>,
 }
 
 /// Read-only seam over forgedb for the `dpu_health` layer. Returning
@@ -223,7 +240,8 @@ pub(crate) const FETCH_SNAPSHOT_COLS: &str = "\
     COALESCE(m.network_status_observation->'instance_network_observation'->>'config_version', ''), \
     COALESCE(i.network_config_version, ''), \
     (m.network_status_observation->'extension_service_observation'->>'observed_at')::timestamptz, \
-    m.network_status_observation->'extension_service_observation'->'extension_service_statuses'";
+    m.network_status_observation->'extension_service_observation'->'extension_service_statuses', \
+    m.infiniband_status_observation";
 
 pub(crate) const FETCH_SNAPSHOT_FROM: &str =
     "FROM machines m LEFT JOIN instances i ON i.machine_id = m.id";
@@ -281,6 +299,7 @@ impl DpuHealthClient for SqlxDpuHealthClient {
             String,
             Option<DateTime<Utc>>,
             Option<serde_json::Value>,
+            Option<serde_json::Value>,
         );
         let row: Option<SnapshotRow> = sqlx::query_as(&sql)
             .bind(dpu_id)
@@ -304,10 +323,17 @@ impl DpuHealthClient for SqlxDpuHealthClient {
             desired_instance,
             services_observed_at,
             services_blob,
+            ib_observation_blob,
         )) = row
         else {
             return Ok(None);
         };
+
+        // PRD-004 slice 4: parse `infiniband_status_observation` JSONB
+        // sub-fields client-side so the row tuple stays under sqlx's
+        // 16-element FromRow limit.
+        let (ib_observed_at, ib_ufm_observable, ib_ports_blob) =
+            parse_ib_observation(ib_observation_blob.as_ref());
 
         let interfaces: Vec<(String, Option<DateTime<Utc>>)> =
             sqlx::query_as(FETCH_INTERFACES_SQL)
@@ -343,6 +369,10 @@ impl DpuHealthClient for SqlxDpuHealthClient {
             desired_instance_network_config_version: desired_instance,
             extension_services_observed_at: services_observed_at,
             extension_services: crate::dpu::parse_extension_services(services_blob.as_ref()),
+            infiniband_observed_at: ib_observed_at,
+            infiniband_ufm_observable: ib_ufm_observable,
+            infiniband_ports: crate::infiniband::parse_ports(ib_ports_blob.as_ref()),
+            ib_alerts: crate::infiniband::parse_ib_alerts(health_report.as_ref()),
         }))
     }
 }
@@ -395,16 +425,54 @@ fn parse_in_alert_since(v: &serde_json::Value) -> Option<DateTime<Utc>> {
     None
 }
 
+/// Split the raw `infiniband_status_observation` JSONB into the three
+/// sub-fields the verdict consumes: `observed_at`, `ufm_observable`,
+/// and the `ports` array (returned as a borrowable JSON value so the
+/// caller can pass it to `crate::infiniband::parse_ports`).
+///
+/// Tolerates the column being NULL or missing any sub-field; verdict
+/// adapters handle the resulting `(None, None, [])` as "no IB
+/// observation" — yielding `Unknown` via `ib_verdict`.
+pub fn parse_ib_observation(
+    blob: Option<&serde_json::Value>,
+) -> (Option<DateTime<Utc>>, Option<bool>, Option<serde_json::Value>) {
+    let Some(v) = blob else { return (None, None, None) };
+    let observed_at = v
+        .get("observed_at")
+        .and_then(|x| x.as_str())
+        .and_then(|s| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        });
+    let ufm_observable = v.get("ufm_observable").and_then(|x| x.as_bool());
+    let ports = v.get("ports").cloned();
+    (observed_at, ufm_observable, ports)
+}
+
 /// Assemble the per-DPU `dpu_health` check list from a snapshot — the
-/// **holistic per-DPU summary** introduced in PRD-003 slice 5 (#309).
+/// **holistic per-DPU summary** introduced in PRD-003 slice 5 (#309) and
+/// extended with the `infiniband` axis in PRD-004 slice 4 (#314).
+///
+/// `infiniband_present` mirrors the fleet `dpu` layer's capability gate
+/// (PRD-004 slice 1):
+///
+/// - `Some(true)` ⇒ emit the IB headline using `ib_verdict`.
+/// - `Some(false)` ⇒ omit the IB headline entirely (n/a-by-design — no
+///   IB fabric on this deployment).
+/// - `None` ⇒ emit an `Unknown` IB headline (probe was skipped: force
+///   mode, postgres unreachable, deployment-type unresolved, or
+///   `rest-only-mock`). The message reads "infiniband: presence not
+///   detected" so the operator knows why.
 ///
 /// Output ordering (matches the JSON-ordering acceptance):
 ///
 /// 1. One headline `Check` per per-DPU axis (`dpu_cert`, `dpu_isolation`,
-///    `hbn`, `dpu_services`), sourced from the shared verdict helpers.
-///    Each headline's `value` is the verdict's one-line message; each
-///    carries `next_command` pointing at `nico doctor <axis> <id>` so
-///    the operator can drill in.
+///    `hbn`, `dpu_services`, and — when not gated off — `infiniband`),
+///    sourced from the shared verdict helpers. Each headline's `value`
+///    is the verdict's one-line message; each carries `next_command`
+///    pointing at `nico doctor <axis> <id>` so the operator can drill
+///    in.
 /// 2. Agent-health-specific detail rows (unchanged in shape from
 ///    PRD-002 slice 6, #262):
 ///    - Agent-version drift (when `agent_version_superseded_at` is set).
@@ -417,6 +485,7 @@ pub fn assemble_checks(
     snapshot: &HealthSnapshot,
     now: DateTime<Utc>,
     dhcp_stale_threshold: Duration,
+    infiniband_present: Option<bool>,
 ) -> Vec<Check> {
     let cert = cert_summary(snapshot, now);
     let isolation = isolation_summary(snapshot, now);
@@ -430,8 +499,42 @@ pub fn assemble_checks(
         axis_headline_check(&services, &snapshot.dpu_id),
     ];
 
+    if let Some(ib_check) = ib_axis_headline(snapshot, now, infiniband_present) {
+        out.push(ib_check);
+    }
+
     out.extend(agent_health_details(snapshot, now, dhcp_stale_threshold));
     out
+}
+
+/// Build the `infiniband` axis headline per the PRD-004 slice 4 gate:
+/// `Some(true)` ⇒ `ib_verdict`; `Some(false)` ⇒ omit (returns `None`);
+/// `None` ⇒ an explicit `Unknown` "presence not detected" headline that
+/// keeps the row visible in the holistic grid even when the boot probe
+/// hasn't resolved IB presence.
+fn ib_axis_headline(
+    snapshot: &HealthSnapshot,
+    now: DateTime<Utc>,
+    infiniband_present: Option<bool>,
+) -> Option<Check> {
+    match infiniband_present {
+        Some(false) => None,
+        Some(true) => {
+            let summary = ib_summary(snapshot, now);
+            Some(axis_headline_check(&summary, &snapshot.dpu_id))
+        }
+        None => Some(Check {
+            name: "infiniband",
+            status: Status::Unknown,
+            value: format!(
+                "dpu {} infiniband: presence not detected (force mode \
+                 or boot probe skipped)",
+                snapshot.dpu_id
+            ),
+            next_command: Some(format!("nico doctor infiniband {}", snapshot.dpu_id)),
+            kind: CheckKind::Headline,
+        }),
+    }
 }
 
 /// Drill-down command suffix per axis — appended to `nico doctor` so the
@@ -444,6 +547,7 @@ fn drilldown_cli_name(axis: &'static str) -> &'static str {
         "dpu_cert" => "dpu-cert",
         "dpu_isolation" => "dpu-isolation",
         "dpu_services" => "dpu-services",
+        // `hbn` and `infiniband` already match their CLI names.
         _ => axis,
     }
 }
@@ -506,6 +610,20 @@ fn hbn_summary(s: &HealthSnapshot, now: DateTime<Utc>) -> AxisSummary {
         },
         now,
         HBN_FRESHNESS_THRESHOLD,
+    )
+}
+
+fn ib_summary(s: &HealthSnapshot, now: DateTime<Utc>) -> AxisSummary {
+    ib_verdict(
+        &IbSnapshot {
+            dpu_id: s.dpu_id.clone(),
+            observed_at: s.infiniband_observed_at,
+            ufm_observable: s.infiniband_ufm_observable,
+            ports: s.infiniband_ports.clone(),
+            ib_alerts: s.ib_alerts.clone(),
+        },
+        now,
+        IB_STALE_THRESHOLD,
     )
 }
 
@@ -676,6 +794,15 @@ mod tests {
             bgp_alerts: vec![],
             extension_services_observed_at: Some(now),
             extension_services: vec![],
+            infiniband_observed_at: Some(now),
+            infiniband_ufm_observable: Some(true),
+            infiniband_ports: vec![crate::infiniband::IbPort {
+                guid: "fe80::1".into(),
+                fabric_id: "ib-fabric-1".into(),
+                lid: 7,
+                port_state: "Active".into(),
+            }],
+            ib_alerts: vec![],
         }
     }
 
@@ -761,15 +888,21 @@ mod tests {
     // ── assemble_checks: empty (holistic shape, PRD-003 slice 5) ─────────
 
     #[test]
-    fn healthy_snapshot_yields_four_axis_headlines_all_ok() {
+    fn healthy_snapshot_yields_five_axis_headlines_all_ok() {
         let snap = snap_healthy();
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let headlines: Vec<&Check> = checks
             .iter()
             .filter(|c| c.kind == CheckKind::Headline)
             .collect();
-        assert_eq!(headlines.len(), 4, "one headline per axis");
-        for axis in ["dpu_cert", "dpu_isolation", "hbn", "dpu_services"] {
+        assert_eq!(headlines.len(), 5, "one headline per axis incl. infiniband");
+        for axis in [
+            "dpu_cert",
+            "dpu_isolation",
+            "hbn",
+            "dpu_services",
+            "infiniband",
+        ] {
             let h = headlines
                 .iter()
                 .find(|c| c.name == axis)
@@ -810,7 +943,7 @@ mod tests {
                 in_alert_since: None,
             },
         ];
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         assert!(
             checks.iter().all(|c| c.kind == CheckKind::Headline),
             "no agent-health detail rows expected (Ib* filtered out)",
@@ -837,7 +970,7 @@ mod tests {
                 in_alert_since: None,
             },
         ];
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         assert!(
             checks
                 .iter()
@@ -856,7 +989,7 @@ mod tests {
             message: "apply failed".into(),
             in_alert_since: None,
         }];
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         assert!(
             checks
                 .iter()
@@ -877,7 +1010,7 @@ mod tests {
             message: "no health report received".into(),
             in_alert_since: None,
         }];
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let details: Vec<&Check> = checks
             .iter()
             .filter(|c| c.kind == CheckKind::Detail)
@@ -931,7 +1064,7 @@ mod tests {
                 in_alert_since: None,
             },
         ];
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let details: Vec<&Check> = checks
             .iter()
             .filter(|c| c.kind == CheckKind::Detail)
@@ -960,7 +1093,7 @@ mod tests {
         let mut snap = snap_healthy();
         snap.agent_version = Some("1.5.0".into());
         snap.agent_version_superseded_at = Some(superseded);
-        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
 
         let drift = checks
             .iter()
@@ -988,7 +1121,7 @@ mod tests {
         let mut snap = snap_healthy();
         snap.agent_version = None;
         snap.agent_version_superseded_at = Some(now - chrono::Duration::days(1));
-        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let drift = checks
             .iter()
             .find(|c| c.name == "agent_version_drift")
@@ -999,7 +1132,7 @@ mod tests {
     #[test]
     fn no_drift_when_superseded_at_is_none() {
         let snap = snap_healthy();
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         assert!(checks.iter().all(|c| c.name != "agent_version_drift"));
     }
 
@@ -1013,7 +1146,7 @@ mod tests {
             mac_address: "aa:bb:cc:dd:ee:ff".into(),
             last_dhcp: Some(now - chrono::Duration::hours(5)),
         }];
-        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
 
         let stale = checks
             .iter()
@@ -1032,7 +1165,7 @@ mod tests {
             mac_address: "aa:bb:cc:dd:ee:ff".into(),
             last_dhcp: Some(now - chrono::Duration::minutes(30)),
         }];
-        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         assert!(checks.iter().all(|c| c.name != "dhcp_stale"));
     }
 
@@ -1043,7 +1176,7 @@ mod tests {
             mac_address: "aa:bb:cc:dd:ee:ff".into(),
             last_dhcp: None,
         }];
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         assert!(checks.iter().all(|c| c.name != "dhcp_stale"));
     }
 
@@ -1056,7 +1189,7 @@ mod tests {
             last_dhcp: Some(now - chrono::Duration::minutes(45)),
         }];
         // Tighter threshold of 30m ⇒ now stale
-        let checks = assemble_checks(&snap, now, Duration::from_secs(30 * 60));
+        let checks = assemble_checks(&snap, now, Duration::from_secs(30 * 60), Some(true));
         assert!(
             checks.iter().any(|c| c.name == "dhcp_stale"),
             "expected dhcp_stale detail under 30m threshold",
@@ -1076,7 +1209,7 @@ mod tests {
 
         let mut s_drift = snap_healthy();
         s_drift.agent_version_superseded_at = Some(now - chrono::Duration::days(1));
-        let drift_checks = assemble_checks(&s_drift, now, DEFAULT_DHCP_STALE_THRESHOLD);
+        let drift_checks = assemble_checks(&s_drift, now, DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let drift_detail = drift_checks
             .iter()
             .find(|c| c.name == "agent_version_drift")
@@ -1098,7 +1231,7 @@ mod tests {
             message: String::new(),
             in_alert_since: None,
         }];
-        let alert_checks = assemble_checks(&s_alert, now, DEFAULT_DHCP_STALE_THRESHOLD);
+        let alert_checks = assemble_checks(&s_alert, now, DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let alert_detail = alert_checks
             .iter()
             .find(|c| c.name == "alert")
@@ -1118,7 +1251,7 @@ mod tests {
     #[test]
     fn cert_axis_headline_carries_dpu_cert_drilldown_command() {
         let snap = snap_healthy();
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let h = checks
             .iter()
             .find(|c| c.name == "dpu_cert" && c.kind == CheckKind::Headline)
@@ -1132,7 +1265,7 @@ mod tests {
     #[test]
     fn isolation_axis_headline_carries_dpu_isolation_drilldown_command() {
         let snap = snap_healthy();
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let h = checks
             .iter()
             .find(|c| c.name == "dpu_isolation" && c.kind == CheckKind::Headline)
@@ -1146,7 +1279,7 @@ mod tests {
     #[test]
     fn hbn_axis_headline_carries_hbn_drilldown_command() {
         let snap = snap_healthy();
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let h = checks
             .iter()
             .find(|c| c.name == "hbn" && c.kind == CheckKind::Headline)
@@ -1157,7 +1290,7 @@ mod tests {
     #[test]
     fn services_axis_headline_carries_dpu_services_drilldown_command() {
         let snap = snap_healthy();
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let h = checks
             .iter()
             .find(|c| c.name == "dpu_services" && c.kind == CheckKind::Headline)
@@ -1177,7 +1310,7 @@ mod tests {
             message: String::new(),
             in_alert_since: None,
         }];
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let mut seen_detail = false;
         for c in &checks {
             match c.kind {
@@ -1192,9 +1325,9 @@ mod tests {
     }
 
     #[test]
-    fn axis_headline_order_is_cert_isolation_hbn_services() {
+    fn axis_headline_order_is_cert_isolation_hbn_services_infiniband() {
         let snap = snap_healthy();
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let names: Vec<&str> = checks
             .iter()
             .filter(|c| c.kind == CheckKind::Headline)
@@ -1202,8 +1335,84 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["dpu_cert", "dpu_isolation", "hbn", "dpu_services"],
+            vec![
+                "dpu_cert",
+                "dpu_isolation",
+                "hbn",
+                "dpu_services",
+                "infiniband",
+            ],
         );
+    }
+
+    // ── infiniband axis (PRD-004 slice 4) ────────────────────────────────
+
+    #[test]
+    fn infiniband_present_some_true_emits_ib_axis_headline_via_verdict() {
+        let snap = snap_healthy();
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
+        let h = checks
+            .iter()
+            .find(|c| c.name == "infiniband" && c.kind == CheckKind::Headline)
+            .expect("infiniband headline expected when capability is Some(true)");
+        assert_eq!(h.status, Status::Ok);
+        assert!(h.value.contains("healthy"), "value: {}", h.value);
+    }
+
+    #[test]
+    fn infiniband_present_some_false_omits_ib_axis_entirely() {
+        let snap = snap_healthy();
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(false));
+        assert!(
+            !checks.iter().any(|c| c.name == "infiniband"),
+            "infiniband row should be omitted when capability is Some(false)",
+        );
+    }
+
+    #[test]
+    fn infiniband_present_none_emits_unknown_ib_axis() {
+        let snap = snap_healthy();
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, None);
+        let h = checks
+            .iter()
+            .find(|c| c.name == "infiniband" && c.kind == CheckKind::Headline)
+            .expect("infiniband headline expected when capability is None");
+        assert_eq!(h.status, Status::Unknown);
+        assert!(
+            h.value.contains("presence not detected"),
+            "value: {}",
+            h.value,
+        );
+        assert!(
+            h.next_command
+                .as_deref()
+                .unwrap_or("")
+                .contains("nico doctor infiniband"),
+        );
+    }
+
+    #[test]
+    fn ib_fabric_id_empty_flips_infiniband_axis_to_fail() {
+        let mut snap = snap_healthy();
+        snap.infiniband_ports[0].fabric_id = "".into();
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
+        let h = checks
+            .iter()
+            .find(|c| c.name == "infiniband" && c.kind == CheckKind::Headline)
+            .unwrap();
+        assert_eq!(h.status, Status::Fail);
+    }
+
+    #[test]
+    fn ufm_unobservable_flips_infiniband_axis_to_warn() {
+        let mut snap = snap_healthy();
+        snap.infiniband_ufm_observable = Some(false);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
+        let h = checks
+            .iter()
+            .find(|c| c.name == "infiniband" && c.kind == CheckKind::Headline)
+            .unwrap();
+        assert_eq!(h.status, Status::Warn);
     }
 
     #[test]
@@ -1213,7 +1422,7 @@ mod tests {
             desired_managed_host_config_version: "v2".into(),
             ..snap_healthy()
         };
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let hbn = checks
             .iter()
             .find(|c| c.name == "hbn" && c.kind == CheckKind::Headline)
@@ -1228,7 +1437,7 @@ mod tests {
             quarantine_state: Some("BlockAllTraffic".into()),
             ..snap_healthy()
         };
-        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, Utc::now(), DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let iso = checks
             .iter()
             .find(|c| c.name == "dpu_isolation" && c.kind == CheckKind::Headline)
@@ -1243,7 +1452,7 @@ mod tests {
             client_certificate_expiry: Some(now - chrono::Duration::days(2)),
             ..snap_healthy()
         };
-        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let cert = checks
             .iter()
             .find(|c| c.name == "dpu_cert" && c.kind == CheckKind::Headline)
@@ -1265,7 +1474,7 @@ mod tests {
             }],
             ..snap_healthy()
         };
-        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD);
+        let checks = assemble_checks(&snap, now, DEFAULT_DHCP_STALE_THRESHOLD, Some(true));
         let svc = checks
             .iter()
             .find(|c| c.name == "dpu_services" && c.kind == CheckKind::Headline)
