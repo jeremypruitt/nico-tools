@@ -22,5 +22,5 @@ pub use orchestrate::{
     next_command_for, standard_steps, standard_steps_with_grpc, BootProbe, ProbeMode,
     ProbeOutcome, ProbeSink, StderrSink, Tracker,
 };
-pub use render::{render_block, render_bar, RenderMode};
+pub use render::{bar_line, BootProbeBlock, RenderMode};
 pub use state::{ProbeState, Section, StepDef, StepId, StepState};

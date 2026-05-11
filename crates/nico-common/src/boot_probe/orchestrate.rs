@@ -14,18 +14,26 @@
 //! sections are marked `Skipped` via `skip_remaining` rather than
 //! started.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crossterm::cursor::MoveTo;
+use crossterm::queue;
+use ratatui::backend::CrosstermBackend;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use super::json;
 use super::log::{success_receipt, transition_line};
-use super::render::{render_block, rendered_line_count, RenderMode};
+use super::render::{rendered_line_count, BootProbeBlock, RenderMode};
 use super::state::{ProbeState, StepDef, StepId, StepState};
+
+/// Concrete TTY terminal type — a ratatui Terminal driving a crossterm
+/// backend wrapping `io::Stderr`.
+type TtyTerminal = Terminal<CrosstermBackend<io::Stderr>>;
 
 /// Where the renderer paints output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,12 +78,17 @@ impl ProbeSink for StderrSink {
 struct Inner {
     state: ProbeState,
     started_at: Instant,
-    last_lines_written: usize,
     mode: ProbeMode,
+    /// Sink used for `NonTty` log lines and the `Json` no-op path.
+    /// `Tty` mode writes through `tty_terminal` instead.
     sink: Box<dyn ProbeSink>,
-    /// Whether we've ever painted a block (only used by Tty mode to
-    /// know whether to clear lines before repainting).
-    has_painted: bool,
+    /// Inline-viewport ratatui terminal for `Tty` mode. Lazily
+    /// constructed on first repaint, then re-created on demand when the
+    /// rendered line count changes (e.g. warnings appear).
+    tty_terminal: Option<TtyTerminal>,
+    /// Cached viewport height for the current `tty_terminal`. None
+    /// means no terminal yet.
+    tty_viewport_lines: Option<u16>,
 }
 
 /// Cloneable handle the bootstrap uses to push state transitions.
@@ -200,16 +213,6 @@ impl Tracker {
             Some(r) => r,
             None => return,
         };
-        // Cursor moves: clear the previous block (if any), then paint.
-        if g.has_painted && g.last_lines_written > 0 {
-            // ANSI: move cursor up N lines + clear from cursor to end of screen.
-            let mut esc = String::new();
-            for _ in 0..g.last_lines_written {
-                esc.push_str("\x1b[F"); // cursor up + start of line
-            }
-            esc.push_str("\x1b[J"); // clear from cursor to end of screen
-            g.sink.write_str(&esc);
-        }
         // Refresh elapsed times for active steps before painting.
         let now = Instant::now();
         let started_at = g.started_at;
@@ -224,11 +227,44 @@ impl Tracker {
         // nico-ops's throbber.
         let frame =
             (g.state.total_elapsed.as_millis() / 100) as usize % super::render::THROBBER_FRAMES.len();
-        let block = render_block(&g.state, render, frame);
         let lines = rendered_line_count(&g.state);
-        g.last_lines_written = lines;
-        g.has_painted = true;
-        g.sink.write_str(&block);
+        // u16 saturating cast — `rendered_line_count` is bounded by the
+        // step list (single-digit teens in practice) but be defensive.
+        let lines_u16: u16 = lines.try_into().unwrap_or(u16::MAX);
+
+        // (Re)construct the inline-viewport terminal if its viewport
+        // height no longer matches. ratatui inline viewports are sized
+        // at construction; for the boot probe the height grows when
+        // warnings are pushed after detection settles.
+        let need_new = !matches!(g.tty_viewport_lines, Some(h) if h == lines_u16);
+        if need_new {
+            // Wind down any existing terminal cleanly: clear its viewport
+            // (cursor lands at top of viewport area, contents wiped),
+            // then drop. The new terminal opens an inline viewport at
+            // the new height starting at the cursor position.
+            if let Some(mut t) = g.tty_terminal.take() {
+                let _ = t.clear();
+            }
+            let backend = CrosstermBackend::new(io::stderr());
+            let opts = TerminalOptions {
+                viewport: Viewport::Inline(lines_u16),
+            };
+            match Terminal::with_options(backend, opts) {
+                Ok(t) => {
+                    g.tty_terminal = Some(t);
+                    g.tty_viewport_lines = Some(lines_u16);
+                }
+                Err(_) => {
+                    g.tty_viewport_lines = None;
+                    return;
+                }
+            }
+        }
+
+        if let Some(t) = g.tty_terminal.as_mut() {
+            let widget = BootProbeBlock::new(&g.state, render, frame);
+            let _ = t.draw(|f| f.render_widget(widget, f.area()));
+        }
     }
 }
 
@@ -246,10 +282,10 @@ impl BootProbe {
         let inner = Arc::new(Mutex::new(Inner {
             state,
             started_at: Instant::now(),
-            last_lines_written: 0,
             mode,
             sink,
-            has_painted: false,
+            tty_terminal: None,
+            tty_viewport_lines: None,
         }));
         Self {
             inner,
@@ -283,8 +319,8 @@ impl BootProbe {
         }
     }
 
-    /// Successful end-of-probe: cancel the tick task, clear the multi-
-    /// line block (TTY only), and print the one-line success receipt.
+    /// Successful end-of-probe: cancel the tick task, replace the
+    /// multi-line block with the one-line success receipt (TTY only).
     pub async fn finish_success(mut self, namespace: &str) -> ProbeOutcome {
         if let Some(h) = self.tick_handle.take() {
             h.abort();
@@ -295,15 +331,7 @@ impl BootProbe {
         let json = json::success_document(&g.state, namespace);
         match g.mode {
             ProbeMode::Tty { .. } => {
-                let lines = rendered_line_count(&g.state);
-                let mut esc = String::new();
-                for _ in 0..lines {
-                    esc.push_str("\x1b[F");
-                }
-                esc.push_str("\x1b[J");
-                g.sink.write_str(&esc);
-                g.sink.write_str(&receipt);
-                g.sink.write_str("\n");
+                emit_completion_receipt_tty(&mut g, &receipt);
             }
             ProbeMode::NonTty => {
                 g.sink.write_str(&receipt);
@@ -346,7 +374,10 @@ impl BootProbe {
         );
 
         match g.mode {
-            ProbeMode::Tty { .. } | ProbeMode::NonTty => {
+            ProbeMode::Tty { .. } => {
+                emit_failure_card_tty(&mut g, &card);
+            }
+            ProbeMode::NonTty => {
                 g.sink.write_str(&card);
             }
             ProbeMode::Json => {
@@ -366,6 +397,57 @@ impl BootProbe {
             human_message,
         }
     }
+}
+
+/// Wind down the inline-viewport terminal cleanly and emit the success
+/// receipt where the boot block used to live. The viewport is cleared
+/// (cursor lands at the top-left of the prior viewport area), the
+/// receipt is written there, and the cursor is then positioned just
+/// below the original viewport so subsequent stderr output doesn't land
+/// on a half-cleared row.
+fn emit_completion_receipt_tty(g: &mut Inner, receipt: &str) {
+    if let Some(mut t) = g.tty_terminal.take() {
+        let area = t.get_frame().area();
+        let _ = t.clear();
+        // Write receipt at the top of the (now-empty) viewport area.
+        let mut stderr = io::stderr();
+        let _ = stderr.write_all(receipt.as_bytes());
+        let _ = stderr.write_all(b"\n");
+        // Park cursor below the prior viewport area so any future
+        // stderr output starts on a fresh row, not inside the (now
+        // blank) reserved region.
+        let bottom_row = area.bottom();
+        let _ = queue!(stderr, MoveTo(0, bottom_row));
+        let _ = stderr.flush();
+        drop(t);
+    } else {
+        // Probe never painted (pathological — `start_ticking` runs and
+        // `set_*` triggers repaints, but be defensive). Fall through to
+        // a plain stderr write.
+        g.sink.write_str(receipt);
+        g.sink.write_str("\n");
+    }
+    g.tty_viewport_lines = None;
+}
+
+/// Wind down the inline-viewport terminal leaving the boot block
+/// in place, then emit the failure card just below it. Mirrors the
+/// pre-ADR-0016 behaviour of writing the card after the painted block.
+fn emit_failure_card_tty(g: &mut Inner, card: &str) {
+    if let Some(mut t) = g.tty_terminal.take() {
+        let area = t.get_frame().area();
+        // Position cursor just below the painted viewport (no clear —
+        // we want the failure context to remain visible).
+        let mut stderr = io::stderr();
+        let _ = queue!(stderr, MoveTo(0, area.bottom()));
+        let _ = stderr.flush();
+        let _ = stderr.write_all(card.as_bytes());
+        let _ = stderr.flush();
+        drop(t);
+    } else {
+        g.sink.write_str(card);
+    }
+    g.tty_viewport_lines = None;
 }
 
 #[derive(Debug)]

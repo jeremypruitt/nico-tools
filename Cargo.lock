@@ -1915,6 +1915,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "crossterm",
  "humantime",
  "k8s-openapi",
  "kube",

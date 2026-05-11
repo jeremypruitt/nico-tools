@@ -46,4 +46,4 @@ explicitly rather than silently overriding.
 | [0012](0012-async-component-tui-event-loop.md) | Async Component-style TUI event loop for `nico ops` | Proposed |
 | [0013](0013-boot-probe.md) | Boot probe — multi-line bootstrap progress visualization | Proposed (TTY render layer amended by 0016) |
 | [0014](0014-snapshot-logs-panel-sizing-and-scrolling.md) | Snapshot logs panel — sizing and scrolling | Proposed |
-| [0016](0016-boot-probe-renders-via-ratatui-inline-viewport.md) | Boot probe renders via ratatui inline viewport | Proposed |
+| [0016](0016-boot-probe-renders-via-ratatui-inline-viewport.md) | Boot probe renders via ratatui inline viewport | Accepted |

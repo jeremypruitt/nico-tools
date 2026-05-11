@@ -1,6 +1,6 @@
 # ADR-0016: Boot probe renders via ratatui inline viewport
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-10
 - **Amends:** ADR-0013 (Layout — TTY rendering: replaces hand-rolled
   `\x1b[F` / `\x1b[J` cursor moves with ratatui's `Viewport::Inline`)
