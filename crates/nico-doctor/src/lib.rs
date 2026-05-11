@@ -25,6 +25,7 @@ pub mod log_source;
 pub mod loki;
 pub mod perf_fixtures;
 pub mod perf_instrument;
+pub mod perf_source;
 pub mod postgres;
 pub mod preflight;
 pub mod runner;
