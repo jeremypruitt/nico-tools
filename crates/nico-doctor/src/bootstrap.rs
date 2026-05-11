@@ -141,6 +141,13 @@ pub struct LayerInputs {
     /// `None` means detection is unresolved (auto, with no probe wired) —
     /// layers fall back to their pre-PRD-001 behavior in that case.
     pub deployment_type: Option<DeploymentType>,
+    /// Boot-probe-resolved IB capability (PRD-004 slice 1). `Some(true)`
+    /// ⇒ at least one DPU is wired into an IB fabric; `Some(false)` ⇒
+    /// confirmed RoCE / ethernet-only; `None` ⇒ probe was skipped
+    /// (force mode, postgres unreachable, deployment-type unresolved,
+    /// or `rest-only-mock`). Consumed by the fleet `dpu` layer so the
+    /// rollup omits the `infiniband` axis on non-IB fleets.
+    pub infiniband_present: Option<bool>,
 }
 
 /// Build the best-effort log source chain (Loki preferred, k8s fallback)
@@ -272,6 +279,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         temporal_address,
         postgres_url,
         mut pf_guards,
+        infiniband_present,
     }) = match probe_outcome {
         Ok(r) => r,
         Err(failure) => {
@@ -372,6 +380,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         skip: args.skip.clone(),
         dpu_config: config.dpu,
         deployment_type: config.cluster.deployment_type,
+        infiniband_present,
     };
 
     let log_source = build_log_source(&inputs);
@@ -412,6 +421,11 @@ struct BootProbeResult {
     temporal_address: String,
     postgres_url: String,
     pf_guards: Vec<nico_common::reach::ForwardedEndpoint>,
+    /// Result of the `detect_infiniband_present` boot-probe step
+    /// (PRD-004 slice 1). `Some(true)` / `Some(false)` after the probe
+    /// runs; `None` when the probe was skipped (force mode, postgres
+    /// unreachable, `rest-only-mock`, etc).
+    infiniband_present: Option<bool>,
 }
 
 async fn run_boot_probe(
@@ -521,6 +535,7 @@ async fn run_boot_probe(
                     temporal_address,
                     postgres_url,
                     pf_guards: vec![],
+                    infiniband_present: None,
                 },
             ));
         }
@@ -697,7 +712,7 @@ async fn run_boot_probe(
         return Err(probe_to_preflight_err(probe, &config).await);
     }
 
-    let (temporal_address, postgres_url, pf_guards) = serving_results;
+    let (temporal_address, postgres_url, pf_guards, infiniband_present) = serving_results;
 
     // Serving failures are non-fatal (probe shows them; bootstrap falls
     // back to config addresses). Probe completes successfully so long
@@ -718,6 +733,7 @@ async fn run_boot_probe(
             temporal_address,
             postgres_url,
             pf_guards,
+            infiniband_present,
         },
     ))
 }
@@ -931,7 +947,12 @@ async fn run_serving_section(
     pf_budget: Duration,
     pg_reach_budget: Duration,
     ib_probe_budget: Duration,
-) -> (String, String, Vec<nico_common::reach::ForwardedEndpoint>) {
+) -> (
+    String,
+    String,
+    Vec<nico_common::reach::ForwardedEndpoint>,
+    Option<bool>,
+) {
     let ns = config.cluster.namespace.clone();
 
     // Workflows port-forward — PRD-001 slice 10: skip when the resolved
@@ -1040,7 +1061,7 @@ async fn run_serving_section(
             tracker
                 .finished(StepId::DetectInfinibandPresent, StepState::Skipped)
                 .await;
-            return (postgres_url, pf_guard);
+            return (postgres_url, pf_guard, None);
         }
 
         tracker.started(StepId::ReachPostgres).await;
@@ -1075,52 +1096,56 @@ async fn run_serving_section(
 
         // PRD-004 slice 1: detect_infiniband_present — gated probe of
         // `machines.inventory->'infiniband_interfaces'`.
-        if !should_probe_infiniband(config.cluster.deployment_type, pg_reachable) {
-            tracker
-                .finished(StepId::DetectInfinibandPresent, StepState::Skipped)
-                .await;
-        } else {
-            tracker.started(StepId::DetectInfinibandPresent).await;
-            let t = Instant::now();
-            match nico_common::bootstrap::run_with_budget(
-                ib_probe_budget,
-                probe_infiniband_present(&postgres_url),
-            )
-            .await
-            {
-                Ok(present) => {
-                    tracker.set_infiniband_present(Some(present)).await;
-                    tracker
-                        .finished(
-                            StepId::DetectInfinibandPresent,
-                            StepState::Passed { elapsed: t.elapsed() },
-                        )
-                        .await;
+        let ib_present: Option<bool> =
+            if !should_probe_infiniband(config.cluster.deployment_type, pg_reachable) {
+                tracker
+                    .finished(StepId::DetectInfinibandPresent, StepState::Skipped)
+                    .await;
+                None
+            } else {
+                tracker.started(StepId::DetectInfinibandPresent).await;
+                let t = Instant::now();
+                match nico_common::bootstrap::run_with_budget(
+                    ib_probe_budget,
+                    probe_infiniband_present(&postgres_url),
+                )
+                .await
+                {
+                    Ok(present) => {
+                        tracker.set_infiniband_present(Some(present)).await;
+                        tracker
+                            .finished(
+                                StepId::DetectInfinibandPresent,
+                                StepState::Passed { elapsed: t.elapsed() },
+                            )
+                            .await;
+                        Some(present)
+                    }
+                    Err(e) => {
+                        let elapsed = t.elapsed();
+                        let timed_out = e.is_timed_out();
+                        tracker
+                            .finished(
+                                StepId::DetectInfinibandPresent,
+                                StepState::Failed {
+                                    elapsed,
+                                    message: e.to_string(),
+                                    timed_out,
+                                    next_command: next_command_for(
+                                        StepId::DetectInfinibandPresent,
+                                        &ns,
+                                    ),
+                                },
+                            )
+                            .await;
+                        None
+                    }
                 }
-                Err(e) => {
-                    let elapsed = t.elapsed();
-                    let timed_out = e.is_timed_out();
-                    tracker
-                        .finished(
-                            StepId::DetectInfinibandPresent,
-                            StepState::Failed {
-                                elapsed,
-                                message: e.to_string(),
-                                timed_out,
-                                next_command: next_command_for(
-                                    StepId::DetectInfinibandPresent,
-                                    &ns,
-                                ),
-                            },
-                        )
-                        .await;
-                }
-            }
-        }
-        (postgres_url, pf_guard)
+            };
+        (postgres_url, pf_guard, ib_present)
     };
 
-    let ((temporal_address, t_guard), _grpc, (postgres_url, pg_guard)) =
+    let ((temporal_address, t_guard), _grpc, (postgres_url, pg_guard, infiniband_present)) =
         tokio::join!(temporal_fut, grpc_fut, postgres_fut);
 
     let mut guards = vec![];
@@ -1130,7 +1155,7 @@ async fn run_serving_section(
     if let Some(g) = pg_guard {
         guards.push(g);
     }
-    (temporal_address, postgres_url, guards)
+    (temporal_address, postgres_url, guards, infiniband_present)
 }
 
 async fn probe_to_preflight_err(probe: BootProbe, config: &Config) -> BootstrapErr {
@@ -1172,6 +1197,7 @@ mod tests {
             skip: vec![],
             dpu_config: DpuConfig::default(),
             deployment_type: None,
+            infiniband_present: None,
         }
     }
 

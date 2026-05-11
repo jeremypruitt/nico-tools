@@ -33,7 +33,10 @@ pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
         return skip;
     }
     match SqlxDpuClient::new(&inputs.postgres_url) {
-        Ok(client) => Box::new(DpuLayer::new(Arc::new(client), inputs.dpu_config)),
+        Ok(client) => Box::new(
+            DpuLayer::new(Arc::new(client), inputs.dpu_config)
+                .with_infiniband_present(inputs.infiniband_present),
+        ),
         Err(_) => layer::UnconfiguredLayer::new(NAME, "invalid postgres URL"),
     }
 }
@@ -41,11 +44,26 @@ pub fn register(inputs: &LayerInputs) -> Box<dyn Layer> {
 pub struct DpuLayer {
     client: Arc<dyn DpuClient>,
     config: DpuConfig,
+    /// Boot-probe-resolved IB capability gate (PRD-004 slice 1). Threaded
+    /// through to [`dpu::assemble_checks`] so the fleet rollup omits the
+    /// `infiniband` axis row on non-IB fleets.
+    infiniband_present: Option<bool>,
 }
 
 impl DpuLayer {
     pub fn new(client: Arc<dyn DpuClient>, config: DpuConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            infiniband_present: None,
+        }
+    }
+
+    /// Set the IB capability gate. `Some(false)` ⇒ the IB axis is omitted
+    /// from the fleet rollup; `Some(true)` or `None` ⇒ included.
+    pub fn with_infiniband_present(mut self, val: Option<bool>) -> Self {
+        self.infiniband_present = val;
+        self
     }
 }
 
@@ -57,7 +75,12 @@ impl Layer for DpuLayer {
 
     async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
         match self.client.fetch_fleet().await {
-            Ok(fleet) => LayerOutcome::Checks(dpu::assemble_checks(&fleet, Utc::now(), &self.config)),
+            Ok(fleet) => LayerOutcome::Checks(dpu::assemble_checks(
+                &fleet,
+                Utc::now(),
+                &self.config,
+                self.infiniband_present,
+            )),
             Err(e) => LayerOutcome::Checks(vec![Check {
                 name: "dpu",
                 status: Status::Unknown,
@@ -106,11 +129,11 @@ mod tests {
 
     fn snap(dpu_id: &str) -> DpuSnapshot {
         // Default: healthy across every axis. Tests override fields to
-        // drive a specific verdict. A cert expiry far in the future is
-        // required because `cert_verdict` returns `Unknown` for
-        // `None` ("no recent network_status_observation"), which would
-        // otherwise contaminate the layer aggregate in `Ok`-expecting
-        // tests.
+        // drive a specific verdict. A cert expiry far in the future and
+        // a healthy IB observation are required because the
+        // corresponding verdicts return `Unknown` for missing inputs,
+        // which would otherwise contaminate the layer aggregate in
+        // `Ok`-expecting tests.
         DpuSnapshot {
             dpu_id: dpu_id.into(),
             applied_managed_host_config_version: "v1".into(),
@@ -126,6 +149,15 @@ mod tests {
             bgp_alerts: Vec::new(),
             extension_services_observed_at: None,
             extension_services: Vec::new(),
+            infiniband_observed_at: Some(Utc::now()),
+            infiniband_ufm_observable: Some(true),
+            infiniband_ports: vec![crate::infiniband::IbPort {
+                guid: "fe80::1".into(),
+                fabric_id: "ib-fabric-1".into(),
+                lid: 7,
+                port_state: "Active".into(),
+            }],
+            ib_alerts: Vec::new(),
         }
     }
 
@@ -177,6 +209,35 @@ mod tests {
         assert!(result.checks.iter().any(|c| c.name == "dpu_isolation"
             && c.kind == CheckKind::Headline
             && c.status == Status::Fail));
+    }
+
+    /// PRD-004 slice 5 acceptance: when the boot-probe reports the
+    /// fleet has no IB fabric (`Some(false)`), the rollup omits the
+    /// `infiniband` axis entirely rather than showing an empty Ok row.
+    #[tokio::test]
+    async fn infiniband_capability_gate_some_false_omits_axis_from_layer_output() {
+        let s = snap("dpu-1");
+        let layer = DpuLayer::new(StubClient::ok(vec![s]), DpuConfig::default())
+            .with_infiniband_present(Some(false));
+        let result = layer.run(&RunOpts::default()).await;
+        assert!(
+            !result.checks.iter().any(|c| c.name == "infiniband"),
+            "infiniband row should be omitted under Some(false): {:?}",
+            result.checks.iter().map(|c| (c.name, c.kind)).collect::<Vec<_>>(),
+        );
+    }
+
+    #[tokio::test]
+    async fn infiniband_capability_gate_some_true_includes_axis_in_layer_output() {
+        let s = snap("dpu-1");
+        let layer = DpuLayer::new(StubClient::ok(vec![s]), DpuConfig::default())
+            .with_infiniband_present(Some(true));
+        let result = layer.run(&RunOpts::default()).await;
+        assert!(
+            result.checks.iter().any(|c| c.name == "infiniband"
+                && c.kind == CheckKind::Headline),
+            "infiniband row should appear under Some(true)",
+        );
     }
 
     #[tokio::test]

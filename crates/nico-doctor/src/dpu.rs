@@ -1,11 +1,12 @@
 //! Fleet-wide DPU holistic summary — the `dpu` layer's data + assembly
-//! seam (PRD-003 slice 6, #310).
+//! seam (PRD-003 slice 6, #310; PRD-004 slice 5, #315 — adds `infiniband`).
 //!
 //! Iterates the fleet, calls each per-DPU axis verdict (`cert_verdict`,
-//! `isolation_verdict`, `hbn_verdict`, `services_verdict`), and emits
-//! **one headline per axis** with a rollup count + worst-status DPU
-//! examples. Fleet-specific concerns that have not yet been carved into
-//! axis verdicts (`probe-stuck`) live alongside the per-axis headlines.
+//! `isolation_verdict`, `hbn_verdict`, `services_verdict`,
+//! `ib_verdict`), and emits **one headline per axis** with a rollup
+//! count + worst-status DPU examples. Fleet-specific concerns that have
+//! not yet been carved into axis verdicts (`probe-stuck`) live
+//! alongside the per-axis headlines.
 //!
 //! Pure assembly over a snapshot vec — no I/O, no clock reads. The
 //! [`DpuClient`] trait is the seam over forgedb / Postgres; tests inject
@@ -22,8 +23,14 @@ use crate::dpu_isolation::{IsolationSnapshot, DEFAULT_FRESHNESS_THRESHOLD as ISO
 use crate::dpu_services::{ServiceStatus, ServicesSnapshot, DEFAULT_OBSERVATION_STALE_THRESHOLD};
 use crate::formatter::FINDINGS_CAP;
 use crate::hbn::{HbnSnapshot, DEFAULT_FRESHNESS_THRESHOLD as HBN_FRESHNESS_THRESHOLD};
+use crate::infiniband::{
+    IbAlert, IbPort, IbSnapshot,
+    DEFAULT_OBSERVATION_STALE_THRESHOLD as IB_STALE_THRESHOLD,
+};
 use crate::layer::{Check, CheckKind};
-use crate::verdicts::{cert_verdict, hbn_verdict, isolation_verdict, services_verdict, AxisSummary};
+use crate::verdicts::{
+    cert_verdict, hbn_verdict, ib_verdict, isolation_verdict, services_verdict, AxisSummary,
+};
 
 pub use nico_common::config::DpuConfig;
 
@@ -46,6 +53,17 @@ pub struct DpuSnapshot {
     pub bgp_alerts: Vec<String>,
     pub extension_services_observed_at: Option<DateTime<Utc>>,
     pub extension_services: Vec<ServiceStatus>,
+    /// `infiniband_status_observation->>'observed_at'`. PRD-004 slice 5.
+    pub infiniband_observed_at: Option<DateTime<Utc>>,
+    /// `infiniband_status_observation->>'ufm_observable'`. `Some(false)`
+    /// ⇒ UFM has lost visibility into the fabric ⇒ contributes Warn via
+    /// `ib_verdict`.
+    pub infiniband_ufm_observable: Option<bool>,
+    /// Parsed `infiniband_status_observation->'ports'` array.
+    pub infiniband_ports: Vec<IbPort>,
+    /// IB-typed alerts from `dpu_agent_health_report` (id prefix `Ib`).
+    /// Parsed by [`crate::infiniband::parse_ib_alerts`].
+    pub ib_alerts: Vec<IbAlert>,
 }
 
 /// One entry from the agent's `HealthReport.alerts` array, persisted on
@@ -118,7 +136,10 @@ pub(crate) const FETCH_FLEET_SQL: &str = "\
         (SELECT c->>'version' FROM jsonb_array_elements(COALESCE(m.inventory->'components', '[]'::jsonb)) c \
            WHERE c->>'name' = 'hbn' LIMIT 1), \
         (m.network_status_observation->'extension_service_observation'->>'observed_at')::timestamptz, \
-        m.network_status_observation->'extension_service_observation'->'extension_service_statuses' \
+        m.network_status_observation->'extension_service_observation'->'extension_service_statuses', \
+        (m.infiniband_status_observation->>'observed_at')::timestamptz, \
+        (m.infiniband_status_observation->>'ufm_observable')::boolean, \
+        m.infiniband_status_observation->'ports' \
     FROM machines m \
     LEFT JOIN instances i ON i.machine_id = m.id \
     WHERE m.network_status_observation IS NOT NULL";
@@ -146,6 +167,9 @@ type FleetRow = (
     Option<String>,
     Option<String>,
     Option<DateTime<Utc>>,
+    Option<serde_json::Value>,
+    Option<DateTime<Utc>>,
+    Option<bool>,
     Option<serde_json::Value>,
 );
 
@@ -224,6 +248,10 @@ impl DpuClient for SqlxDpuClient {
                 bgp_alerts: crate::hbn::parse_bgp_alerts(r.8.as_ref()),
                 extension_services_observed_at: r.11,
                 extension_services: parse_extension_services(r.12.as_ref()),
+                infiniband_observed_at: r.13,
+                infiniband_ufm_observable: r.14,
+                infiniband_ports: crate::infiniband::parse_ports(r.15.as_ref()),
+                ib_alerts: crate::infiniband::parse_ib_alerts(r.8.as_ref()),
             })
             .collect())
     }
@@ -293,6 +321,20 @@ fn services_summary(s: &DpuSnapshot, now: DateTime<Utc>) -> AxisSummary {
     )
 }
 
+fn infiniband_summary(s: &DpuSnapshot, now: DateTime<Utc>) -> AxisSummary {
+    ib_verdict(
+        &IbSnapshot {
+            dpu_id: s.dpu_id.clone(),
+            observed_at: s.infiniband_observed_at,
+            ufm_observable: s.infiniband_ufm_observable,
+            ports: s.infiniband_ports.clone(),
+            ib_alerts: s.ib_alerts.clone(),
+        },
+        now,
+        IB_STALE_THRESHOLD,
+    )
+}
+
 /// Worst-case status across a slice of `AxisSummary` verdicts.
 /// Priority: Fail > Warn > Unknown > Ok.
 fn worst_status(verdicts: &[AxisSummary]) -> Status {
@@ -327,6 +369,7 @@ fn axis_headline_value(axis: &'static str, verdicts: &[AxisSummary]) -> String {
         ("dpu_isolation", _) => "isolation",
         ("hbn", _) => "hbn",
         ("dpu_services", _) => "services",
+        ("infiniband", _) => "infiniband",
         _ => "axis",
     };
     let mut parts: Vec<String> = Vec::new();
@@ -348,6 +391,7 @@ fn ok_message_for(axis: &'static str, total: usize) -> String {
         "dpu_isolation" => format!("{total} DPUs healthy"),
         "hbn" => "no drift".to_string(),
         "dpu_services" => "no degraded services".to_string(),
+        "infiniband" => format!("{total} DPUs IB healthy"),
         _ => format!("{total} DPUs ok"),
     }
 }
@@ -367,12 +411,20 @@ fn status_rank(s: &Status) -> u8 {
 /// Assemble the fleet `dpu` layer's holistic checks from a snapshot vec.
 /// Pure — the caller supplies `now` so the function stays clock-free.
 ///
-/// Output ordering (per PRD-003 slice 6 acceptance):
+/// `infiniband_present` is the boot-probe-derived capability gate
+/// (PRD-004 slice 1): `Some(false)` ⇒ the IB axis row is omitted
+/// entirely (n/a-by-design — no IB fabric to summarise); `Some(true)`
+/// or `None` ⇒ include the IB axis. `None` matches the existing
+/// auto-unresolved / force-mode behaviour: render the axis using
+/// whatever data the snapshot carries (the per-DPU verdict yields
+/// `Unknown` for empty observations).
+///
+/// Output ordering:
 ///
 /// 1. One headline `Check` per per-DPU axis (cert, isolation, hbn,
-///    services), tagged with the axis name. Each headline's `value`
-///    summarises the rollup count; status = worst-of the per-DPU
-///    verdicts on that axis.
+///    services, and — when not gated off — infiniband), tagged with the
+///    axis name. Each headline's `value` summarises the rollup count;
+///    status = worst-of the per-DPU verdicts on that axis.
 /// 2. Fleet-specific headlines that have not yet migrated onto the
 ///    verdict primitive — currently just `probe-stuck`.
 /// 3. Detail rows for the worst non-Ok DPUs across all axes, capped at
@@ -383,12 +435,19 @@ pub fn assemble_checks(
     snapshots: &[DpuSnapshot],
     now: DateTime<Utc>,
     config: &DpuConfig,
+    infiniband_present: Option<bool>,
 ) -> Vec<Check> {
     let cert: Vec<AxisSummary> = snapshots.iter().map(|s| cert_summary(s, now)).collect();
     let isolation: Vec<AxisSummary> =
         snapshots.iter().map(|s| isolation_summary(s, now)).collect();
     let hbn: Vec<AxisSummary> = snapshots.iter().map(|s| hbn_summary(s, now)).collect();
     let services: Vec<AxisSummary> = snapshots.iter().map(|s| services_summary(s, now)).collect();
+    let include_ib = infiniband_present != Some(false);
+    let infiniband: Vec<AxisSummary> = if include_ib {
+        snapshots.iter().map(|s| infiniband_summary(s, now)).collect()
+    } else {
+        Vec::new()
+    };
 
     let mut out: Vec<Check> = vec![
         axis_headline("dpu_cert", &cert),
@@ -396,16 +455,24 @@ pub fn assemble_checks(
         axis_headline("hbn", &hbn),
         axis_headline("dpu_services", &services),
     ];
+    if include_ib {
+        out.push(axis_headline("infiniband", &infiniband));
+    }
     out.extend(probe_stuck_headline(snapshots, now, config));
 
     // Detail rows: collect every non-Ok per-DPU verdict across all axes,
-    // sort worst-first (Fail > Warn > Unknown), and cap.
-    let axes: [(&'static str, &[AxisSummary]); 4] = [
+    // sort worst-first (Fail > Warn > Unknown), and cap. IB sits after
+    // services in the axis-rank tiebreaker so its detail rows follow
+    // the cert/isolation/hbn/services ordering established by slice 6.
+    let mut axes: Vec<(&'static str, &[AxisSummary])> = vec![
         ("dpu_cert", &cert),
         ("dpu_isolation", &isolation),
         ("hbn", &hbn),
         ("dpu_services", &services),
     ];
+    if include_ib {
+        axes.push(("infiniband", &infiniband));
+    }
     let mut findings: Vec<(u8, u8, &'static str, &AxisSummary)> = Vec::new();
     for (axis_rank, (name, verdicts)) in axes.iter().enumerate() {
         for v in verdicts.iter() {
@@ -532,6 +599,10 @@ mod tests {
             bgp_alerts: Vec::new(),
             extension_services_observed_at: None,
             extension_services: Vec::new(),
+            infiniband_observed_at: None,
+            infiniband_ufm_observable: None,
+            infiniband_ports: Vec::new(),
+            ib_alerts: Vec::new(),
         }
     }
 
@@ -562,8 +633,15 @@ mod tests {
     #[test]
     fn empty_fleet_emits_four_axis_headlines_plus_probe_stuck_all_ok() {
         let now = Utc::now();
-        let checks = assemble_checks(&[], now, &DpuConfig::default());
-        for axis in ["dpu_cert", "dpu_isolation", "hbn", "dpu_services", "probe-stuck"] {
+        let checks = assemble_checks(&[], now, &DpuConfig::default(), Some(true));
+        for axis in [
+            "dpu_cert",
+            "dpu_isolation",
+            "hbn",
+            "dpu_services",
+            "infiniband",
+            "probe-stuck",
+        ] {
             assert_eq!(headline(&checks, axis).status, Status::Ok, "{axis}");
         }
         assert!(
@@ -580,7 +658,7 @@ mod tests {
         let now = Utc::now();
         let mut s = snap("dpu-1");
         s.client_certificate_expiry = Some(now - ChronoDuration::days(1));
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         let h = headline(&checks, "dpu_cert");
         assert_eq!(h.status, Status::Fail);
         assert!(h.value.contains("DPUs cert"), "value: {}", h.value);
@@ -591,7 +669,7 @@ mod tests {
         let now = Utc::now();
         let mut s = snap("dpu-1");
         s.client_certificate_expiry = Some(now + ChronoDuration::days(20));
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         assert_eq!(headline(&checks, "dpu_cert").status, Status::Warn);
     }
 
@@ -602,7 +680,7 @@ mod tests {
         let now = Utc::now();
         let mut s = snap("dpu-1");
         s.last_seen_at = now - ChronoDuration::seconds(300); // > 90s freshness
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         assert_eq!(headline(&checks, "dpu_isolation").status, Status::Fail);
     }
 
@@ -611,7 +689,7 @@ mod tests {
         let now = Utc::now();
         let mut s = snap("dpu-1");
         s.quarantine_state = Some("BlockAllTraffic".into());
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         assert_eq!(headline(&checks, "dpu_isolation").status, Status::Fail);
     }
 
@@ -623,7 +701,7 @@ mod tests {
         let mut s = snap("dpu-1");
         s.applied_managed_host_config_version = "v1".into();
         s.desired_managed_host_config_version = "v2".into();
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         assert_eq!(headline(&checks, "hbn").status, Status::Fail);
     }
 
@@ -632,7 +710,7 @@ mod tests {
         let now = Utc::now();
         let mut s = snap("dpu-1");
         s.bgp_alerts = vec!["BgpPeerDown".into()];
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         assert_eq!(headline(&checks, "hbn").status, Status::Fail);
     }
 
@@ -650,8 +728,126 @@ mod tests {
             message: String::new(),
             removed: None,
         }];
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         assert_eq!(headline(&checks, "dpu_services").status, Status::Warn);
+    }
+
+    // ── per-axis rollup: infiniband (PRD-004 slice 5) ───────────────────
+
+    fn ib_active_port() -> crate::infiniband::IbPort {
+        crate::infiniband::IbPort {
+            guid: "fe80::1".into(),
+            fabric_id: "ib-fabric-1".into(),
+            lid: 7,
+            port_state: "Active".into(),
+        }
+    }
+
+    /// Default `snap()` has no IB observation → ib_verdict yields
+    /// Unknown. Construct a healthy IB observation explicitly so the
+    /// rollup's IB axis lands on Ok.
+    fn snap_with_healthy_ib(dpu_id: &str, now: DateTime<Utc>) -> DpuSnapshot {
+        let mut s = snap(dpu_id);
+        s.infiniband_observed_at = Some(now);
+        s.infiniband_ufm_observable = Some(true);
+        s.infiniband_ports = vec![ib_active_port()];
+        s
+    }
+
+    #[test]
+    fn healthy_ib_fleet_emits_ok_infiniband_axis() {
+        let now = Utc::now();
+        let s = snap_with_healthy_ib("dpu-1", now);
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
+        let h = headline(&checks, "infiniband");
+        assert_eq!(h.status, Status::Ok);
+        assert!(
+            h.value.contains("IB healthy"),
+            "ok message reads as 'IB healthy', got: {}",
+            h.value,
+        );
+    }
+
+    #[test]
+    fn empty_fabric_id_flips_infiniband_axis_to_fail() {
+        let now = Utc::now();
+        let mut s = snap_with_healthy_ib("dpu-1", now);
+        s.infiniband_ports[0].fabric_id = "".into();
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
+        assert_eq!(headline(&checks, "infiniband").status, Status::Fail);
+    }
+
+    #[test]
+    fn ufm_unobservable_flips_infiniband_axis_to_warn() {
+        let now = Utc::now();
+        let mut s = snap_with_healthy_ib("dpu-1", now);
+        s.infiniband_ufm_observable = Some(false);
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
+        assert_eq!(headline(&checks, "infiniband").status, Status::Warn);
+    }
+
+    #[test]
+    fn infiniband_detail_row_carries_ib_verdict_next_command() {
+        let now = Utc::now();
+        let mut s = snap_with_healthy_ib("dpu-x", now);
+        s.infiniband_ports[0].fabric_id = "".into();
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
+        let d = details(&checks, "infiniband");
+        assert_eq!(d.len(), 1);
+        assert!(d[0].value.contains("dpu-x"));
+        assert!(
+            d[0].next_command
+                .as_deref()
+                .unwrap_or("")
+                .contains("nico doctor infiniband dpu-x"),
+            "expected ib drill-down hint: {:?}",
+            d[0].next_command,
+        );
+    }
+
+    #[test]
+    fn infiniband_present_some_false_omits_ib_axis_entirely() {
+        let now = Utc::now();
+        let mut s = snap_with_healthy_ib("dpu-1", now);
+        // Even an active IB observation should not surface when the
+        // capability gate says the fleet has no IB fabric — n/a by
+        // design.
+        s.infiniband_ports[0].fabric_id = "".into();
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(false));
+        assert!(
+            !checks.iter().any(|c| c.name == "infiniband"),
+            "infiniband row should be omitted when capability gate is Some(false), got {:?}",
+            checks.iter().map(|c| (c.name, c.kind)).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn infiniband_present_none_falls_back_to_per_dpu_observation() {
+        // Force / auto-unresolved deployment: render the axis using
+        // whatever the snapshot carries. A healthy snapshot ⇒ Ok.
+        let now = Utc::now();
+        let s = snap_with_healthy_ib("dpu-1", now);
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), None);
+        assert!(checks.iter().any(|c| c.name == "infiniband"));
+        assert_eq!(headline(&checks, "infiniband").status, Status::Ok);
+    }
+
+    #[test]
+    fn infiniband_axis_appears_after_dpu_services_in_headlines() {
+        let now = Utc::now();
+        let checks = assemble_checks(&[snap("dpu-1")], now, &DpuConfig::default(), Some(true));
+        let order: Vec<&str> = checks
+            .iter()
+            .filter(|c| c.kind == CheckKind::Headline)
+            .map(|c| c.name)
+            .collect();
+        let services_idx = order.iter().position(|&n| n == "dpu_services").unwrap();
+        let ib_idx = order.iter().position(|&n| n == "infiniband").unwrap();
+        let probe_idx = order.iter().position(|&n| n == "probe-stuck").unwrap();
+        assert!(
+            services_idx < ib_idx && ib_idx < probe_idx,
+            "expected order ... dpu_services, infiniband, probe-stuck; got {order:?}",
+        );
     }
 
     // ── fleet rollup count is non-Ok DPUs ───────────────────────────────
@@ -670,7 +866,7 @@ mod tests {
         for s in snaps.iter_mut().take(3) {
             s.client_certificate_expiry = Some(now + ChronoDuration::days(15));
         }
-        let checks = assemble_checks(&snaps, now, &DpuConfig::default());
+        let checks = assemble_checks(&snaps, now, &DpuConfig::default(), Some(true));
         let h = headline(&checks, "dpu_cert");
         assert_eq!(h.status, Status::Warn);
         assert!(h.value.contains("3/5"), "value: {}", h.value);
@@ -696,7 +892,7 @@ mod tests {
             s.client_certificate_expiry = Some(now - ChronoDuration::days(1));
             snaps.push(s);
         }
-        let checks = assemble_checks(&snaps, now, &DpuConfig::default());
+        let checks = assemble_checks(&snaps, now, &DpuConfig::default(), Some(true));
         // All details across all axes, capped at 5.
         let total_details = checks.iter().filter(|c| c.kind == CheckKind::Detail).count();
         assert_eq!(total_details, FINDINGS_CAP);
@@ -717,7 +913,7 @@ mod tests {
         let now = Utc::now();
         let mut s = snap("dpu-x");
         s.client_certificate_expiry = Some(now - ChronoDuration::days(2));
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         let d = details(&checks, "dpu_cert");
         assert_eq!(d.len(), 1);
         assert!(d[0].value.contains("dpu-x"));
@@ -736,7 +932,7 @@ mod tests {
         let now = Utc::now();
         let mut s = snap("dpu-y");
         s.last_seen_at = now - ChronoDuration::seconds(300);
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         let d = details(&checks, "dpu_isolation");
         assert_eq!(d.len(), 1);
         assert!(d[0].value.contains("dpu-y"));
@@ -754,7 +950,7 @@ mod tests {
         let now = Utc::now();
         let mut s = snap("dpu-1");
         s.client_certificate_expiry = Some(now - ChronoDuration::days(1));
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         let mut seen_detail = false;
         for c in &checks {
             match c.kind {
@@ -775,7 +971,7 @@ mod tests {
     #[test]
     fn per_axis_headlines_come_before_fleet_specific_headlines() {
         let now = Utc::now();
-        let checks = assemble_checks(&[snap("dpu-1")], now, &DpuConfig::default());
+        let checks = assemble_checks(&[snap("dpu-1")], now, &DpuConfig::default(), Some(true));
         let order: Vec<&str> = checks
             .iter()
             .filter(|c| c.kind == CheckKind::Headline)
@@ -806,7 +1002,7 @@ mod tests {
                 s
             })
             .collect();
-        let checks = assemble_checks(&snaps, now, &DpuConfig::default());
+        let checks = assemble_checks(&snaps, now, &DpuConfig::default(), Some(true));
         let h = headline(&checks, "probe-stuck");
         assert_eq!(h.status, Status::Fail);
         assert!(h.value.starts_with("3 DPUs"), "value: {}", h.value);
@@ -819,7 +1015,7 @@ mod tests {
 
     #[test]
     fn empty_fleet_cert_axis_value_reads_no_expiring_certs() {
-        let checks = assemble_checks(&[], Utc::now(), &DpuConfig::default());
+        let checks = assemble_checks(&[], Utc::now(), &DpuConfig::default(), Some(true));
         assert!(
             headline(&checks, "dpu_cert").value.contains("no expiring"),
             "value: {}",
@@ -831,7 +1027,7 @@ mod tests {
     fn all_healthy_services_axis_value_reads_no_degraded() {
         let now = Utc::now();
         let s = snap("dpu-1");
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let checks = assemble_checks(&[s], now, &DpuConfig::default(), Some(true));
         assert_eq!(headline(&checks, "dpu_services").status, Status::Ok);
         assert!(
             headline(&checks, "dpu_services").value.contains("no degraded"),
@@ -944,5 +1140,19 @@ mod tests {
             sql.contains("inventory->'components'") || sql.contains("inventory ->'components'"),
             "hbn version input missing: {sql}"
         );
+    }
+
+    #[test]
+    fn fetch_fleet_sql_includes_infiniband_inputs_added_in_prd_004_slice_5() {
+        let sql = FETCH_FLEET_SQL;
+        assert!(
+            sql.contains("infiniband_status_observation"),
+            "IB verdict observation column missing: {sql}"
+        );
+        assert!(
+            sql.contains("'ufm_observable'"),
+            "IB ufm_observable column missing: {sql}"
+        );
+        assert!(sql.contains("'ports'"), "IB ports column missing: {sql}");
     }
 }
