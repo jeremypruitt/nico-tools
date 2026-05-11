@@ -69,6 +69,7 @@ impl IbClient for StubIbClient {
 async fn ib_alert_surfaces_in_infiniband_layer_only_not_dpu_health() {
     let blob = shared_health_report();
 
+    let now = Utc::now();
     let dpu_health_snap = HealthSnapshot {
         dpu_id: "dpu-42".into(),
         agent_version: Some("2.0.0".into()),
@@ -77,6 +78,24 @@ async fn ib_alert_surfaces_in_infiniband_layer_only_not_dpu_health() {
         // assemble_checks); production wiring runs the same parser.
         alerts: parse_alerts(Some(&blob)),
         interfaces: vec![],
+        client_certificate_expiry: Some(now + chrono::Duration::days(365)),
+        quarantine_state: None,
+        last_seen_at: Some(now),
+        registered: true,
+        scout_discovery_complete: true,
+        hbn_version: "2.0.0-doca2.5.0".into(),
+        network_config_error: None,
+        applied_managed_host_config_version: "v1".into(),
+        desired_managed_host_config_version: "v1".into(),
+        applied_instance_network_config_version: "v1".into(),
+        desired_instance_network_config_version: "v1".into(),
+        bgp_alerts: vec![],
+        extension_services_observed_at: Some(now),
+        extension_services: vec![],
+        infiniband_observed_at: None,
+        infiniband_ufm_observable: None,
+        infiniband_ports: vec![],
+        ib_alerts: vec![],
     };
     let ib_snap = IbSnapshot {
         dpu_id: "dpu-42".into(),
