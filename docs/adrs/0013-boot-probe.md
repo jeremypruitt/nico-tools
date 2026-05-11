@@ -5,6 +5,7 @@
 - **Amended:** 2026-05-09 (PRD-001: `detect_deployment_type` step added to `validating` section) — **superseded** by 2026-05-10
 - **Amended:** 2026-05-10 (PRD-001 slice 9 / #321: `detect_deployment_type` re-placed as a sequential gate at the end of `connecting`; supersedes the 2026-05-09 placement)
 - **Amended:** 2026-05-10 (ADR-0016: TTY render layer switches from hand-rolled `\x1b[F`/`\x1b[J` cursor moves to ratatui's `Viewport::Inline`; layout shape unchanged)
+- **Amended:** 2026-05-10 (PRD-004 slice 6 / #316: `detect_infiniband_present` step added to the `serving` section, gated on `forgedb_present` and a reachable postgres)
 
 ## Context
 
@@ -278,6 +279,60 @@ than concurrent with the validating fan-out, so the worst-case bound is
 detection latency behind credentials/RBAC). On a responsive cluster the
 detection ladder typically resolves in ≤200ms because rung 1 (workload
 probe) hits a single Service and short-circuits.
+
+### `detect_infiniband_present` step (2026-05-10 amendment, PRD-004 slice 6 / #316)
+
+PRD-004 adds a `detect_infiniband_present` step (plain-English label
+`"detect infiniband presence"`, technical name `detect_infiniband_present`)
+that probes whether at least one DPU in the fleet is wired into an
+InfiniBand fabric. The result drives a second capability flag
+(`infiniband_present`, parallel to `forgedb_present`) consumed by the
+fleet `dpu` layer and the per-DPU `dpu_health` layer to gate their
+`infiniband` axis row.
+
+**Placement.** Inside the `serving` section, sequenced **after**
+`reach postgres` because the probe issues a single SQL read against
+`machines.inventory->'infiniband_interfaces'`. The step is concurrent
+with the section's other serving operations only in the sense that
+`serving` runs in parallel with `validating`; within `serving`'s
+postgres lane, the probe is sequential after `reach postgres` so
+unreachable postgres short-circuits it to `Skipped`.
+
+**Gating.** Skipped when any of:
+
+- The resolved deployment-type is `rest-only-mock` (no forgedb table to
+  read).
+- The resolved deployment-type is `force` (escape hatch — short-circuit
+  the probe just like detection itself).
+- The deployment-type is unresolved (auto detection didn't complete).
+- The previous `reach postgres` step failed (probe can't run without a
+  live SQL connection).
+
+In every skip path the step renders `Skipped` in the probe and the
+downstream capability resolves to `None` — the fleet `dpu` layer
+includes the `infiniband` axis defensively (since absence is not
+confirmed) and the per-DPU `dpu_health` layer renders an `Unknown` row
+("presence not detected"). `Some(false)` (confirmed absence) is the
+only state that omits the IB row entirely.
+
+**Failure semantics.** A query failure (transient postgres error,
+schema-probe miss, timeout) renders the step `Failed` with the error
+text. The downstream capability resolves to `None`, matching the skip
+paths above — the doctor continues without IB-specific signal, and
+operators can re-run nico if the failure was transient.
+
+**Budget.** Reuses `timeouts.preflight` (5s default). The probe is a
+single SQL read with an `EXISTS` short-circuit, so it typically
+resolves in tens of milliseconds on a responsive postgres.
+
+**Why a second capability flag (vs. inferring from inventory).** The
+fleet `dpu` rollup needs the boolean answer before it iterates the
+fleet so it can omit the IB axis on confirmed non-IB clusters. Reading
+per-DPU `infiniband_status_observation` rows is too late for the omit
+decision and would mis-render a fresh IB fleet (no observations yet)
+as "no IB". A capability flag answers "should we render the IB row?"
+independently of "what does each DPU report?", paralleling
+`forgedb_present`'s role for the entire `dpu` / per-DPU layer family.
 
 ## Consequences
 
