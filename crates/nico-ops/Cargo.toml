@@ -26,5 +26,22 @@ dhat-heap = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.5", features = ["async_tokio"] }
 dhat = "0.3"
+async-trait = "0.1"
+
+[[bench]]
+name = "idle_tick_bench"
+harness = false
+
+[[bench]]
+name = "fan_out_bench"
+harness = false
+
+[[bench]]
+name = "reducer_bench"
+harness = false
+
+[[bench]]
+name = "render_bench"
+harness = false
