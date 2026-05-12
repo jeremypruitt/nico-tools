@@ -22,6 +22,7 @@ pub mod data;
 pub mod events;
 pub mod hbn_panel;
 pub mod model;
+pub mod popup;
 pub mod pulse;
 pub mod ringbuffer;
 pub mod view;

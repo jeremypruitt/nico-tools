@@ -1,4 +1,5 @@
 use chrono::{DateTime, Local};
+use crossterm::event::KeyCode;
 use nico_common::output::Status;
 use nico_common::theme::Theme;
 use ratatui::{
@@ -6,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 use tui_big_text::{BigText, PixelSize};
 
@@ -18,6 +19,7 @@ use crate::model::{
     CorrelateState, CorrelateStatus, Finding, LayerSnapshot, LogLine, PopoverEvent,
     PopoverSeverity, SourceError, overall_verdict,
 };
+use crate::popup::{Popup, PopupSize};
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
 
 /// How many recent verdicts the header breadcrumb shows. The ring buffer
@@ -581,20 +583,11 @@ fn render_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 }
 
 fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let inner_area = centered(area, 80, 80);
     let title = match app.focused() {
         Some(s) => format!(" detail — {} ", s.name),
         None => " detail ".to_string(),
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .style(Style::default().bg(theme.overlay_bg).fg(theme.overlay_fg));
-    let inner = block.inner(inner_area);
-    frame.render_widget(Clear, inner_area);
-    frame.render_widget(block, inner_area);
-
-    let lines = match app.focused() {
+    let body = match app.focused() {
         Some(s) if !s.findings.is_empty() => finding_lines(&s.findings, theme, true),
         Some(_) => vec![Line::from(Span::styled(
             "no findings",
@@ -602,15 +595,21 @@ fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect
         ))],
         None => vec![],
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.overlay_scroll(), 0)),
-        inner.inner(Margin {
+    Popup {
+        title,
+        body,
+        size_pct: PopupSize {
+            width_pct: 80,
+            height_pct: 80,
+        },
+        dismiss_keys: vec![KeyCode::Esc, KeyCode::Enter],
+        body_margin: Margin {
             horizontal: 1,
             vertical: 0,
-        }),
-    );
+        },
+        scroll: app.overlay_scroll(),
+    }
+    .render(theme, frame, area);
 }
 
 /// Quick-correlate popover (issue #157). Centered ~80%×70% modal; title
@@ -619,25 +618,24 @@ fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect
 /// `source_error` rows so the operator can see *why* a Source dropped
 /// out without leaving the dashboard.
 fn render_correlate_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let inner_area = centered(area, 80, 70);
     let Some(state) = app.correlate_state() else {
         return;
     };
-    let title = correlate_title(app, state);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .style(Style::default().bg(theme.overlay_bg).fg(theme.overlay_fg));
-    let inner = block.inner(inner_area);
-    frame.render_widget(Clear, inner_area);
-    frame.render_widget(block, inner_area);
-
-    let body = inner.inner(Margin {
-        horizontal: 1,
-        vertical: 0,
-    });
-    let lines = correlate_body_lines(state, theme);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+    Popup {
+        title: correlate_title(app, state),
+        body: correlate_body_lines(state, theme),
+        size_pct: PopupSize {
+            width_pct: 80,
+            height_pct: 70,
+        },
+        dismiss_keys: vec![KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('Q')],
+        body_margin: Margin {
+            horizontal: 1,
+            vertical: 0,
+        },
+        scroll: 0,
+    }
+    .render(theme, frame, area);
 }
 
 fn correlate_title(app: &App, state: &CorrelateState) -> String {
@@ -714,16 +712,7 @@ fn popover_color(theme: &Theme, severity: PopoverSeverity) -> ratatui::style::Co
 }
 
 fn render_help_overlay(theme: &Theme, frame: &mut Frame, area: Rect) {
-    let inner_area = centered(area, 60, 50);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" keybinds ")
-        .style(Style::default().bg(theme.overlay_bg).fg(theme.overlay_fg));
-    let inner = block.inner(inner_area);
-    frame.render_widget(Clear, inner_area);
-    frame.render_widget(block, inner_area);
-
-    let lines: Vec<Line> = HELP_LINES
+    let body: Vec<Line<'static>> = HELP_LINES
         .iter()
         .map(|l| {
             let (key, rest) = split_help_line(l);
@@ -733,13 +722,21 @@ fn render_help_overlay(theme: &Theme, frame: &mut Frame, area: Rect) {
             ])
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(lines),
-        inner.inner(Margin {
+    Popup {
+        title: " keybinds ".to_string(),
+        body,
+        size_pct: PopupSize {
+            width_pct: 60,
+            height_pct: 50,
+        },
+        dismiss_keys: vec![KeyCode::Esc, KeyCode::Char('?')],
+        body_margin: Margin {
             horizontal: 2,
             vertical: 1,
-        }),
-    );
+        },
+        scroll: 0,
+    }
+    .render(theme, frame, area);
 }
 
 fn finding_lines(findings: &[Finding], theme: &Theme, full: bool) -> Vec<Line<'static>> {
@@ -835,19 +832,6 @@ pub fn grid_cols_for_width(width: u16) -> usize {
         2
     } else {
         3
-    }
-}
-
-fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
-    let h = (area.width * pct_x) / 100;
-    let v = (area.height * pct_y) / 100;
-    let x = area.x + (area.width.saturating_sub(h)) / 2;
-    let y = area.y + (area.height.saturating_sub(v)) / 2;
-    Rect {
-        x,
-        y,
-        width: h,
-        height: v,
     }
 }
 

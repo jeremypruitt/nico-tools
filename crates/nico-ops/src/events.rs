@@ -561,4 +561,76 @@ mod tests {
             Some(Action::OpenDetail)
         );
     }
+
+    /// PRD-006 Slice 3 (issue #369). With any popup open, no key that
+    /// would normally drive the underlying view may produce an
+    /// underlying-view action — the only acceptable outcomes are
+    /// `CloseOverlay` (when the key is in the popup's dismiss keymap),
+    /// `Quit` (Ctrl-C only), or `None`. This guards against regressions
+    /// where a new view-level binding silently leaks through an active
+    /// overlay.
+    #[test]
+    fn no_underlying_view_action_leaks_past_active_overlay() {
+        use Action::*;
+        let underlying_view_actions: &[Action] = &[
+            Refresh,
+            TogglePause,
+            ShowSpotlight,
+            ShowAll,
+            OpenHelp,
+            OpenDetail,
+            Correlate,
+            CopyNextCommand,
+            OpenLink,
+            ToggleMouseCapture,
+            ShowToast(MISSION_CONTROL_REMOVED_TOAST.to_string()),
+            Focus(Dir::Up),
+            Focus(Dir::Down),
+            Focus(Dir::Left),
+            Focus(Dir::Right),
+        ];
+
+        // The full universe of keys that any underlying view (Scorecard
+        // or Spotlight) binds. If any of these returns an underlying-view
+        // action while an overlay is active, the popup primitive's
+        // modal-stack contract is broken.
+        let view_keys: &[KeyCode] = &[
+            KeyCode::Char('r'),
+            KeyCode::Char('R'),
+            KeyCode::Char(' '),
+            KeyCode::Char('s'),
+            KeyCode::Char('S'),
+            KeyCode::Char('a'),
+            KeyCode::Char('A'),
+            KeyCode::Char('m'),
+            KeyCode::Char('M'),
+            KeyCode::Char('y'),
+            KeyCode::Char('Y'),
+            KeyCode::Char('o'),
+            KeyCode::Char('O'),
+            KeyCode::Char('h'),
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('l'),
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+        ];
+
+        for layout in [Layout::Scorecard, Layout::Spotlight] {
+            for overlay in [Overlay::Detail, Overlay::Help, Overlay::Correlate] {
+                for key in view_keys {
+                    let result = translate(&k(*key), Mode::Normal, layout, overlay);
+                    if let Some(action) = &result {
+                        assert!(
+                            !underlying_view_actions.contains(action),
+                            "key {key:?} leaked underlying-view action {action:?} \
+                             through overlay {overlay:?} in layout {layout:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
