@@ -7,9 +7,10 @@ use nico_doctor::baseline::{Baseline, Delta, compute_deltas_for};
 use ratatui::layout::Rect;
 
 use crate::action::{Action, Dir, ScrollDir};
+use crate::correlate_runner::CorrelateUpdate;
 use crate::events::Overlay;
 use crate::model::{
-    CorrelateState, CorrelateStatus, EntityRef, LayerSnapshot, LogLine,
+    CorrelateState, EntityRef, LayerSnapshot, LogLine, SourceError, SourceProgress, SourceStatus,
     extract_entity_from_finding,
 };
 use crate::pulse::PulseTimer;
@@ -71,12 +72,16 @@ pub enum Effect {
     /// default). Best-effort; failures translate into
     /// `Action::ShowToast`.
     OpenUrl(String),
-    /// Kick off `nico_correlate::collect_all` for the given entity.
-    /// The host loop spawns the call and posts the results back via
-    /// `Action::CorrelateResults`. PRD-007 generalised this from a bare
-    /// workflow ID (issue #157) to an [`EntityRef`] so DPU / host /
-    /// request drills land through the same effect.
+    /// Kick off a correlate run for the given entity. The host loop
+    /// constructs a [`crate::correlate_runner::CorrelateStream`] and
+    /// pumps each [`CorrelateUpdate`] back through the action channel
+    /// as `Action::CorrelateUpdate`. PRD-007 Slice 2 — replaces the
+    /// one-shot bulk `Action::CorrelateResults` with streaming.
     RunCorrelate(EntityRef),
+    /// PRD-007 Slice 2: drop the in-flight correlate stream. The host
+    /// loop owns the stream's abort handle; aborting it cancels every
+    /// per-Source future via `FuturesUnordered` drop.
+    CancelCorrelate,
     /// Tear down and exit cleanly.
     Quit,
 }
@@ -372,10 +377,18 @@ impl App {
                 None
             }
             Action::CloseOverlay => {
-                if self.overlay != Overlay::None {
-                    self.overlay = Overlay::None;
-                    self.correlate = None;
-                    self.dirty = true;
+                if self.overlay == Overlay::None {
+                    return None;
+                }
+                let had_correlate = self.correlate.is_some();
+                self.overlay = Overlay::None;
+                self.correlate = None;
+                self.dirty = true;
+                // Slice 2: tearing down the popup must abort the
+                // runner's per-Source futures so we never leak tasks
+                // (verified by `correlate_runner::tests::dropping_…`).
+                if had_correlate {
+                    return Some(Effect::CancelCorrelate);
                 }
                 None
             }
@@ -539,27 +552,22 @@ impl App {
                 self.overlay = Overlay::Correlate;
                 self.correlate = Some(CorrelateState {
                     entity: entity.clone(),
-                    status: CorrelateStatus::Loading,
+                    sources: Vec::new(),
+                    events: Vec::new(),
+                    source_errors: Vec::new(),
                     diagnosis: None,
+                    run_done: false,
                 });
                 self.dirty = true;
                 Some(Effect::RunCorrelate(entity))
             }
-            Action::CorrelateResults {
-                entity,
-                events,
-                source_errors,
-                diagnosis,
-            } => {
+            Action::CorrelateUpdate { entity, update } => {
                 let state = self.correlate.as_mut()?;
                 if state.entity != entity {
+                    // Stale update from a previous popup invocation.
                     return None;
                 }
-                state.status = CorrelateStatus::Loaded {
-                    events,
-                    source_errors,
-                };
-                state.diagnosis = diagnosis;
+                apply_correlate_update(state, update);
                 self.dirty = true;
                 None
             }
@@ -779,6 +787,60 @@ fn contains(r: &Rect, col: u16, row: u16) -> bool {
         && col < r.x.saturating_add(r.width)
         && row >= r.y
         && row < r.y.saturating_add(r.height)
+}
+
+/// PRD-007 Slice 2: fold one streamed [`CorrelateUpdate`] into the
+/// popup's accumulating state. Pure — easy to unit-test without going
+/// through the full reducer.
+fn apply_correlate_update(state: &mut CorrelateState, update: CorrelateUpdate) {
+    match update {
+        CorrelateUpdate::Loading { sources } => {
+            // Build the per-Source progress strip in the order the
+            // runner declared so the dots row reads left-to-right in
+            // a stable layout (temporal · postgres · k8s · loki · …).
+            state.sources = sources
+                .into_iter()
+                .map(|name| SourceProgress {
+                    name: name.to_string(),
+                    status: SourceStatus::Pending,
+                })
+                .collect();
+        }
+        CorrelateUpdate::SourceLanded { source, events } => {
+            mark_source(state, source, SourceStatus::Landed);
+            state.events.extend(events);
+            // Keep the timeline chronologically sorted as events
+            // accumulate across Sources.
+            state.events.sort_by_key(|e| e.ts);
+        }
+        CorrelateUpdate::SourceFailed { source, reason } => {
+            mark_source(state, source, SourceStatus::Failed);
+            state.source_errors.push(SourceError {
+                name: source.to_string(),
+                reason,
+            });
+        }
+        CorrelateUpdate::Diagnosis { diagnosis } => {
+            state.diagnosis = diagnosis;
+        }
+        CorrelateUpdate::Done => {
+            state.run_done = true;
+        }
+    }
+}
+
+fn mark_source(state: &mut CorrelateState, name: &'static str, status: SourceStatus) {
+    if let Some(p) = state.sources.iter_mut().find(|p| p.name == name) {
+        p.status = status;
+    } else {
+        // Defensive: a SourceLanded for a Source the Loading event didn't
+        // mention shouldn't happen, but if it does append rather than drop
+        // so the dots row still reflects what the runner reported.
+        state.sources.push(SourceProgress {
+            name: name.to_string(),
+            status,
+        });
+    }
 }
 
 #[cfg(test)]
