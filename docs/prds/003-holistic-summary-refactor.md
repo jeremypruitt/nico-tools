@@ -63,9 +63,13 @@ pattern.
 - Cross-repo coupling: the verdict primitive lives in
   `nico-doctor`; it does not depend on `infra-controller-core`'s
   `api-model` helpers.
-- Instance-level lookups (issue #301 — config-sync exploration).
-  Verdicts in this PRD work off the `machines` row only, matching
-  the existing per-DPU layer pattern.
+- Instance-level lookups for IB config-sync (issue #301 —
+  resolved 2026-05-12 via
+  `docs/design/ib-config-sync-detection.md`; implementation
+  deferred to a future PRD-008 gated on operator demand). Note
+  that `hbn`'s instance-network drift rung already does an
+  instance lookup — verdicts in this PRD don't add new
+  cross-axis instance fetches, but the pattern itself isn't new.
 - An ADR up front. If the primitive crystallises into something
   worth documenting separately, write the ADR during/after slice 1.
 - Renaming or removing per-DPU drill-down commands. Each axis keeps
@@ -275,6 +279,8 @@ conventions in `docs/agents/issue-tracker.md`.
   PRD refactors against.
 - PRD-004 — infiniband layer; drops into this pattern as the first
   new axis after the refactor lands.
-- Issue #301 — IB config-sync detection design spike; orthogonal,
-  may add an instance-config axis later that plugs into the same
-  primitive.
+- Issue #301 — IB config-sync detection design spike. Resolved
+  2026-05-12 via `docs/design/ib-config-sync-detection.md`:
+  config-sync drift will plug into this primitive as a new rung
+  in `ib_verdict()` rather than as a separate axis layer when
+  PRD-008 lands.

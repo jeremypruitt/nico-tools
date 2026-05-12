@@ -258,8 +258,12 @@ Multiple ports per DPU is a first-class case (`ib_interfaces` is
 `Vec<...>`). There is a parallel "expected" config in core
 (`InstanceInfinibandConfig`, instance-level) and core's
 `ib_config_synced()` helper compares them — surfacing that
-comparison is **out of scope** for both PRD-004 and this PRD; see
-issue #301 (potential PRD-005).
+comparison is **out of scope** for both PRD-004 and this PRD.
+Issue #301 resolved 2026-05-12 via
+`docs/design/ib-config-sync-detection.md`: lives inside
+`ib_verdict()` (per-layer); compared locally (no cross-repo dep);
+implementation deferred to a future PRD-008 gated on operator
+demand.
 
 ## Decisions captured
 

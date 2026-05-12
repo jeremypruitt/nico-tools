@@ -30,10 +30,14 @@ The verdict-shape grilling concluded:
   this layer; PRD-002's `dpu_health` carve-out grows to exclude
   IB-typed alerts (parallel to BGP-typed alerts staying in `hbn`).
 
-PRD-005 (potential, issue #301) will explore IB config-sync
-detection — comparing observed pkeys/partition_ids against the
-expected `InstanceInfinibandConfig`. Out of scope here to keep
-PRD-004 observation-only and shippable.
+IB config-sync detection — comparing observed pkeys/partition_ids
+against the expected `InstanceInfinibandConfig` — is out of scope
+here to keep PRD-004 observation-only and shippable. Design
+decisions resolved in `docs/design/ib-config-sync-detection.md`
+(2026-05-12, closes spike #301): config-drift rung lands inside
+`ib_verdict()` (per-layer, not a new axis layer); comparison
+replicated locally; implementation deferred to a future PRD-008
+gated on operator demand.
 
 ## Personas
 
@@ -345,8 +349,10 @@ conventions in `docs/agents/issue-tracker.md`.
   verdict-shape decision at this PRD.
 - Issue #265 — original IB layer implementation slice under PRD-002.
   Superseded by this PRD's epic; left for triage to handle.
-- Issue #301 — IB config-sync detection design spike (potential
-  PRD-005). Blocked by PRD-004 shipping.
+- Issue #301 — IB config-sync detection design spike. Resolved
+  2026-05-12 by `docs/design/ib-config-sync-detection.md`:
+  decisions captured, implementation deferred to a future PRD-008
+  gated on operator demand.
 - PRD-001 — capability bundle pattern (`forgedb_present`). This PRD
   adds `infiniband_present` as the second flag.
 - PRD-002 — DPU layer rewrite. Defers IB verdict shape here; this
