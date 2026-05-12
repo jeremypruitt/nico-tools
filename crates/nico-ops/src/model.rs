@@ -48,23 +48,43 @@ pub struct PopoverEvent {
     pub severity: PopoverSeverity,
 }
 
-/// Either the correlate run is still in flight (`Loading`) or it has
-/// landed and the renderer has events + per-source error lines to show.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CorrelateStatus {
-    Loading,
-    Loaded {
-        events: Vec<PopoverEvent>,
-        source_errors: Vec<SourceError>,
-    },
-}
-
 /// One Source that errored during the correlate run. Rendered inline as
 /// a synthetic `source_error` event (mirrors ADR-007's tail-mode behavior).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceError {
     pub name: String,
     pub reason: String,
+}
+
+/// PRD-007 Slice 2: the four discrete states each Source's row of the
+/// availability-dots strip can be in. Drives the `⟳ / ● / ✗ / ○` glyph
+/// at the top of the correlate mini-dashboard popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceStatus {
+    /// `⟳` — fetching; the per-Source future has not yet completed.
+    Pending,
+    /// `●` — landed successfully; any events the Source returned are
+    /// already in [`CorrelateState::events`].
+    Landed,
+    /// `✗` — Source reported `Unavailable`; a synthetic `source_error`
+    /// row was pushed into the timeline.
+    Failed,
+    /// `○` — Source was filtered out before the run started (e.g.
+    /// `--sources postgres,k8s` skipped Loki). Slice 2 always emits one
+    /// `Pending` entry per Source the runner was given, so this variant
+    /// is reserved for later slices that support pre-filtering.
+    Skipped,
+}
+
+/// PRD-007 Slice 2: per-Source progress strip rendered at the top of
+/// the correlate mini-dashboard popup. The list is built from the
+/// initial `CorrelateUpdate::Loading` event and mutated in place by
+/// subsequent `SourceLanded` / `SourceFailed` updates so the operator
+/// watches each dot transition `⟳ → ● / ✗` as Sources report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceProgress {
+    pub name: String,
+    pub status: SourceStatus,
 }
 
 /// PRD-007: condensed mirror of [`nico_correlate::diagnosis::Diagnosis`]
@@ -79,13 +99,33 @@ pub struct PopoverDiagnosis {
     pub next_commands: Vec<String>,
 }
 
-/// The full state the correlate popup needs: which entity it's for, the
-/// in-flight / loaded payload, and the optional Diagnosis banner.
+/// The full state the correlate mini-dashboard popup needs: which entity
+/// it's for, the per-Source availability strip, the accumulated event
+/// timeline (plus inline `source_error` rows), the optional Diagnosis
+/// banner, and a `run_done` marker that flips when the runner emits its
+/// terminal `Done` update.
+///
+/// PRD-007 Slice 2 reshape: the previous `Loading | Loaded` enum is gone
+/// because the popup now renders incrementally — Diagnosis can land
+/// before every Source has reported, and the source-dots row needs the
+/// per-Source breakdown rather than one bulk flag.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorrelateState {
     pub entity: EntityRef,
-    pub status: CorrelateStatus,
+    pub sources: Vec<SourceProgress>,
+    pub events: Vec<PopoverEvent>,
+    pub source_errors: Vec<SourceError>,
     pub diagnosis: Option<PopoverDiagnosis>,
+    pub run_done: bool,
+}
+
+impl CorrelateState {
+    /// Whether the runner has not yet emitted its terminal `Done`
+    /// update. The popup title appends "collecting…" while this is
+    /// true; per-Source status is read off the `sources` strip.
+    pub fn is_loading(&self) -> bool {
+        !self.run_done
+    }
 }
 
 /// PRD-007: pull the first entity (DPU / workflow / host / request) out

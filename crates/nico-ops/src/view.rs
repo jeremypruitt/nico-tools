@@ -16,8 +16,8 @@ use nico_doctor::baseline::Delta;
 use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
 use crate::model::{
-    CorrelateState, CorrelateStatus, Finding, LayerSnapshot, LogLine, PopoverEvent,
-    PopoverSeverity, SourceError, overall_verdict,
+    CorrelateState, Finding, LayerSnapshot, LogLine, PopoverEvent, PopoverSeverity, SourceError,
+    SourceStatus, overall_verdict,
 };
 use crate::popup::{Popup, PopupSize};
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
@@ -46,7 +46,7 @@ pub const HELP_LINES: &[&str] = &[
     "a / Esc   show all (return from spotlight)",
     "y         copy focused next-command (spotlight)",
     "o         open focused link (spotlight)",
-    "c         quick-correlate popover (workflow Finding)",
+    "c         correlate mini-dashboard popup for focused entity",
     "Esc       close overlay",
     "?         this help",
     "q / ^C    quit",
@@ -640,46 +640,104 @@ fn render_correlate_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: R
 
 fn correlate_title(app: &App, state: &CorrelateState) -> String {
     let throb = app.throbber_glyph();
-    let (loading_marker, suffix) = match state.status {
-        CorrelateStatus::Loading if !throb.is_empty() => (format!(" {throb}"), " collecting…"),
-        CorrelateStatus::Loading => (String::new(), " collecting…"),
-        CorrelateStatus::Loaded { .. } => (String::new(), ""),
+    let (loading_marker, suffix) = if state.is_loading() {
+        if throb.is_empty() {
+            (String::new(), " collecting…")
+        } else {
+            (format!(" {throb}"), " collecting…")
+        }
+    } else {
+        (String::new(), "")
     };
-    format!(" correlate — {}{}{} ", state.entity.id, loading_marker, suffix)
+    format!(
+        " correlate — {}{}{} ",
+        state.entity.id, loading_marker, suffix
+    )
 }
 
+/// PRD-007 Slice 2 popup body layout:
+///
+/// 1. **Diagnosis banner** at the top — omitted if absent.
+/// 2. **Source-availability dots row** — `⟳ temporal  ● postgres  ✗ loki`.
+/// 3. **Scrollable Timeline** — chronologically sorted events, with
+///    failed Sources surfacing inline as synthetic `source_error` rows.
+/// 4. **Action row** at the bottom — `[Enter] full   [esc] close`. The
+///    `Enter` handler is a stub until Slice 4.
+///
+/// Rendered by stitching the four sections into one `body` vec; the
+/// `Popup` primitive draws it inside the centered modal frame.
 fn correlate_body_lines(state: &CorrelateState, theme: &Theme) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     if let Some(diag) = &state.diagnosis {
         out.extend(diagnosis_banner_lines(diag, theme));
     }
-    match &state.status {
-        CorrelateStatus::Loading => {
-            out.push(Line::from(Span::styled(
-                "loading timeline…".to_string(),
-                Style::default().fg(theme.muted),
-            )));
+    if !state.sources.is_empty() {
+        out.push(source_dots_line(state, theme));
+        out.push(Line::from(""));
+    }
+
+    if state.events.is_empty() && state.source_errors.is_empty() {
+        let msg = if state.is_loading() {
+            "loading timeline…".to_string()
+        } else {
+            format!("No events in the last 1h for {}", state.entity.id)
+        };
+        out.push(Line::from(Span::styled(
+            msg,
+            Style::default().fg(theme.muted),
+        )));
+    } else {
+        for e in &state.events {
+            out.push(format_popover_event(e, theme));
         }
-        CorrelateStatus::Loaded {
-            events,
-            source_errors,
-        } => {
-            if events.is_empty() && source_errors.is_empty() {
-                out.push(Line::from(Span::styled(
-                    format!("(no events found for {})", state.entity.id),
-                    Style::default().fg(theme.muted),
-                )));
-            } else {
-                for e in events {
-                    out.push(format_popover_event(e, theme));
-                }
-                for se in source_errors {
-                    out.push(format_source_error(se, theme));
-                }
-            }
+        for se in &state.source_errors {
+            out.push(format_source_error(se, theme));
         }
     }
+
+    out.push(Line::from(""));
+    out.push(action_row_line(theme));
     out
+}
+
+/// `⟳ temporal  ● postgres  ✗ loki  ⟳ k8s …` — one entry per Source the
+/// runner is querying, glyph by current status. Re-rendered on every
+/// `CorrelateUpdate` so dots transition `⟳ → ● / ✗` live.
+fn source_dots_line(state: &CorrelateState, theme: &Theme) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, p) in state.sources.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let (glyph, color) = match p.status {
+            SourceStatus::Pending => ("⟳", theme.muted),
+            SourceStatus::Landed => ("●", theme.ok),
+            SourceStatus::Failed => ("✗", theme.error),
+            SourceStatus::Skipped => ("○", theme.muted),
+        };
+        spans.push(Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(color),
+        ));
+        spans.push(Span::styled(
+            p.name.clone(),
+            Style::default().fg(theme.overlay_fg),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn action_row_line(theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "[Enter] full   ".to_string(),
+            Style::default().fg(theme.overlay_key),
+        ),
+        Span::styled(
+            "[esc] close".to_string(),
+            Style::default().fg(theme.overlay_key),
+        ),
+    ])
 }
 
 /// PRD-007: two-line Diagnosis banner + blank separator at the top of
