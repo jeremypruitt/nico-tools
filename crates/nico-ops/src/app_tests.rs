@@ -1,6 +1,21 @@
 use super::*;
-use crate::model::{PopoverEvent, SourceError};
+use crate::model::{EntityRef, PopoverEvent, SourceError};
 use nico_common::output::Status;
+use nico_correlate::id::IdType;
+
+fn entity_wf(id: &str) -> EntityRef {
+    EntityRef {
+        id: id.into(),
+        id_type: IdType::Workflow,
+    }
+}
+
+fn entity_dpu(id: &str) -> EntityRef {
+    EntityRef {
+        id: id.into(),
+        id_type: IdType::Dpu,
+    }
+}
 
 fn snap(name: &str, status: Status) -> LayerSnapshot {
     LayerSnapshot {
@@ -932,27 +947,30 @@ fn correlate_on_workflows_layer_opens_loading_overlay_and_emits_effect() {
         "wf-001",
     )]));
     let eff = app.handle(Action::Correlate);
-    assert_eq!(eff, Some(Effect::Correlate("wf-001".into())));
+    assert_eq!(eff, Some(Effect::RunCorrelate(entity_wf("wf-001"))));
     assert_eq!(app.overlay(), Overlay::Correlate);
     let cs = app.correlate_state().expect("correlate state set");
-    assert_eq!(cs.workflow_id, "wf-001");
+    assert_eq!(cs.entity, entity_wf("wf-001"));
     assert!(matches!(cs.status, CorrelateStatus::Loading));
+    assert!(cs.diagnosis.is_none());
 }
 
 #[test]
-fn correlate_on_non_workflows_layer_is_inert() {
+fn correlate_on_non_entity_layer_in_scorecard_is_inert() {
+    // Scorecard preserves the issue-#157 contract: silently inert when no
+    // entity in the focused finding (no toast). PRD-007 only adds the
+    // toast for the Spotlight surface.
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![warn_snap("logs")]));
     let eff = app.handle(Action::Correlate);
     assert_eq!(eff, None);
     assert_eq!(app.overlay(), Overlay::None);
     assert!(app.correlate_state().is_none());
+    assert!(app.toast().is_none());
 }
 
 #[test]
 fn correlate_on_workflows_layer_with_no_id_is_inert() {
-    // workflows layer with only the aggregate "0 stuck, 0 failed"
-    // style finding (no recognizable workflow ID token).
     let snap = LayerSnapshot {
         name: "workflows".into(),
         status: Status::Ok,
@@ -970,19 +988,64 @@ fn correlate_on_workflows_layer_with_no_id_is_inert() {
 #[test]
 fn correlate_in_spotlight_targets_focused_incident_card() {
     let mut app = App::new();
-    // Two non-green cards; the second is workflows.
     app.handle(Action::Snapshots(vec![
         warn_snap("logs"),
         workflows_warn_snap_with_id("wf-042"),
     ]));
     app.handle(Action::ShowSpotlight);
-    // Default focus is 0 (logs) — should be inert.
+    // Default focus is 0 (logs) — no entity in its finding ("logs finding"),
+    // so PRD-007 raises the toast and stays inert (no overlay).
     assert_eq!(app.handle(Action::Correlate), None);
     assert_eq!(app.overlay(), Overlay::None);
+    assert_eq!(
+        app.toast().map(|t| t.message.as_str()),
+        Some("no entity found in this row")
+    );
 }
 
 #[test]
-fn correlate_results_for_matching_workflow_id_populates_loaded_state() {
+fn correlate_on_dpu_finding_in_spotlight_opens_popup_with_dpu_entity() {
+    // PRD-007 Slice 0 tracer-bullet path: a non-workflows incident card
+    // whose Finding mentions a DPU id should open the correlate popup
+    // for that DPU. Before slice 0 this was inert (workflows-layer-only).
+    let snap = LayerSnapshot {
+        name: "ib".into(),
+        status: Status::Warn,
+        evidence: "1 dpu down".into(),
+        findings: vec![crate::model::Finding {
+            status: Status::Warn,
+            message: "dpu-r12u5 disconnected at 14:32 (link down 5m)".into(),
+            next_command: None,
+            link: None,
+        }],
+        duration_ms: 0,
+    };
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![snap]));
+    app.handle(Action::ShowSpotlight);
+    let eff = app.handle(Action::Correlate);
+    assert_eq!(eff, Some(Effect::RunCorrelate(entity_dpu("dpu-r12u5"))));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    let cs = app.correlate_state().expect("correlate state set");
+    assert_eq!(cs.entity, entity_dpu("dpu-r12u5"));
+    assert!(matches!(cs.status, CorrelateStatus::Loading));
+}
+
+#[test]
+fn open_correlate_popup_directly_opens_for_any_entity() {
+    // Direct path used by the slice-0 tracer bullet's reducer test, and
+    // by the per-surface triggers landing in slices 3-5.
+    let mut app = App::new();
+    let entity = entity_dpu("dpu-r12u5");
+    let eff = app.handle(Action::OpenCorrelatePopup(entity.clone()));
+    assert_eq!(eff, Some(Effect::RunCorrelate(entity.clone())));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    let cs = app.correlate_state().expect("correlate state set");
+    assert_eq!(cs.entity, entity);
+}
+
+#[test]
+fn correlate_results_for_matching_entity_populates_loaded_state() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
         "wf-001",
@@ -995,10 +1058,16 @@ fn correlate_results_for_matching_workflow_id_populates_loaded_state() {
         message: "started".into(),
         severity: crate::model::PopoverSeverity::Info,
     }];
+    let diag = crate::model::PopoverDiagnosis {
+        pattern: "stuck_workflow".into(),
+        error_signature: "no events in the last 30m; workflow still Running".into(),
+        next_commands: vec!["nico doctor".into()],
+    };
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: entity_wf("wf-001"),
         events: evs.clone(),
         source_errors: vec![],
+        diagnosis: Some(diag.clone()),
     });
     let cs = app.correlate_state().expect("still open");
     match &cs.status {
@@ -1012,24 +1081,26 @@ fn correlate_results_for_matching_workflow_id_populates_loaded_state() {
         }
         _ => panic!("expected Loaded, got {:?}", cs.status),
     }
+    assert_eq!(cs.diagnosis.as_ref(), Some(&diag));
 }
 
 #[test]
-fn correlate_results_for_stale_workflow_id_are_dropped() {
+fn correlate_results_for_stale_entity_are_dropped() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
         "wf-001",
     )]));
     app.handle(Action::Correlate);
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-OTHER".into(),
+        entity: entity_wf("wf-OTHER"),
         events: vec![],
         source_errors: vec![],
+        diagnosis: None,
     });
     let cs = app.correlate_state().unwrap();
     assert!(
         matches!(cs.status, CorrelateStatus::Loading),
-        "stale results must not flip the popover into Loaded"
+        "stale results must not flip the popup into Loaded"
     );
 }
 
@@ -1060,15 +1131,16 @@ fn correlate_with_overlay_already_open_is_inert() {
 #[test]
 fn correlate_results_when_no_overlay_open_are_dropped() {
     let mut app = App::new();
-    // Never opened the popover; out-of-band results must not crash
-    // or flip state.
+    // Never opened the popup; out-of-band results must not crash or
+    // flip state.
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: entity_wf("wf-001"),
         events: vec![],
         source_errors: vec![SourceError {
             name: "loki".into(),
             reason: "x".into(),
         }],
+        diagnosis: None,
     });
     assert!(app.correlate_state().is_none());
 }

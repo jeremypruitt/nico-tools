@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use crate::model::{LayerSnapshot, LogLine, PopoverEvent, SourceError};
+use crate::model::{
+    EntityRef, LayerSnapshot, LogLine, PopoverDiagnosis, PopoverEvent, SourceError,
+};
 
 /// Direction for focus navigation across the scorecard grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,19 +74,26 @@ pub enum Action {
     /// `o` in Spotlight — open the focused Finding's link via the system
     /// browser. Best-effort; toast on failure (or when no link is set).
     OpenLink,
-    /// `c` on a workflow Finding — open the quick-correlate popover for
-    /// the focused workflow ID and kick off `nico_correlate::collect_all`.
-    /// No-op when the focused Layer is not `workflows` or no finding
-    /// surfaces a workflow ID. (Issue #157.)
+    /// `c` from any view — extract the entity from the focused row's
+    /// finding (workflow / DPU / host / request) and open the correlate
+    /// mini-dashboard popup for it. PRD-007 Slice 0 ships the Spotlight
+    /// trigger; the underlying handler dispatches through
+    /// [`Action::OpenCorrelatePopup`].
     Correlate,
+    /// PRD-007: open the correlate mini-dashboard popup for an explicit
+    /// entity. The general path the per-surface triggers (Spotlight rows,
+    /// log lines, Findings detail, event timeline) all funnel into.
+    OpenCorrelatePopup(EntityRef),
     /// Results from a `nico_correlate::collect_all` round, posted by the
-    /// host loop. Carries the `workflow_id` so the reducer can drop stale
+    /// host loop. Carries the `entity` so the reducer can drop stale
     /// results when the operator has already closed or re-opened the
-    /// popover for a different workflow.
+    /// popup for a different entity. PRD-007 adds `diagnosis` for the
+    /// banner at the top of the popup.
     CorrelateResults {
-        workflow_id: String,
+        entity: EntityRef,
         events: Vec<PopoverEvent>,
         source_errors: Vec<SourceError>,
+        diagnosis: Option<PopoverDiagnosis>,
     },
     /// Show a transient toast in the bottom bar (e.g. "clipboard
     /// unavailable"). Auto-clears after `TOAST_TTL`.

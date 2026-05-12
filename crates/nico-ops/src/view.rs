@@ -645,39 +645,63 @@ fn correlate_title(app: &App, state: &CorrelateState) -> String {
         CorrelateStatus::Loading => (String::new(), " collecting…"),
         CorrelateStatus::Loaded { .. } => (String::new(), ""),
     };
-    format!(
-        " correlate — {}{}{} ",
-        state.workflow_id, loading_marker, suffix
-    )
+    format!(" correlate — {}{}{} ", state.entity.id, loading_marker, suffix)
 }
 
 fn correlate_body_lines(state: &CorrelateState, theme: &Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if let Some(diag) = &state.diagnosis {
+        out.extend(diagnosis_banner_lines(diag, theme));
+    }
     match &state.status {
-        CorrelateStatus::Loading => vec![Line::from(Span::styled(
-            "loading timeline…".to_string(),
-            Style::default().fg(theme.muted),
-        ))],
+        CorrelateStatus::Loading => {
+            out.push(Line::from(Span::styled(
+                "loading timeline…".to_string(),
+                Style::default().fg(theme.muted),
+            )));
+        }
         CorrelateStatus::Loaded {
             events,
             source_errors,
         } => {
             if events.is_empty() && source_errors.is_empty() {
-                return vec![Line::from(Span::styled(
-                    "(no events found for this workflow)".to_string(),
+                out.push(Line::from(Span::styled(
+                    format!("(no events found for {})", state.entity.id),
                     Style::default().fg(theme.muted),
-                ))];
+                )));
+            } else {
+                for e in events {
+                    out.push(format_popover_event(e, theme));
+                }
+                for se in source_errors {
+                    out.push(format_source_error(se, theme));
+                }
             }
-            let mut out: Vec<Line<'static>> =
-                Vec::with_capacity(events.len() + source_errors.len());
-            for e in events {
-                out.push(format_popover_event(e, theme));
-            }
-            for se in source_errors {
-                out.push(format_source_error(se, theme));
-            }
-            out
         }
     }
+    out
+}
+
+/// PRD-007: two-line Diagnosis banner + blank separator at the top of
+/// the popup body. Renders only when `state.diagnosis.is_some()`.
+fn diagnosis_banner_lines(
+    diag: &crate::model::PopoverDiagnosis,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled(
+                "diagnosis: ".to_string(),
+                Style::default().fg(theme.overlay_key),
+            ),
+            Span::styled(diag.pattern.clone(), Style::default().fg(theme.warn)),
+        ]),
+        Line::from(vec![
+            Span::styled("  ".to_string(), Style::default()),
+            Span::raw(diag.error_signature.clone()),
+        ]),
+        Line::from(""),
+    ]
 }
 
 fn format_popover_event(e: &PopoverEvent, theme: &Theme) -> Line<'static> {

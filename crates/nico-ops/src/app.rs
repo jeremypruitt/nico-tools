@@ -9,7 +9,8 @@ use ratatui::layout::Rect;
 use crate::action::{Action, Dir, ScrollDir};
 use crate::events::Overlay;
 use crate::model::{
-    CorrelateState, CorrelateStatus, LayerSnapshot, LogLine, workflow_id_from_finding,
+    CorrelateState, CorrelateStatus, EntityRef, LayerSnapshot, LogLine,
+    extract_entity_from_finding,
 };
 use crate::pulse::PulseTimer;
 use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
@@ -70,10 +71,12 @@ pub enum Effect {
     /// default). Best-effort; failures translate into
     /// `Action::ShowToast`.
     OpenUrl(String),
-    /// Kick off `nico_correlate::collect_all` for the given workflow ID.
+    /// Kick off `nico_correlate::collect_all` for the given entity.
     /// The host loop spawns the call and posts the results back via
-    /// `Action::CorrelateResults`. (Issue #157.)
-    Correlate(String),
+    /// `Action::CorrelateResults`. PRD-007 generalised this from a bare
+    /// workflow ID (issue #157) to an [`EntityRef`] so DPU / host /
+    /// request drills land through the same effect.
+    RunCorrelate(EntityRef),
     /// Tear down and exit cleanly.
     Quit,
 }
@@ -515,28 +518,48 @@ impl App {
                 if self.overlay != Overlay::None {
                     return None;
                 }
-                let workflow_id = self.focused_workflow_id()?;
+                match self.focused_entity() {
+                    Some(entity) => self.handle(Action::OpenCorrelatePopup(entity)),
+                    None => {
+                        // PRD-007 Slice 0: Spotlight gives operator-visible
+                        // feedback when the row carries no entity. Scorecard
+                        // stays silent (preserves the issue-#157 contract
+                        // that `c` is inert outside the workflows layer).
+                        if self.layout == Layout::Spotlight {
+                            self.set_toast("no entity found in this row");
+                        }
+                        None
+                    }
+                }
+            }
+            Action::OpenCorrelatePopup(entity) => {
+                if self.overlay != Overlay::None {
+                    return None;
+                }
                 self.overlay = Overlay::Correlate;
                 self.correlate = Some(CorrelateState {
-                    workflow_id: workflow_id.clone(),
+                    entity: entity.clone(),
                     status: CorrelateStatus::Loading,
+                    diagnosis: None,
                 });
                 self.dirty = true;
-                Some(Effect::Correlate(workflow_id))
+                Some(Effect::RunCorrelate(entity))
             }
             Action::CorrelateResults {
-                workflow_id,
+                entity,
                 events,
                 source_errors,
+                diagnosis,
             } => {
                 let state = self.correlate.as_mut()?;
-                if state.workflow_id != workflow_id {
+                if state.entity != entity {
                     return None;
                 }
                 state.status = CorrelateStatus::Loaded {
                     events,
                     source_errors,
                 };
+                state.diagnosis = diagnosis;
                 self.dirty = true;
                 None
             }
@@ -560,17 +583,15 @@ impl App {
         self.dirty = true;
     }
 
-    /// Workflow ID extracted from the first Finding on the currently
-    /// focused Layer, if (a) the focused Layer is `workflows` and (b) at
-    /// least one Finding's message carries a recognizable workflow ID
-    /// (`wf-…` or `hp-…`). Drives the `[c]` quick-correlate trigger; see
-    /// [`workflow_id_from_finding`].
-    fn focused_workflow_id(&self) -> Option<String> {
+    /// First entity (DPU / workflow / host / request) extracted from a
+    /// Finding on the currently focused row. PRD-007 Slice 0 broadens
+    /// from the workflow-only path (issue #157) so `c` works on any row
+    /// that mentions an entity ID. Returns `None` when no Finding carries
+    /// a recognizable token; the reducer turns that into a toast in
+    /// Spotlight or stays silent in Scorecard.
+    fn focused_entity(&self) -> Option<EntityRef> {
         let snap = self.focused_for_correlate()?;
-        if snap.name != "workflows" {
-            return None;
-        }
-        snap.findings.iter().find_map(workflow_id_from_finding)
+        snap.findings.iter().find_map(extract_entity_from_finding)
     }
 
     /// In Spotlight, `[c]` should target the focused incident card; in

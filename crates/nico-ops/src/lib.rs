@@ -33,7 +33,8 @@ use crate::app::{App, Effect};
 use crate::clock::{Clock, SystemClock};
 use crate::events::{Mode, translate};
 use crate::model::{
-    LayerSnapshot, LogLine, PopoverEvent, PopoverSeverity, SourceError, log_level_from_text,
+    EntityRef, LayerSnapshot, LogLine, PopoverDiagnosis, PopoverEvent, PopoverSeverity,
+    SourceError, log_level_from_text,
 };
 
 pub use cli::{HbnPanelArgs, OpsArgs, OpsCommand};
@@ -314,34 +315,39 @@ fn dispatch(
             }
             false
         }
-        Some(Effect::Correlate(workflow_id)) => {
-            spawn_correlate(workflow_id, tx.clone());
+        Some(Effect::RunCorrelate(entity)) => {
+            spawn_correlate(entity, tx.clone());
             false
         }
         None => false,
     }
 }
 
-/// Run `nico_correlate::collect_all` for `workflow_id` on a background
+/// Run `nico_correlate::collect_all` for `entity` on a background
 /// task and post the resulting timeline back through the action channel.
 /// All errors (config load, source preparation, collection) end up as
 /// `Action::CorrelateResults` with a populated `source_errors` so the
-/// popover can render them inline as `source_error` rows. (Issue #157.)
-fn spawn_correlate(workflow_id: String, tx: mpsc::Sender<Action>) {
+/// popup can render them inline as `source_error` rows. PRD-007 also
+/// computes a `Diagnosis` over the collected events + state and ships
+/// it through for the popup banner.
+fn spawn_correlate(entity: EntityRef, tx: mpsc::Sender<Action>) {
     tokio::spawn(async move {
-        let (events, source_errors) = run_correlate_collect(&workflow_id).await;
+        let (events, source_errors, diagnosis) = run_correlate_collect(&entity).await;
         let _ = tx
             .send(Action::CorrelateResults {
-                workflow_id,
+                entity,
                 events,
                 source_errors,
+                diagnosis,
             })
             .await;
     });
 }
 
-async fn run_correlate_collect(workflow_id: &str) -> (Vec<PopoverEvent>, Vec<SourceError>) {
-    let args = correlate_args(workflow_id);
+async fn run_correlate_collect(
+    entity: &EntityRef,
+) -> (Vec<PopoverEvent>, Vec<SourceError>, Option<PopoverDiagnosis>) {
+    let args = correlate_args(entity);
     let cfg = match nico_correlate::resolve_config(&args) {
         Ok(c) => c,
         Err(nico_correlate::BootstrapErr::Fatal { message, .. }) => {
@@ -351,6 +357,7 @@ async fn run_correlate_collect(workflow_id: &str) -> (Vec<PopoverEvent>, Vec<Sou
                     name: "config".into(),
                     reason: message,
                 }],
+                None,
             );
         }
     };
@@ -359,20 +366,24 @@ async fn run_correlate_collect(workflow_id: &str) -> (Vec<PopoverEvent>, Vec<Sou
     let results = nico_correlate::collect_all(&prepared.named_sources, &id_str, &cfg.id_type).await;
     drop(prepared._pf_guards);
 
-    let mut events: Vec<PopoverEvent> = Vec::new();
+    let mut popover_events: Vec<PopoverEvent> = Vec::new();
     let mut source_errors: Vec<SourceError> = Vec::new();
+    let mut raw_events: Vec<nico_correlate::Event> = Vec::new();
+    let mut state: Vec<nico_correlate::source::StateEntry> = Vec::new();
     for r in results {
         match r {
             nico_correlate::source::SourceResult::Output(o) => {
                 for e in o.events {
-                    events.push(PopoverEvent {
+                    popover_events.push(PopoverEvent {
                         ts: e.ts,
-                        source: e.source,
-                        kind: e.kind,
-                        message: e.message,
+                        source: e.source.clone(),
+                        kind: e.kind.clone(),
+                        message: e.message.clone(),
                         severity: severity_to_popover(&e.severity),
                     });
+                    raw_events.push(e);
                 }
+                state.extend(o.state);
             }
             nico_correlate::source::SourceResult::Unavailable(u) => {
                 source_errors.push(SourceError {
@@ -382,8 +393,20 @@ async fn run_correlate_collect(workflow_id: &str) -> (Vec<PopoverEvent>, Vec<Sou
             }
         }
     }
-    events.sort_by_key(|e| e.ts);
-    (events, source_errors)
+    popover_events.sort_by_key(|e| e.ts);
+
+    let diag_config = nico_correlate::diagnosis::DiagnosisConfig {
+        stuck_threshold: cfg.config.temporal.stuck_threshold,
+    };
+    let diagnosis = nico_correlate::diagnosis::diagnose(&raw_events, &state, &diag_config).map(
+        |d| PopoverDiagnosis {
+            pattern: d.pattern,
+            error_signature: d.error_signature,
+            next_commands: d.next_commands,
+        },
+    );
+
+    (popover_events, source_errors, diagnosis)
 }
 
 fn severity_to_popover(s: &nico_correlate::event::Severity) -> PopoverSeverity {
@@ -394,11 +417,11 @@ fn severity_to_popover(s: &nico_correlate::event::Severity) -> PopoverSeverity {
     }
 }
 
-fn correlate_args(workflow_id: &str) -> nico_correlate::CorrelateArgs {
+fn correlate_args(entity: &EntityRef) -> nico_correlate::CorrelateArgs {
     nico_correlate::CorrelateArgs {
         command: None,
-        id: Some(workflow_id.to_string()),
-        r#type: Some("workflow".to_string()),
+        id: Some(entity.id.clone()),
+        r#type: Some(entity.id_type.cli_name().to_string()),
         sources: vec![],
         pod: None,
         since: "1h".to_string(),

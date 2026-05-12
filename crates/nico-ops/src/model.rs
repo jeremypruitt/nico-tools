@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use nico_common::output::Status;
+use nico_correlate::id::{IdType, detect_id_type};
 
 /// A single warning/failure line attached to a Layer.
 #[derive(Debug, Clone, PartialEq)]
@@ -12,6 +13,17 @@ pub struct Finding {
     /// dashboard or Temporal Web UI workflow page). `None` means the
     /// `[o]` action raises a toast instead.
     pub link: Option<String>,
+}
+
+/// PRD-007: a typed pointer at one entity (workflow / host / DPU / request)
+/// the correlate drill-down popup is opened against. Constructed from
+/// `Finding.message` text via [`extract_entity_from_finding`] using the
+/// shared [`detect_id_type`] vocabulary so doctor / correlate / ops agree
+/// on what an entity ID looks like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityRef {
+    pub id: String,
+    pub id_type: IdType,
 }
 
 /// Severity of a single timeline entry inside the quick-correlate popover.
@@ -55,24 +67,40 @@ pub struct SourceError {
     pub reason: String,
 }
 
-/// The full state the correlate popover needs: which workflow it's for,
-/// and the in-flight / loaded payload.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CorrelateState {
-    pub workflow_id: String,
-    pub status: CorrelateStatus,
+/// PRD-007: condensed mirror of [`nico_correlate::diagnosis::Diagnosis`]
+/// for the correlate mini-dashboard popup banner. Drops the `activity`
+/// field (popup banner is two lines: pattern + error_signature). Mirroring
+/// — rather than re-exporting — keeps the renderer free of correlate's
+/// internal types, same pattern as [`PopoverSeverity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopoverDiagnosis {
+    pub pattern: String,
+    pub error_signature: String,
+    pub next_commands: Vec<String>,
 }
 
-/// Heuristic: pull a workflow ID out of a `Finding.message` produced by
-/// the workflows Layer. Matches the first whitespace-separated token that
-/// starts with `wf-` or `hp-` (the prefixes recognized by
-/// `nico_correlate::id::detect_id_type`). Returns `None` when no token
-/// matches — used to decide whether `[c]` should open the popover.
-pub fn workflow_id_from_finding(f: &Finding) -> Option<String> {
-    f.message
-        .split_whitespace()
-        .find(|tok| tok.starts_with("wf-") || tok.starts_with("hp-"))
-        .map(|s| s.to_string())
+/// The full state the correlate popup needs: which entity it's for, the
+/// in-flight / loaded payload, and the optional Diagnosis banner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrelateState {
+    pub entity: EntityRef,
+    pub status: CorrelateStatus,
+    pub diagnosis: Option<PopoverDiagnosis>,
+}
+
+/// PRD-007: pull the first entity (DPU / workflow / host / request) out
+/// of a `Finding.message`. Tokens are split on whitespace and trimmed of
+/// surrounding non-id punctuation before being run through
+/// [`detect_id_type`]. Returns `None` when no token matches — drives the
+/// "no entity found in this row" toast.
+pub fn extract_entity_from_finding(f: &Finding) -> Option<EntityRef> {
+    f.message.split_whitespace().find_map(|raw| {
+        let tok = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+        detect_id_type(tok).map(|id_type| EntityRef {
+            id: tok.to_string(),
+            id_type,
+        })
+    })
 }
 
 /// One line in the snapshot logs panel. `ts` is the snapshot fetch time
@@ -181,21 +209,52 @@ mod tests {
     }
 
     #[test]
-    fn workflow_id_extracts_wf_prefix_token() {
+    fn extract_entity_finds_wf_prefix_token_as_workflow() {
         let f = finding("stuck_workflow: wf-001 (HostProvisioning): 47m running");
-        assert_eq!(workflow_id_from_finding(&f).as_deref(), Some("wf-001"));
+        let e = extract_entity_from_finding(&f).unwrap();
+        assert_eq!(e.id, "wf-001");
+        assert_eq!(e.id_type, IdType::Workflow);
     }
 
     #[test]
-    fn workflow_id_extracts_hp_prefix_token() {
+    fn extract_entity_finds_hp_prefix_token_as_workflow() {
         let f = finding("failed_workflow: hp-7f3a (HostDecommission): failed");
-        assert_eq!(workflow_id_from_finding(&f).as_deref(), Some("hp-7f3a"));
+        let e = extract_entity_from_finding(&f).unwrap();
+        assert_eq!(e.id, "hp-7f3a");
+        assert_eq!(e.id_type, IdType::Workflow);
     }
 
     #[test]
-    fn workflow_id_returns_none_when_no_prefixed_token() {
+    fn extract_entity_finds_dpu_prefix_token_as_dpu() {
+        // PRD-007 Slice 0 — the "DPU id in Spotlight finding row" path.
+        let f = finding("dpu-r12u5 disconnected at 14:32 (link down 5m)");
+        let e = extract_entity_from_finding(&f).unwrap();
+        assert_eq!(e.id, "dpu-r12u5");
+        assert_eq!(e.id_type, IdType::Dpu);
+    }
+
+    #[test]
+    fn extract_entity_strips_surrounding_punctuation() {
+        // Operators tend to bracket entity refs inline: "[dpu-r12u5]".
+        let f = finding("incident: [dpu-r12u5] flapping");
+        let e = extract_entity_from_finding(&f).unwrap();
+        assert_eq!(e.id, "dpu-r12u5");
+        assert_eq!(e.id_type, IdType::Dpu);
+    }
+
+    #[test]
+    fn extract_entity_returns_none_when_no_token_matches() {
         let f = finding("0 stuck, 0 failed");
-        assert_eq!(workflow_id_from_finding(&f), None);
+        assert_eq!(extract_entity_from_finding(&f), None);
+    }
+
+    #[test]
+    fn extract_entity_picks_first_matching_token() {
+        // Slice 0 takes the first match; chooser comes in Slice 1.
+        let f = finding("host-r12u5 had dpu-bf3-r12u5 disconnect");
+        let e = extract_entity_from_finding(&f).unwrap();
+        assert_eq!(e.id, "host-r12u5");
+        assert_eq!(e.id_type, IdType::Host);
     }
 
     #[test]

@@ -1160,7 +1160,10 @@ fn correlate_overlay_body_renders_loaded_timeline_events() {
     app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     open_correlate(&mut app);
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: crate::model::EntityRef {
+            id: "wf-001".into(),
+            id_type: nico_correlate::id::IdType::Workflow,
+        },
         events: vec![
             PopoverEvent {
                 ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 5).unwrap(),
@@ -1178,6 +1181,7 @@ fn correlate_overlay_body_renders_loaded_timeline_events() {
             },
         ],
         source_errors: vec![],
+        diagnosis: None,
     });
     let s = render_to_string(&mut app, 120, 30);
     assert!(
@@ -1204,12 +1208,16 @@ fn correlate_overlay_renders_source_errors_inline_as_source_error_rows() {
     app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     open_correlate(&mut app);
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: crate::model::EntityRef {
+            id: "wf-001".into(),
+            id_type: nico_correlate::id::IdType::Workflow,
+        },
         events: vec![],
         source_errors: vec![SourceError {
             name: "loki".into(),
             reason: "LOKI_URL not set".into(),
         }],
+        diagnosis: None,
     });
     let s = render_to_string(&mut app, 120, 30);
     assert!(
@@ -1229,9 +1237,13 @@ fn correlate_overlay_renders_empty_state_when_no_events_and_no_source_errors() {
     app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     open_correlate(&mut app);
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: crate::model::EntityRef {
+            id: "wf-001".into(),
+            id_type: nico_correlate::id::IdType::Workflow,
+        },
         events: vec![],
         source_errors: vec![],
+        diagnosis: None,
     });
     let s = render_to_string(&mut app, 120, 30);
     assert!(
@@ -1265,5 +1277,142 @@ fn correlate_overlay_renders_in_spotlight_layout_too() {
     assert!(
         s.contains("wf-001"),
         "wf id missing in Spotlight overlay:\n{s}"
+    );
+}
+
+// ── PRD-007 Slice 0 — DPU correlate mini-dashboard popup ───────────
+
+fn dpu_warn_snap(message: &str) -> LayerSnapshot {
+    LayerSnapshot {
+        name: "ib".into(),
+        status: Status::Warn,
+        evidence: "1 dpu down".into(),
+        findings: vec![Finding {
+            status: Status::Warn,
+            message: message.into(),
+            next_command: None,
+            link: None,
+        }],
+        duration_ms: 0,
+    }
+}
+
+#[test]
+fn correlate_popup_for_dpu_renders_diagnosis_banner_and_timeline_at_120_cols() {
+    // PRD-007 Slice 0 acceptance: TestBackend snapshot of the popup at
+    // medium width (120 cols) against a fixture correlate result. Asserts
+    // the Diagnosis banner sits above the chronologically-sorted timeline
+    // — the "killer feature" shape promised by the slice spec.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![dpu_warn_snap(
+        "dpu-r12u5 disconnected at 14:32 (link down 5m)",
+    )]));
+    app.handle(Action::ShowSpotlight);
+    open_correlate(&mut app);
+    let dpu_entity = crate::model::EntityRef {
+        id: "dpu-r12u5".into(),
+        id_type: nico_correlate::id::IdType::Dpu,
+    };
+    app.handle(Action::CorrelateResults {
+        entity: dpu_entity,
+        events: vec![
+            PopoverEvent {
+                ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 30, 0).unwrap(),
+                source: "postgres".into(),
+                kind: "provision_fail".into(),
+                message: "BMC unreachable after 3 retries".into(),
+                severity: PopoverSeverity::Warning,
+            },
+            PopoverEvent {
+                ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 32, 0).unwrap(),
+                source: "redfish".into(),
+                kind: "NetworkAdapterFailed".into(),
+                message: "link state down".into(),
+                severity: PopoverSeverity::Error,
+            },
+        ],
+        source_errors: vec![],
+        diagnosis: Some(crate::model::PopoverDiagnosis {
+            pattern: "k8s_crash_loop".into(),
+            error_signature: "pod worker-xyz in CrashLoopBackOff (6 restarts)".into(),
+            next_commands: vec!["kubectl describe pod worker-xyz".into()],
+        }),
+    });
+    let s = render_to_string(&mut app, 120, 30);
+    // Title pins the entity by id, not "workflow-id"-flavored suffix.
+    assert!(
+        s.contains("dpu-r12u5"),
+        "DPU id should appear in popup title:\n{s}"
+    );
+    // Diagnosis banner above the timeline.
+    assert!(
+        s.contains("diagnosis:"),
+        "Diagnosis banner label missing:\n{s}"
+    );
+    assert!(
+        s.contains("k8s_crash_loop"),
+        "Diagnosis pattern missing in banner:\n{s}"
+    );
+    assert!(
+        s.contains("CrashLoopBackOff"),
+        "Diagnosis error signature missing in banner:\n{s}"
+    );
+    // Timeline events render below the banner.
+    assert!(
+        s.contains("provision_fail"),
+        "first timeline event missing:\n{s}"
+    );
+    assert!(
+        s.contains("NetworkAdapterFailed"),
+        "second timeline event missing:\n{s}"
+    );
+    // Banner-then-timeline ordering: diagnosis label appears earlier in
+    // the rendered string than the first event kind.
+    let diag_pos = s
+        .find("diagnosis:")
+        .expect("diagnosis label should exist in render output");
+    let event_pos = s
+        .find("provision_fail")
+        .expect("first event kind should exist in render output");
+    assert!(
+        diag_pos < event_pos,
+        "Diagnosis banner must render above the timeline; \
+         got diag@{diag_pos} event@{event_pos}:\n{s}"
+    );
+}
+
+#[test]
+fn correlate_popup_omits_diagnosis_section_when_no_diagnosis_present() {
+    // Slice spec: "Diagnosis banner (top, omitted if none)".
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![dpu_warn_snap(
+        "dpu-r12u5 disconnected at 14:32 (link down 5m)",
+    )]));
+    app.handle(Action::ShowSpotlight);
+    open_correlate(&mut app);
+    let dpu_entity = crate::model::EntityRef {
+        id: "dpu-r12u5".into(),
+        id_type: nico_correlate::id::IdType::Dpu,
+    };
+    app.handle(Action::CorrelateResults {
+        entity: dpu_entity,
+        events: vec![PopoverEvent {
+            ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 30, 0).unwrap(),
+            source: "postgres".into(),
+            kind: "provision_fail".into(),
+            message: "BMC unreachable".into(),
+            severity: PopoverSeverity::Warning,
+        }],
+        source_errors: vec![],
+        diagnosis: None,
+    });
+    let s = render_to_string(&mut app, 120, 30);
+    assert!(
+        !s.contains("diagnosis:"),
+        "Diagnosis banner must not render when no diagnosis matched:\n{s}"
+    );
+    assert!(
+        s.contains("provision_fail"),
+        "Timeline still renders without diagnosis:\n{s}"
     );
 }
