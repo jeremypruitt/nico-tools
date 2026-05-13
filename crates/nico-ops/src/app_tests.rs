@@ -157,6 +157,56 @@ fn open_help_then_close() {
 }
 
 #[test]
+fn show_logs_opens_logs_overlay() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.clear_dirty();
+    app.handle(Action::ShowLogs);
+    assert_eq!(app.overlay(), Overlay::Logs);
+    assert!(app.dirty(), "opening the overlay marks the frame dirty");
+}
+
+#[test]
+fn close_overlay_dismisses_logs_overlay() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::ShowLogs);
+    app.handle(Action::CloseOverlay);
+    assert_eq!(app.overlay(), Overlay::None);
+}
+
+#[test]
+fn show_logs_inert_when_another_overlay_is_open() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::OpenHelp);
+    app.clear_dirty();
+    app.handle(Action::ShowLogs);
+    assert_eq!(
+        app.overlay(),
+        Overlay::Help,
+        "ShowLogs must not steal an already-active overlay"
+    );
+    assert!(!app.dirty());
+}
+
+#[test]
+fn show_logs_preserves_underlying_view_state() {
+    // PRD-006 Slice 2 (#368) AC: "preserves underlying-view state".
+    // Opening and closing the overlay leaves the scorecard layout and
+    // focus untouched.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::Focus(crate::action::Dir::Down));
+    let focus_before = app.focus();
+    let layout_before = app.layout();
+    app.handle(Action::ShowLogs);
+    app.handle(Action::CloseOverlay);
+    assert_eq!(app.focus(), focus_before);
+    assert_eq!(app.layout(), layout_before);
+}
+
+#[test]
 fn refresh_returns_start_effect_and_marks_refreshing() {
     let mut app = App::new();
     let eff = app.handle(Action::Refresh);
