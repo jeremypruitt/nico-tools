@@ -109,6 +109,9 @@ pub enum Action {
     /// Show a transient toast in the bottom bar (e.g. "clipboard
     /// unavailable"). Auto-clears after `TOAST_TTL`.
     ShowToast(String),
+    /// PRD-006 Slice 2 (#368): open the logs modal overlay over the
+    /// current view. Closed via `Action::CloseOverlay` (Esc / `l` / `q`).
+    ShowLogs,
     /// `q` / `Ctrl-C` — exit cleanly.
     Quit,
 }

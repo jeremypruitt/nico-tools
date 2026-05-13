@@ -393,6 +393,14 @@ impl App {
                 }
                 None
             }
+            Action::ShowLogs => {
+                if self.overlay == Overlay::None {
+                    self.overlay = Overlay::Logs;
+                    self.logs_scroll = 0;
+                    self.dirty = true;
+                }
+                None
+            }
             Action::CloseOverlay => {
                 if self.overlay == Overlay::None {
                     return None;

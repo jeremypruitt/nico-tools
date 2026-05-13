@@ -575,6 +575,20 @@ fn render_help_overlay_lists_logs_scroll_keybind() {
 }
 
 #[test]
+fn render_help_overlay_lists_logs_modal_keybind() {
+    // PRD-006 Slice 2 (#368): the `l` modal-overlay binding lives in the
+    // help screen so operators can discover it.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::OpenHelp);
+    let s = render_to_string(&mut app, 120, 24);
+    assert!(
+        s.contains("logs modal"),
+        "help overlay should document the logs modal binding:\n{s}"
+    );
+}
+
+#[test]
 fn render_hint_bar_does_not_carry_logs_scroll_hint() {
     // Per ADR-0014, the footer hint bar is intentionally NOT extended
     // with a logs-panel-specific hint. The help overlay is the home
@@ -1763,4 +1777,110 @@ fn chooser_overlay_renders_at_narrow_and_wide_widths() {
         assert!(s.contains("host-r12u5"), "host missing at {w}x{h}:\n{s}");
         assert!(s.contains("dpu-bf3-r12u5"), "dpu missing at {w}x{h}:\n{s}");
     }
+}
+
+// ── PRD-006 Slice 2 (#368): logs modal overlay ──────────────────────────
+
+#[test]
+fn logs_overlay_renders_title_with_total_count_when_lines_present() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::LogLines(log_lines_sample()));
+    app.handle(Action::ShowLogs);
+    let s = render_to_string(&mut app, 140, 30);
+    // Two lines from log_lines_sample(); title shows the count so the
+    // operator knows the modal isn't truncating.
+    assert!(s.contains("logs — 2"), "title with count missing:\n{s}");
+    assert!(s.contains("carbide-controller"), "first log line missing:\n{s}");
+}
+
+#[test]
+fn logs_overlay_renders_empty_state_when_no_lines() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::ShowLogs);
+    let s = render_to_string(&mut app, 140, 30);
+    assert!(s.contains("no errors"), "empty state missing:\n{s}");
+}
+
+#[test]
+fn logs_overlay_renders_at_small_medium_large_widths() {
+    // AC: "Snapshot or TestBackend coverage for the logs overlay at all
+    // three breakpoints." Use distinctive content per line so we can
+    // assert that the line survived the modal sizing at every width.
+    let lines = log_lines_sample();
+    for (w, h, label) in [
+        (80u16, 24u16, "small"),
+        (140, 32, "medium"),
+        (220, 48, "large"),
+    ] {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::LogLines(lines.clone()));
+        app.handle(Action::ShowLogs);
+        let s = render_to_string(&mut app, w, h);
+        assert!(
+            s.contains("logs"),
+            "{label} ({w}x{h}): logs title missing:\n{s}"
+        );
+        assert!(
+            s.contains("carbide-controller"),
+            "{label} ({w}x{h}): first log pod missing:\n{s}"
+        );
+    }
+}
+
+#[test]
+fn logs_overlay_renders_log_pod_names_that_used_to_get_cut_off_at_small_widths() {
+    // AC: "Logs overlay no longer cuts off content at small/medium widths."
+    // The pre-overlay logs panel had to share width with the rest of the
+    // drill panel; the modal overlay claims the whole centered rect so
+    // the pod column is visible even at 80×24.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::LogLines(log_lines_sample()));
+    app.handle(Action::ShowLogs);
+    let s = render_to_string(&mut app, 80, 24);
+    assert!(
+        s.contains("carbide-controller"),
+        "pod name should fit in the modal at 80×24:\n{s}"
+    );
+    assert!(
+        s.contains("site-agent-7f3a"),
+        "second pod name should fit in the modal at 80×24:\n{s}"
+    );
+}
+
+#[test]
+fn logs_overlay_reachable_from_spotlight() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::ShowSpotlight);
+    app.handle(Action::LogLines(log_lines_sample()));
+    app.handle(Action::ShowLogs);
+    let s = render_to_string(&mut app, 140, 32);
+    assert!(s.contains("logs — 2"), "logs modal not on top of Spotlight:\n{s}");
+    assert!(s.contains("carbide-controller"), "log content missing:\n{s}");
+}
+
+#[test]
+fn logs_overlay_dismisses_and_returns_to_underlying_view() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::LogLines(log_lines_sample()));
+    app.handle(Action::ShowLogs);
+    let with_modal = render_to_string(&mut app, 140, 32);
+    assert!(with_modal.contains("logs — 2"));
+
+    app.handle(Action::CloseOverlay);
+    let after_close = render_to_string(&mut app, 140, 32);
+    assert!(
+        !after_close.contains("logs — 2"),
+        "logs modal still visible after CloseOverlay:\n{after_close}"
+    );
+    // Underlying view still renders normally (header, hint bar).
+    assert!(
+        after_close.contains("nico ops"),
+        "underlying scorecard header missing after dismiss:\n{after_close}"
+    );
 }

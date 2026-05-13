@@ -15,6 +15,7 @@ use nico_doctor::baseline::Delta;
 
 use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
+use crate::layout_solver::{FocusState, SolverInput, solve};
 use crate::model::{
     CorrelateState, Finding, LayerSnapshot, LogLine, PopoverEvent, PopoverSeverity, SourceError,
     SourceStatus, overall_verdict,
@@ -39,7 +40,7 @@ pub const SPARKLINE_MAX: usize = 24;
 pub const HELP_LINES: &[&str] = &[
     "R         refresh",
     "Space     pause / resume auto-refresh",
-    "↑↓←→/hjkl move focus",
+    "↑↓/hjk    move focus  (←→ for left/right; `l` reserved for logs)",
     "j/k/wheel scroll logs (when logs panel is zoomed/focused)",
     "Enter     open detail",
     "s         spotlight (incident-only) view",
@@ -47,6 +48,7 @@ pub const HELP_LINES: &[&str] = &[
     "y         copy focused next-command (spotlight)",
     "o         open focused link (spotlight)",
     "c         correlate mini-dashboard popup for focused entity",
+    "l         logs modal overlay (any view; `l`/Esc to dismiss)",
     "Esc       close overlay",
     "?         this help",
     "q / ^C    quit",
@@ -66,27 +68,30 @@ pub fn render(app: &mut App, theme: &Theme, frame: &mut Frame) {
 
 fn render_scorecard_layout(app: &mut App, theme: &Theme, frame: &mut Frame) {
     let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(7),    // body grid
-            Constraint::Min(5),    // drill panel
-            Constraint::Length(1), // hint bar
-        ])
-        .split(area);
+    let focus = if app.focused().is_some_and(|s| s.name == "logs") {
+        FocusState::Logs
+    } else {
+        FocusState::Grid
+    };
+    let plan = solve(SolverInput {
+        viewport: area,
+        view: AppLayout::Scorecard,
+        focus,
+        logs_overlay_open: matches!(app.overlay(), Overlay::Logs),
+    });
 
-    render_header(app, theme, frame, chunks[0]);
-    let regions = render_grid(app, theme, frame, chunks[1]);
+    render_header(app, theme, frame, plan.header);
+    let regions = render_grid(app, theme, frame, plan.body);
     app.set_card_regions(regions);
-    render_drill(app, theme, frame, chunks[2]);
-    render_hint_bar(app, theme, frame, chunks[3]);
+    render_drill(app, theme, frame, plan.drill);
+    render_hint_bar(app, theme, frame, plan.hint_bar);
 
     match app.overlay() {
         Overlay::Detail => render_detail_overlay(app, theme, frame, area),
         Overlay::Help => render_help_overlay(theme, frame, area),
         Overlay::Correlate => render_correlate_overlay(app, theme, frame, area),
         Overlay::CorrelateChooser => render_correlate_chooser_overlay(app, theme, frame, area),
+        Overlay::Logs => render_logs_overlay(app, theme, frame, plan.logs_overlay.unwrap_or(area)),
         Overlay::None => {}
     }
 }
@@ -110,12 +115,22 @@ fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
     render_spotlight_green_footer(app, theme, frame, chunks[2]);
     render_spotlight_hint_bar(app, theme, frame, chunks[3]);
 
-    // Layout C still honors the help overlay (`?`) so the operator can
-    // see all keybinds, including the Spotlight-only ones.
+    // Spotlight still honors the help overlay (`?`) so the operator can
+    // see all keybinds, including the Spotlight-only ones. PRD-006 Slice
+    // 2 (#368) adds the logs overlay reachable here via `l`.
     match app.overlay() {
         Overlay::Help => render_help_overlay(theme, frame, area),
         Overlay::Correlate => render_correlate_overlay(app, theme, frame, area),
         Overlay::CorrelateChooser => render_correlate_chooser_overlay(app, theme, frame, area),
+        Overlay::Logs => {
+            let plan = solve(SolverInput {
+                viewport: area,
+                view: AppLayout::Spotlight,
+                focus: FocusState::Grid,
+                logs_overlay_open: true,
+            });
+            render_logs_overlay(app, theme, frame, plan.logs_overlay.unwrap_or(area));
+        }
         _ => {}
     }
 }
@@ -517,6 +532,47 @@ fn render_logs_panel(lines: &[LogLine], scroll: u16, theme: &Theme, frame: &mut 
     frame.render_widget(Paragraph::new(body), inner);
 }
 
+/// PRD-006 Slice 2 (#368): logs modal overlay. Renders the snapshot
+/// `log_lines` inside the popup primitive centered at the rect
+/// returned by the layout solver. Operator dismisses with `Esc` / `l`
+/// / `q`. Empty `log_lines` yields a "no errors" empty state so the
+/// modal still says something.
+fn render_logs_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let lines = app.log_lines();
+    let total = lines.len();
+    let title = if total == 0 {
+        " logs ".to_string()
+    } else {
+        format!(" logs — {total} ")
+    };
+    let body: Vec<Line<'static>> = if lines.is_empty() {
+        vec![Line::from(Span::styled(
+            "no errors",
+            Style::default().fg(theme.muted),
+        ))]
+    } else {
+        lines
+            .iter()
+            .map(|l| log_line_spans(l, theme, area.width))
+            .collect()
+    };
+    let popup = Popup {
+        title,
+        body,
+        size_pct: PopupSize {
+            width_pct: 100,
+            height_pct: 100,
+        },
+        dismiss_keys: vec![KeyCode::Esc, KeyCode::Char('l'), KeyCode::Char('q')],
+        body_margin: Margin {
+            horizontal: 1,
+            vertical: 0,
+        },
+        scroll: app.logs_scroll(),
+    };
+    popup.render(theme, frame, area);
+}
+
 /// Format one `LogLine` as `HH:MM:SS · pod · glyph · message`. Truncates
 /// the message so the whole row fits in `width` cells (best-effort — uses
 /// char count, not display width). The message is always truncated, never
@@ -569,7 +625,7 @@ fn render_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let mouse = if app.mouse_capture() { "on" } else { "off" };
     let mut spans: Vec<Span> = vec![Span::styled(
         format!(
-            " R:refresh  Space:pause  hjkl/arrows:focus  Enter:detail  s:spotlight  M:mouse({mouse})  ?:help  q:quit "
+            " R:refresh  Space:pause  hjk/arrows:focus  Enter:detail  s:spotlight  l:logs  M:mouse({mouse})  ?:help  q:quit "
         ),
         Style::default().fg(theme.muted),
     )];
@@ -868,7 +924,7 @@ fn render_help_overlay(theme: &Theme, frame: &mut Frame, area: Rect) {
         body,
         size_pct: PopupSize {
             width_pct: 60,
-            height_pct: 50,
+            height_pct: 80,
         },
         dismiss_keys: vec![KeyCode::Esc, KeyCode::Char('?')],
         body_margin: Margin {

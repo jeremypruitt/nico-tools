@@ -23,6 +23,7 @@ pub mod data;
 pub mod entity_extraction;
 pub mod events;
 pub mod hbn_panel;
+pub mod layout_solver;
 pub mod model;
 pub mod popup;
 pub mod pulse;

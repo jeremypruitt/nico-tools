@@ -22,6 +22,11 @@ pub enum Overlay {
     /// the correlate popup for the focused entity, `Esc` cancels.
     /// Entity list + focus index live on `App::chooser_state`.
     CorrelateChooser,
+    /// PRD-006 Slice 2 (#368): logs modal overlay. Opens via `l` from
+    /// either Scorecard or Spotlight; dismisses via `Esc` / `l` / `q`.
+    /// Renders the snapshot logs (`App::log_lines`) inside the popup
+    /// primitive at breakpoint-aware percentages from the layout solver.
+    Logs,
 }
 
 /// Reserved for future input modes (filter bar, etc.). Today only `Normal`
@@ -78,6 +83,7 @@ fn translate_key(key: &KeyEvent, _mode: Mode, layout: Layout, overlay: Overlay) 
         (_, Overlay::Detail | Overlay::Help) => translate_overlay(key, overlay),
         (_, Overlay::Correlate) => translate_correlate_overlay(key),
         (_, Overlay::CorrelateChooser) => translate_correlate_chooser(key),
+        (_, Overlay::Logs) => translate_logs_overlay(key),
         (Layout::Scorecard, Overlay::None) => translate_normal(key),
         (Layout::Spotlight, Overlay::None) => translate_spotlight(key),
     }
@@ -100,9 +106,13 @@ fn translate_normal(key: &KeyEvent) -> Option<Action> {
         // Finding (issue #157). Reducer turns it into a no-op when the
         // focused Layer is not `workflows`.
         KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::Correlate),
+        // PRD-006 Slice 2 (#368): `l` opens the logs modal. The previous
+        // vim-style `l` → Focus(Right) binding is dropped in favour of
+        // the logs overlay; arrow keys still cover right-nav.
+        KeyCode::Char('l') | KeyCode::Char('L') => Some(Action::ShowLogs),
         KeyCode::Enter => Some(Action::OpenDetail),
         KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
-        KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
+        KeyCode::Right => Some(Action::Focus(Dir::Right)),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::Focus(Dir::Up)),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
         _ => None,
@@ -128,6 +138,10 @@ fn translate_spotlight(key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::CopyNextCommand),
         KeyCode::Char('o') | KeyCode::Char('O') => Some(Action::OpenLink),
         KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::Correlate),
+        // PRD-006 Slice 2 (#368): `l` opens the logs modal from
+        // Spotlight too. The toast pointing at logs has always said
+        // "press `l` for logs"; this slice finally implements it.
+        KeyCode::Char('l') | KeyCode::Char('L') => Some(Action::ShowLogs),
         // Up/down still navigate cards (Spotlight is a vertical stack).
         KeyCode::Up | KeyCode::Char('k') => Some(Action::Focus(Dir::Up)),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
@@ -165,6 +179,21 @@ fn translate_correlate_chooser(key: &KeyEvent) -> Option<Action> {
         KeyCode::Enter => Some(Action::ChooserConfirm),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::ChooserNavigate(Dir::Up)),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::ChooserNavigate(Dir::Down)),
+        _ => None,
+    }
+}
+
+/// PRD-006 Slice 2 (#368): logs modal overlay. `Esc`, `l`, and `q` all
+/// dismiss. Quit-on-`q` is locally overridden so the operator can close
+/// the overlay without exiting the process; Ctrl-C still quits because
+/// the higher-level translator branch handles it before reaching here.
+fn translate_logs_overlay(key: &KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Esc
+        | KeyCode::Char('q')
+        | KeyCode::Char('Q')
+        | KeyCode::Char('l')
+        | KeyCode::Char('L') => Some(Action::CloseOverlay),
         _ => None,
     }
 }
@@ -265,12 +294,14 @@ mod tests {
     }
 
     #[test]
-    fn arrow_and_hjkl_map_to_focus_dirs() {
+    fn arrows_and_hjk_map_to_focus_dirs() {
+        // `l` is intentionally absent: PRD-006 Slice 2 (#368) rebinds it
+        // to the logs overlay. Vim-style left/up/down still work via
+        // h/j/k; right-nav falls back to the arrow key alone.
         for (code, dir) in [
             (KeyCode::Left, Dir::Left),
             (KeyCode::Char('h'), Dir::Left),
             (KeyCode::Right, Dir::Right),
-            (KeyCode::Char('l'), Dir::Right),
             (KeyCode::Up, Dir::Up),
             (KeyCode::Char('k'), Dir::Up),
             (KeyCode::Down, Dir::Down),
@@ -283,6 +314,57 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn l_opens_logs_overlay_from_scorecard() {
+        assert_eq!(
+            tr(&k(KeyCode::Char('l')), Overlay::None),
+            Some(Action::ShowLogs)
+        );
+        assert_eq!(
+            tr(&k(KeyCode::Char('L')), Overlay::None),
+            Some(Action::ShowLogs)
+        );
+    }
+
+    #[test]
+    fn l_opens_logs_overlay_from_spotlight() {
+        assert_eq!(
+            tr_spotlight(&k(KeyCode::Char('l'))),
+            Some(Action::ShowLogs)
+        );
+    }
+
+    fn logs_overlay(event: &Event, layout: Layout) -> Option<Action> {
+        translate(event, Mode::Normal, layout, Overlay::Logs)
+    }
+
+    #[test]
+    fn esc_l_q_dismiss_logs_overlay() {
+        for layout in [Layout::Scorecard, Layout::Spotlight] {
+            for key in [
+                KeyCode::Esc,
+                KeyCode::Char('l'),
+                KeyCode::Char('L'),
+                KeyCode::Char('q'),
+                KeyCode::Char('Q'),
+            ] {
+                assert_eq!(
+                    logs_overlay(&k(key), layout),
+                    Some(Action::CloseOverlay),
+                    "key={key:?} layout={layout:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_inside_logs_overlay() {
+        assert_eq!(
+            logs_overlay(&ctrl(KeyCode::Char('c')), Layout::Scorecard),
+            Some(Action::Quit)
+        );
     }
 
     #[test]
@@ -654,6 +736,7 @@ mod tests {
             CopyNextCommand,
             OpenLink,
             ToggleMouseCapture,
+            ShowLogs,
             ShowToast(MISSION_CONTROL_REMOVED_TOAST.to_string()),
             Focus(Dir::Up),
             Focus(Dir::Down),
@@ -695,6 +778,7 @@ mod tests {
                 Overlay::Help,
                 Overlay::Correlate,
                 Overlay::CorrelateChooser,
+                Overlay::Logs,
             ] {
                 for key in view_keys {
                     let result = translate(&k(*key), Mode::Normal, layout, overlay);
