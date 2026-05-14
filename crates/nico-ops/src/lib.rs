@@ -110,7 +110,10 @@ pub async fn run_ops(args: OpsArgs) -> i32 {
         }
     };
 
-    let result = run_event_loop(&mut terminal, &theme, bootstrapped, interval, SystemClock).await;
+    let features = cli::FeatureFlags::from_cli_names(&args.features);
+
+    let result =
+        run_event_loop(&mut terminal, &theme, bootstrapped, interval, features, SystemClock).await;
 
     let _ = restore_terminal(&mut terminal);
 
@@ -160,6 +163,7 @@ async fn run_event_loop<C: Clock>(
     theme: &Theme,
     bootstrapped: nico_doctor::Bootstrapped,
     interval: Duration,
+    features: cli::FeatureFlags,
     clock: C,
 ) -> io::Result<()> {
     // Mission Control (Layout B) was removed in PRD-006 slice 1 (issue
@@ -181,6 +185,7 @@ async fn run_event_loop<C: Clock>(
     let layers = Arc::new(layers);
 
     let mut app = App::with_interval(interval);
+    app.set_features(features);
     app.set_baseline(nico_doctor::baseline::load());
     let (tx, mut rx) = mpsc::channel::<Action>(64);
     let mut correlate_runner = CorrelateRunner::default();

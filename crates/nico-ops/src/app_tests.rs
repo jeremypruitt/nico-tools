@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli::FeatureFlags;
 use crate::model::{Confidence, EntityRef, PopoverEvent, SourceStatus};
 use nico_common::output::Status;
 use nico_correlate::id::IdType;
@@ -1559,4 +1560,140 @@ fn keypress_c_in_logs_overlay_routes_through_translator_to_popup_open() {
     let eff = app.handle(action);
     assert_eq!(eff, Some(Effect::RunCorrelate(entity_dpu("dpu-r12u5"))));
     assert_eq!(app.overlay(), Overlay::Correlate);
+}
+
+// ── PRD-007 Slice 5 (#379): event-timeline trigger (stub) ───────────────
+
+fn tag(k: &str, v: &str) -> (String, String) {
+    (k.to_string(), v.to_string())
+}
+
+#[test]
+fn correlate_event_row_with_host_id_tag_opens_popup_with_explicit_confidence() {
+    let mut app = App::new();
+    app.set_features(FeatureFlags {
+        events_overlay: true,
+    });
+    let eff = app.handle(Action::CorrelateEventRow {
+        text: "ignored message".into(),
+        tags: vec![tag("host_id", "host-r12u5")],
+    });
+    let expected = EntityRef {
+        id: "host-r12u5".into(),
+        id_type: IdType::Host,
+        confidence: Confidence::Explicit,
+    };
+    assert_eq!(eff, Some(Effect::RunCorrelate(expected.clone())));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    let state = app.correlate_state().expect("correlate popup opened");
+    assert_eq!(state.entity, expected);
+}
+
+#[test]
+fn correlate_event_row_with_no_matching_tag_falls_back_to_message_regex() {
+    let mut app = App::new();
+    app.set_features(FeatureFlags {
+        events_overlay: true,
+    });
+    let eff = app.handle(Action::CorrelateEventRow {
+        text: "stuck workflow hp-7f3a at 14:32".into(),
+        tags: vec![],
+    });
+    let expected = EntityRef {
+        id: "hp-7f3a".into(),
+        id_type: IdType::Workflow,
+        confidence: Confidence::Heuristic,
+    };
+    assert_eq!(eff, Some(Effect::RunCorrelate(expected)));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+}
+
+#[test]
+fn correlate_event_row_with_no_entity_raises_toast_and_no_overlay() {
+    let mut app = App::new();
+    app.set_features(FeatureFlags {
+        events_overlay: true,
+    });
+    let eff = app.handle(Action::CorrelateEventRow {
+        text: "nothing useful here".into(),
+        tags: vec![],
+    });
+    assert_eq!(eff, None);
+    assert_eq!(app.overlay(), Overlay::None);
+    assert_eq!(
+        app.toast().map(|t| t.message.as_str()),
+        Some("no entity found in this row")
+    );
+}
+
+#[test]
+fn correlate_event_row_with_multi_entity_message_opens_chooser() {
+    let mut app = App::new();
+    app.set_features(FeatureFlags {
+        events_overlay: true,
+    });
+    let eff = app.handle(Action::CorrelateEventRow {
+        text: "host-r12u5 had dpu-bf3-r12u5 disconnect".into(),
+        tags: vec![],
+    });
+    assert_eq!(eff, None);
+    assert_eq!(app.overlay(), Overlay::CorrelateChooser);
+    let chooser = app.chooser_state().expect("chooser opened");
+    assert_eq!(chooser.entities.len(), 2);
+    assert_eq!(chooser.entities[0].id, "host-r12u5");
+    assert_eq!(chooser.entities[1].id, "dpu-bf3-r12u5");
+}
+
+#[test]
+fn correlate_event_row_prefers_tag_even_when_message_carries_other_ids() {
+    // The tag is the authoritative source — message regex must not be
+    // consulted once a tag hits.
+    let mut app = App::new();
+    app.set_features(FeatureFlags {
+        events_overlay: true,
+    });
+    let eff = app.handle(Action::CorrelateEventRow {
+        text: "host-r12u5 had dpu-bf3-r12u5 disconnect".into(),
+        tags: vec![tag("dpu_id", "dpu-r99u9")],
+    });
+    let expected = EntityRef {
+        id: "dpu-r99u9".into(),
+        id_type: IdType::Dpu,
+        confidence: Confidence::Explicit,
+    };
+    assert_eq!(eff, Some(Effect::RunCorrelate(expected)));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+}
+
+#[test]
+fn correlate_event_row_is_inert_when_events_overlay_feature_disabled() {
+    // Stub gate: with the feature off (default), the action is silently
+    // dropped — no extraction, no overlay, no toast. This is the
+    // "deferred" contract from issue #379.
+    let mut app = App::new();
+    let eff = app.handle(Action::CorrelateEventRow {
+        text: "stuck workflow hp-7f3a".into(),
+        tags: vec![tag("host_id", "host-r12u5")],
+    });
+    assert_eq!(eff, None);
+    assert_eq!(app.overlay(), Overlay::None);
+    assert!(app.toast().is_none());
+}
+
+#[test]
+fn feature_flags_default_has_events_overlay_off() {
+    let f = FeatureFlags::default();
+    assert!(!f.events_overlay);
+}
+
+#[test]
+fn feature_flags_from_cli_names_parses_known_feature() {
+    let f = FeatureFlags::from_cli_names(&["events-overlay".to_string()]);
+    assert!(f.events_overlay);
+}
+
+#[test]
+fn feature_flags_from_cli_names_ignores_unknown_feature() {
+    let f = FeatureFlags::from_cli_names(&["not-a-real-feature".to_string()]);
+    assert!(!f.events_overlay);
 }

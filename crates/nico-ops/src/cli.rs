@@ -51,6 +51,44 @@ pub struct OpsArgs {
                 config (no namespace / gRPC re-pointing)."
     )]
     pub deployment_type: Option<String>,
+
+    #[arg(
+        long = "feature",
+        value_name = "NAME",
+        help = "Enable an experimental feature (repeat to enable several). \
+                Known: events-overlay (PRD-007 Slice 5 stub)."
+    )]
+    pub features: Vec<String>,
+}
+
+/// Compile-time-known experimental feature toggles. Today this only
+/// guards PRD-007 Slice 5 (#379)'s event-timeline trigger; new flags
+/// land here as additional `bool` fields. Off-by-default; populated from
+/// the repeatable `--feature NAME` CLI arg via
+/// [`FeatureFlags::from_cli_names`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureFlags {
+    /// PRD-007 Slice 5 (#379): when on, [`crate::action::Action::CorrelateEventRow`]
+    /// runs the Slice 1 extraction primitive and dispatches to the
+    /// correlate popup / chooser / toast. Off → the action is a no-op
+    /// (the deferred contract until the events overlay UI lands).
+    pub events_overlay: bool,
+}
+
+impl FeatureFlags {
+    /// Parse the `--feature NAME` repeats into a typed set. Unknown
+    /// names are silently ignored so the CLI surface stays
+    /// forward-compatible — early callers of a future flag won't fail
+    /// on older binaries.
+    pub fn from_cli_names(names: &[String]) -> Self {
+        let mut out = Self::default();
+        for n in names {
+            if n == "events-overlay" {
+                out.events_overlay = true;
+            }
+        }
+        out
+    }
 }
 
 impl Default for OpsArgs {
@@ -68,6 +106,7 @@ impl Default for OpsArgs {
             theme: None,
             interval: None,
             deployment_type: None,
+            features: vec![],
         }
     }
 }

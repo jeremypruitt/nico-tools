@@ -112,6 +112,18 @@ pub enum Action {
     /// PRD-006 Slice 2 (#368): open the logs modal overlay over the
     /// current view. Closed via `Action::CloseOverlay` (Esc / `l` / `q`).
     ShowLogs,
+    /// PRD-007 Slice 5 (#379): event-timeline trigger (stub). Carries the
+    /// event row's free text plus its tag set (`host_id`, `dpu_id`, etc.).
+    /// Reducer runs the Slice 1 extraction primitive in
+    /// [`crate::entity_extraction::ExtractionContext::EventRow`] mode and
+    /// dispatches to popup / chooser / toast. Gated by the
+    /// `events-overlay` feature flag — until the events overlay UI lands
+    /// there is no surface to fire this from, so the gate keeps the
+    /// trigger reducer-testable while staying inert in production.
+    CorrelateEventRow {
+        text: String,
+        tags: Vec<(String, String)>,
+    },
     /// `q` / `Ctrl-C` — exit cleanly.
     Quit,
 }

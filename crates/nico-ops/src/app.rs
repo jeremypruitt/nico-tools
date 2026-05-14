@@ -7,6 +7,7 @@ use nico_doctor::baseline::{Baseline, Delta, compute_deltas_for};
 use ratatui::layout::Rect;
 
 use crate::action::{Action, Dir, ScrollDir};
+use crate::cli::FeatureFlags;
 use crate::correlate_runner::CorrelateUpdate;
 use crate::events::Overlay;
 use crate::model::{
@@ -115,6 +116,7 @@ pub struct App {
     correlate: Option<CorrelateState>,
     chooser: Option<ChooserState>,
     log_lines: Vec<LogLine>,
+    features: FeatureFlags,
 }
 
 /// A transient bottom-bar message and its expiry timestamp. Cleared by
@@ -168,7 +170,23 @@ impl App {
             correlate: None,
             chooser: None,
             log_lines: Vec::new(),
+            features: FeatureFlags::default(),
         }
+    }
+
+    /// Replace the active set of experimental feature toggles. Host loop
+    /// calls this once during startup from the CLI-parsed
+    /// [`FeatureFlags`]. The reducer then branches off these (e.g.
+    /// `events_overlay` gates [`Action::CorrelateEventRow`]).
+    pub fn set_features(&mut self, features: FeatureFlags) {
+        self.features = features;
+    }
+
+    /// Read-only view of the experimental feature toggles. Renderer /
+    /// translator can use this to hide affordances tied to an off-flag
+    /// experiment.
+    pub fn features(&self) -> FeatureFlags {
+        self.features
     }
 
     /// Seed the baseline used for `NEW` / `FIXED` delta badges. Pass
@@ -639,6 +657,9 @@ impl App {
                 self.set_toast(&msg);
                 None
             }
+            Action::CorrelateEventRow { text, tags } => {
+                self.correlate_from_event_row(&text, &tags)
+            }
             Action::Quit => Some(Effect::Quit),
         }
     }
@@ -698,6 +719,43 @@ impl App {
                 self.dirty = true;
                 self.handle(Action::ShowCorrelateChooser(entities))
             }
+        }
+    }
+
+    /// PRD-007 Slice 5 (#379): handle `Action::CorrelateEventRow`. Tag
+    /// vocabulary (`host_id`, `dpu_id`, …) is preferred over message-text
+    /// regex; tagged hits get `Explicit` confidence, regex fallbacks get
+    /// `Heuristic`. Behaves identically to the log-line trigger from
+    /// there (popup / chooser / toast).
+    ///
+    /// Gated by the `events-overlay` feature flag — the events overlay
+    /// UI is not a PRD-007 deliverable, so the trigger ships behind the
+    /// gate and stays reducer-testable until a future PRD wires a
+    /// surface that fires this action.
+    fn correlate_from_event_row(
+        &mut self,
+        text: &str,
+        tags: &[(String, String)],
+    ) -> Option<Effect> {
+        if !self.features.events_overlay {
+            return None;
+        }
+        use crate::entity_extraction::{ExtractionContext, extract_entities};
+        // ExtractionContext::EventRow wants `&[(&str, &str)]`; reborrow
+        // the owned tag set into that shape for the one call.
+        let tag_refs: Vec<(&str, &str)> =
+            tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let entities = extract_entities(text, ExtractionContext::EventRow { tags: &tag_refs });
+        match entities.len() {
+            0 => {
+                self.set_toast("no entity found in this row");
+                None
+            }
+            1 => {
+                let entity = entities.into_iter().next().unwrap();
+                self.handle(Action::OpenCorrelatePopup(entity))
+            }
+            _ => self.handle(Action::ShowCorrelateChooser(entities)),
         }
     }
 
