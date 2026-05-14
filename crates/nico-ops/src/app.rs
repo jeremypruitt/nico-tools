@@ -676,6 +676,15 @@ impl App {
                 self.set_toast(&msg);
                 None
             }
+            Action::ToggleCorrelateFullscreen => {
+                match self.overlay {
+                    Overlay::Correlate => self.overlay = Overlay::CorrelateFullscreen,
+                    Overlay::CorrelateFullscreen => self.overlay = Overlay::Correlate,
+                    _ => return None,
+                }
+                self.dirty = true;
+                None
+            }
             Action::SpotlightDrillStub => {
                 if self.layout != Layout::Spotlight || self.overlay != Overlay::None {
                     return None;
@@ -705,11 +714,24 @@ impl App {
     /// First entity (DPU / workflow / host / request) extracted from a
     /// Finding on the currently focused row. PRD-007 Slice 0 broadens
     /// from the workflow-only path (issue #157) so `c` works on any row
-    /// that mentions an entity ID. Returns `None` when no Finding carries
-    /// a recognizable token; the reducer turns that into a toast in
-    /// Spotlight or stays silent in Scorecard.
+    /// that mentions an entity ID. PRD-007 Slice 4 (#377) prefers the
+    /// Findings detail surface's `next_command` field (NextCommand context,
+    /// `Parsed` confidence) over the legacy message regex (Heuristic) so
+    /// the detail-row trigger lands ahead of the Slice 0 fallback. Returns
+    /// `None` when neither surface yields an entity; the reducer turns
+    /// that into a toast in Spotlight or stays silent in Scorecard.
     fn focused_entity(&self) -> Option<EntityRef> {
+        use crate::entity_extraction::{ExtractionContext, extract_entities};
         let snap = self.focused_for_correlate()?;
+        let from_next_command = snap.findings.iter().find_map(|f| {
+            let cmd = f.next_command.as_deref()?;
+            extract_entities(cmd, ExtractionContext::NextCommand)
+                .into_iter()
+                .next()
+        });
+        if from_next_command.is_some() {
+            return from_next_command;
+        }
         snap.findings.iter().find_map(extract_entity_from_finding)
     }
 

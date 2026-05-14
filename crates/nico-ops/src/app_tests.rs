@@ -1003,15 +1003,24 @@ fn workflows_warn_snap_with_id(workflow_id: &str) -> LayerSnapshot {
 
 #[test]
 fn correlate_on_workflows_layer_opens_loading_overlay_and_emits_effect() {
+    // PRD-007 Slice 4 (#377): the `workflows` fixture carries a
+    // `next_command` (`temporal workflow show -w wf-001`); the slice 4
+    // NextCommand-first extraction lands a `Parsed` entity rather than
+    // the legacy Heuristic message-regex path.
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
         "wf-001",
     )]));
     let eff = app.handle(Action::Correlate);
-    assert_eq!(eff, Some(Effect::RunCorrelate(entity_wf("wf-001"))));
+    let expected = EntityRef {
+        id: "wf-001".into(),
+        id_type: IdType::Workflow,
+        confidence: Confidence::Parsed,
+    };
+    assert_eq!(eff, Some(Effect::RunCorrelate(expected.clone())));
     assert_eq!(app.overlay(), Overlay::Correlate);
     let cs = app.correlate_state().expect("correlate state set");
-    assert_eq!(cs.entity, entity_wf("wf-001"));
+    assert_eq!(cs.entity, expected);
     assert!(cs.is_loading(), "popup must start in the loading state");
     assert!(cs.sources.is_empty(), "no sources reported yet");
     assert!(cs.events.is_empty());
@@ -1704,4 +1713,169 @@ fn feature_flags_from_cli_names_parses_known_feature() {
 fn feature_flags_from_cli_names_ignores_unknown_feature() {
     let f = FeatureFlags::from_cli_names(&["not-a-real-feature".to_string()]);
     assert!(!f.events_overlay);
+}
+
+// ── PRD-007 Slice 4 (#377): Findings detail trigger + Enter-to-fullscreen ─
+
+fn spotlight_card_with_next_command(next: &str) -> LayerSnapshot {
+    LayerSnapshot {
+        name: "hbn".into(),
+        status: Status::Warn,
+        evidence: "1 drift".into(),
+        findings: vec![crate::model::Finding {
+            status: Status::Warn,
+            // Detail message intentionally carries no entity ID so we know
+            // the Parsed result must have come from `next_command`, not
+            // from a Heuristic fallback against the message.
+            message: "config drift detected on focused dpu".into(),
+            next_command: Some(next.into()),
+            link: None,
+        }],
+        duration_ms: 0,
+    }
+}
+
+#[test]
+fn spotlight_c_prefers_next_command_parsed_entity_over_message() {
+    // Acceptance: `c` on a Findings detail row whose `next_command` parses
+    // to an entity routes to `OpenCorrelatePopup` with `Parsed` confidence.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![spotlight_card_with_next_command(
+        "nico doctor hbn dpu-r12u5",
+    )]));
+    app.handle(Action::ShowSpotlight);
+    let eff = app.handle(Action::Correlate);
+    let expected = EntityRef {
+        id: "dpu-r12u5".into(),
+        id_type: IdType::Dpu,
+        confidence: Confidence::Parsed,
+    };
+    assert_eq!(eff, Some(Effect::RunCorrelate(expected.clone())));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    let cs = app.correlate_state().expect("correlate state set");
+    assert_eq!(cs.entity, expected);
+}
+
+#[test]
+fn enter_in_correlate_overlay_expands_to_fullscreen_preserving_state() {
+    // Acceptance: pressing Enter while the condensed correlate popup is
+    // open switches to the full-screen correlate view (overlay flips to
+    // `CorrelateFullscreen`) without disturbing the in-flight stream.
+    use crate::correlate_runner::CorrelateUpdate;
+    let mut app = App::new();
+    let entity = entity_dpu("dpu-r12u5");
+    app.handle(Action::OpenCorrelatePopup(entity.clone()));
+    apply(
+        &mut app,
+        &entity,
+        CorrelateUpdate::Loading {
+            sources: vec!["temporal", "postgres"],
+        },
+    );
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    let before = app.correlate_state().cloned();
+
+    let eff = app.handle(Action::ToggleCorrelateFullscreen);
+    assert_eq!(eff, None, "fullscreen toggle has no side effect");
+    assert_eq!(app.overlay(), Overlay::CorrelateFullscreen);
+    // Stream state must survive the toggle so the in-flight per-Source
+    // futures keep landing into the same popup.
+    let after = app.correlate_state().cloned();
+    assert_eq!(after, before, "correlate state must be preserved");
+}
+
+#[test]
+fn esc_in_fullscreen_collapses_to_condensed_popup_preserving_state() {
+    // Acceptance: Esc from the full-screen view collapses back to the
+    // condensed popup; the in-flight stream is preserved.
+    use crate::correlate_runner::CorrelateUpdate;
+    let mut app = App::new();
+    let entity = entity_dpu("dpu-r12u5");
+    app.handle(Action::OpenCorrelatePopup(entity.clone()));
+    apply(
+        &mut app,
+        &entity,
+        CorrelateUpdate::Loading {
+            sources: vec!["temporal"],
+        },
+    );
+    app.handle(Action::ToggleCorrelateFullscreen);
+    assert_eq!(app.overlay(), Overlay::CorrelateFullscreen);
+    let before = app.correlate_state().cloned();
+
+    let eff = app.handle(Action::ToggleCorrelateFullscreen);
+    assert_eq!(eff, None);
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    let after = app.correlate_state().cloned();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn fullscreen_correlate_updates_still_land_in_state() {
+    // Streaming updates that arrive while the operator is in fullscreen
+    // must continue to land. The stale-update guard keys on the entity
+    // (not on the overlay variant), so this is a sanity test that the
+    // CorrelateFullscreen overlay does not accidentally inhibit the
+    // existing CorrelateUpdate handler.
+    use crate::correlate_runner::CorrelateUpdate;
+    let mut app = App::new();
+    let entity = entity_dpu("dpu-r12u5");
+    app.handle(Action::OpenCorrelatePopup(entity.clone()));
+    app.handle(Action::ToggleCorrelateFullscreen);
+    assert_eq!(app.overlay(), Overlay::CorrelateFullscreen);
+    apply(
+        &mut app,
+        &entity,
+        CorrelateUpdate::Loading {
+            sources: vec!["temporal"],
+        },
+    );
+    let cs = app.correlate_state().expect("state still set");
+    let names: Vec<&str> = cs.sources.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["temporal"]);
+}
+
+#[test]
+fn close_overlay_from_fullscreen_cancels_stream_and_clears_state() {
+    // Closing from fullscreen must abort the per-Source futures and tear
+    // down state — same contract as closing from the condensed popup.
+    let mut app = App::new();
+    app.handle(Action::OpenCorrelatePopup(entity_dpu("dpu-r12u5")));
+    app.handle(Action::ToggleCorrelateFullscreen);
+    let eff = app.handle(Action::CloseOverlay);
+    assert_eq!(eff, Some(Effect::CancelCorrelate));
+    assert_eq!(app.overlay(), Overlay::None);
+    assert!(app.correlate_state().is_none());
+}
+
+#[test]
+fn toggle_fullscreen_outside_correlate_overlay_is_inert() {
+    // Fullscreen only applies while the correlate popup is open; firing
+    // the toggle from any other state (None, Help, Detail) must be inert
+    // so a stray keybind does not flip the dashboard into a half-state.
+    let mut app = App::new();
+    assert_eq!(app.handle(Action::ToggleCorrelateFullscreen), None);
+    assert_eq!(app.overlay(), Overlay::None);
+
+    app.handle(Action::OpenHelp);
+    assert_eq!(app.handle(Action::ToggleCorrelateFullscreen), None);
+    assert_eq!(app.overlay(), Overlay::Help);
+}
+
+#[test]
+fn spotlight_c_with_unparseable_next_command_raises_toast() {
+    // Acceptance: detail row with `next_command` set but no parseable
+    // entity → "no entity found in this row" toast, no overlay.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![spotlight_card_with_next_command(
+        "nico doctor --json",
+    )]));
+    app.handle(Action::ShowSpotlight);
+    let eff = app.handle(Action::Correlate);
+    assert_eq!(eff, None);
+    assert_eq!(app.overlay(), Overlay::None);
+    assert_eq!(
+        app.toast().map(|t| t.message.as_str()),
+        Some("no entity found in this row")
+    );
 }

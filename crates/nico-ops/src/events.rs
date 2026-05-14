@@ -22,6 +22,13 @@ pub enum Overlay {
     /// the correlate popup for the focused entity, `Esc` cancels.
     /// Entity list + focus index live on `App::chooser_state`.
     CorrelateChooser,
+    /// PRD-007 Slice 4 (#377): full-screen correlate view. Operator hit
+    /// `Enter` while the condensed correlate popup was open; the same
+    /// state and in-flight stream are rendered to fill the viewport
+    /// instead of inside the centered modal. `Esc` collapses back to
+    /// `Correlate`; `q` and the underlying close path tear down the
+    /// stream just like the condensed popup.
+    CorrelateFullscreen,
     /// PRD-006 Slice 2 (#368): logs modal overlay. Opens via `l` from
     /// either Scorecard or Spotlight; dismisses via `Esc` / `l` / `q`.
     /// Renders the snapshot logs (`App::log_lines`) inside the popup
@@ -82,6 +89,7 @@ fn translate_key(key: &KeyEvent, _mode: Mode, layout: Layout, overlay: Overlay) 
     match (layout, overlay) {
         (_, Overlay::Detail | Overlay::Help) => translate_overlay(key, overlay),
         (_, Overlay::Correlate) => translate_correlate_overlay(key),
+        (_, Overlay::CorrelateFullscreen) => translate_correlate_fullscreen(key),
         (_, Overlay::CorrelateChooser) => translate_correlate_chooser(key),
         (_, Overlay::Logs) => translate_logs_overlay(key),
         (Layout::Scorecard, Overlay::None) => translate_normal(key),
@@ -166,9 +174,26 @@ fn translate_overlay(key: &KeyEvent, overlay: Overlay) -> Option<Action> {
 /// Quick-correlate popover (issue #157). Both `Esc` and `q` dismiss; the
 /// usual quit-on-`q` is locally overridden so the operator can return to
 /// the dashboard without exiting the process.
+///
+/// PRD-007 Slice 4 (#377) adds `Enter` — expands the condensed popup to
+/// the full-screen correlate view (`Overlay::CorrelateFullscreen`); the
+/// in-flight stream and accumulated state are preserved across the flip.
 fn translate_correlate_overlay(key: &KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::CloseOverlay),
+        KeyCode::Enter => Some(Action::ToggleCorrelateFullscreen),
+        _ => None,
+    }
+}
+
+/// PRD-007 Slice 4 (#377): full-screen correlate view. `Esc` collapses
+/// back to the condensed popup (`Overlay::Correlate`); `q` closes the
+/// entire overlay, aborting the in-flight per-Source stream. Ctrl-C is
+/// handled by the top-level translator branch before we reach here.
+fn translate_correlate_fullscreen(key: &KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Esc => Some(Action::ToggleCorrelateFullscreen),
+        KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::CloseOverlay),
         _ => None,
     }
 }
@@ -631,6 +656,61 @@ mod tests {
     }
 
     #[test]
+    fn enter_in_correlate_overlay_toggles_fullscreen() {
+        // PRD-007 Slice 4 (#377): Enter from the condensed correlate
+        // popup is the fullscreen expand trigger; quit is still ctrl-c.
+        assert_eq!(
+            translate(
+                &k(KeyCode::Enter),
+                Mode::Normal,
+                Layout::Scorecard,
+                Overlay::Correlate,
+            ),
+            Some(Action::ToggleCorrelateFullscreen)
+        );
+    }
+
+    fn correlate_fullscreen(event: &Event) -> Option<Action> {
+        translate(
+            event,
+            Mode::Normal,
+            Layout::Scorecard,
+            Overlay::CorrelateFullscreen,
+        )
+    }
+
+    #[test]
+    fn esc_in_correlate_fullscreen_collapses_to_condensed_popup() {
+        assert_eq!(
+            correlate_fullscreen(&k(KeyCode::Esc)),
+            Some(Action::ToggleCorrelateFullscreen)
+        );
+    }
+
+    #[test]
+    fn q_in_correlate_fullscreen_closes_overlay_entirely() {
+        // Esc collapses; q is the explicit "close the drill" path so the
+        // operator can exit the correlate run from fullscreen without a
+        // two-step (Esc, then Esc again).
+        assert_eq!(
+            correlate_fullscreen(&k(KeyCode::Char('q'))),
+            Some(Action::CloseOverlay)
+        );
+        assert_eq!(
+            correlate_fullscreen(&k(KeyCode::Char('Q'))),
+            Some(Action::CloseOverlay)
+        );
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_inside_correlate_fullscreen() {
+        assert_eq!(
+            correlate_fullscreen(&ctrl(KeyCode::Char('c'))),
+            Some(Action::Quit)
+        );
+    }
+
+    #[test]
     fn q_closes_correlate_overlay_instead_of_quitting() {
         assert_eq!(
             translate(
@@ -812,6 +892,7 @@ mod tests {
                 Overlay::Detail,
                 Overlay::Help,
                 Overlay::Correlate,
+                Overlay::CorrelateFullscreen,
                 Overlay::CorrelateChooser,
                 Overlay::Logs,
             ] {

@@ -111,6 +111,13 @@ pub enum Action {
     /// reducer turns this into the documented stub toast. PRD-007 Slice
     /// 4 (#377) replaces the stub with the real correlate-popup launch.
     SpotlightDrillStub,
+    /// PRD-007 Slice 4 (#377): toggle between the condensed correlate
+    /// popup ([`crate::events::Overlay::Correlate`]) and the full-screen
+    /// correlate view ([`crate::events::Overlay::CorrelateFullscreen`]).
+    /// Inert outside of those two states. The in-flight stream and
+    /// accumulated state are preserved across the flip so the operator
+    /// can expand/collapse without restarting the correlate run.
+    ToggleCorrelateFullscreen,
     /// Show a transient toast in the bottom bar (e.g. "clipboard
     /// unavailable"). Auto-clears after `TOAST_TTL`.
     ShowToast(String),

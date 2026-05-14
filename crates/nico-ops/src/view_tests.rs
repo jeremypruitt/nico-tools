@@ -1499,10 +1499,15 @@ fn deliver_correlate_run(
 }
 
 fn entity_wf(id: &str) -> crate::model::EntityRef {
+    // PRD-007 Slice 4 (#377): `workflows_snap_with_id` carries a
+    // `next_command`, so the Slice-4 NextCommand-first extraction tags
+    // the workflow entity as `Parsed`; the stale-update guard in
+    // `Action::CorrelateUpdate` compares the full `EntityRef` (confidence
+    // included), so the deliver helper must mint Parsed too.
     crate::model::EntityRef {
         id: id.into(),
         id_type: nico_correlate::id::IdType::Workflow,
-        confidence: crate::model::Confidence::Heuristic,
+        confidence: crate::model::Confidence::Parsed,
     }
 }
 
@@ -2385,5 +2390,137 @@ fn logs_overlay_dismisses_and_returns_to_underlying_view() {
     assert!(
         after_close.contains("nico ops"),
         "underlying scorecard header missing after dismiss:\n{after_close}"
+    );
+}
+
+// ── PRD-007 Slice 4 (#377): fullscreen correlate view ───────────────
+
+#[test]
+fn correlate_fullscreen_renders_same_diagnosis_and_timeline_at_120_cols() {
+    // Acceptance: TestBackend snapshot of the full-screen correlate view
+    // at medium width (120 cols). Same data the condensed popup shows,
+    // rendered into a viewport-filling frame with the fullscreen action
+    // row (`[esc] back   [q] close`).
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![dpu_warn_snap(
+        "dpu-r12u5 disconnected at 14:32 (link down 5m)",
+    )]));
+    app.handle(Action::ShowSpotlight);
+    open_correlate(&mut app);
+    deliver_correlate_run(
+        &mut app,
+        entity_dpu("dpu-r12u5"),
+        vec![
+            (
+                "postgres",
+                vec![PopoverEvent {
+                    ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 30, 0).unwrap(),
+                    source: "postgres".into(),
+                    kind: "provision_fail".into(),
+                    message: "BMC unreachable after 3 retries".into(),
+                    severity: PopoverSeverity::Warning,
+                }],
+            ),
+            (
+                "redfish",
+                vec![PopoverEvent {
+                    ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 32, 0).unwrap(),
+                    source: "redfish".into(),
+                    kind: "NetworkAdapterFailed".into(),
+                    message: "link state down".into(),
+                    severity: PopoverSeverity::Error,
+                }],
+            ),
+        ],
+        vec![],
+        Some(crate::model::PopoverDiagnosis {
+            pattern: "k8s_crash_loop".into(),
+            error_signature: "pod worker-xyz in CrashLoopBackOff (6 restarts)".into(),
+            next_commands: vec!["kubectl describe pod worker-xyz".into()],
+        }),
+    );
+    // Operator presses Enter — expand to fullscreen.
+    app.handle(Action::ToggleCorrelateFullscreen);
+
+    let s = render_to_string(&mut app, 120, 30);
+    assert!(
+        s.contains("correlate (full)"),
+        "fullscreen title marker missing:\n{s}"
+    );
+    assert!(
+        s.contains("dpu-r12u5"),
+        "entity id missing in fullscreen title:\n{s}"
+    );
+    assert!(s.contains("diagnosis:"), "diagnosis banner missing:\n{s}");
+    assert!(
+        s.contains("k8s_crash_loop"),
+        "diagnosis pattern missing:\n{s}"
+    );
+    assert!(s.contains("provision_fail"), "timeline event missing:\n{s}");
+    assert!(
+        s.contains("NetworkAdapterFailed"),
+        "second timeline event missing:\n{s}"
+    );
+    assert!(s.contains("[esc] back"), "fullscreen action row missing:\n{s}");
+    assert!(
+        s.contains("[q] close"),
+        "fullscreen close hint missing:\n{s}"
+    );
+}
+
+#[test]
+fn correlate_fullscreen_uses_more_viewport_width_than_condensed_popup() {
+    // Sanity check on the "expand" UX: fullscreen renders the timeline
+    // wider than the condensed popup. We assert by counting the row
+    // length of the first timeline event row, which is bounded by the
+    // popup chrome's inner width.
+    let build = || -> App {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![dpu_warn_snap(
+            "dpu-r12u5 disconnected",
+        )]));
+        app.handle(Action::ShowSpotlight);
+        app.handle(Action::Correlate);
+        deliver_correlate_run(
+            &mut app,
+            entity_dpu("dpu-r12u5"),
+            vec![(
+                "redfish",
+                vec![PopoverEvent {
+                    ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 32, 0).unwrap(),
+                    source: "redfish".into(),
+                    kind: "NetworkAdapterFailed".into(),
+                    message: "link state down".into(),
+                    severity: PopoverSeverity::Error,
+                }],
+            )],
+            vec![],
+            None,
+        );
+        app
+    };
+    let mut condensed = build();
+    let mut fullscreen = build();
+    fullscreen.handle(Action::ToggleCorrelateFullscreen);
+
+    let condensed_render = render_to_string(&mut condensed, 120, 30);
+    let fullscreen_render = render_to_string(&mut fullscreen, 120, 30);
+
+    // Both render the same timeline event somewhere on the screen.
+    assert!(condensed_render.contains("NetworkAdapterFailed"));
+    assert!(fullscreen_render.contains("NetworkAdapterFailed"));
+    // The condensed popup is centered at 80% × 70%, so its border row
+    // contains a leading run of blank cells before the left `┌`. The
+    // fullscreen variant fills the viewport — the border starts at the
+    // very first column. Use that as the signal.
+    let condensed_first = condensed_render.lines().next().unwrap_or("");
+    let fullscreen_first = fullscreen_render.lines().next().unwrap_or("");
+    let leading_blanks = |line: &str| line.bytes().take_while(|b| *b == b' ').count();
+    assert!(
+        leading_blanks(fullscreen_first) < leading_blanks(condensed_first),
+        "fullscreen top border should start farther left than condensed; \
+         got fs_blanks={} cond_blanks={}\nfs:{fullscreen_first}\ncond:{condensed_first}",
+        leading_blanks(fullscreen_first),
+        leading_blanks(condensed_first),
     );
 }

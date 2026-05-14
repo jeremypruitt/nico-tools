@@ -91,6 +91,7 @@ fn render_scorecard_layout(app: &mut App, theme: &Theme, frame: &mut Frame) {
         Overlay::Detail => render_detail_overlay(app, theme, frame, area),
         Overlay::Help => render_help_overlay(theme, frame, area),
         Overlay::Correlate => render_correlate_overlay(app, theme, frame, area),
+        Overlay::CorrelateFullscreen => render_correlate_fullscreen(app, theme, frame, area),
         Overlay::CorrelateChooser => render_correlate_chooser_overlay(app, theme, frame, area),
         Overlay::Logs => render_logs_overlay(app, theme, frame, plan.logs_overlay.unwrap_or(area)),
         Overlay::None => {}
@@ -127,6 +128,7 @@ fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
     match app.overlay() {
         Overlay::Help => render_help_overlay(theme, frame, area),
         Overlay::Correlate => render_correlate_overlay(app, theme, frame, area),
+        Overlay::CorrelateFullscreen => render_correlate_fullscreen(app, theme, frame, area),
         Overlay::CorrelateChooser => render_correlate_chooser_overlay(app, theme, frame, area),
         Overlay::Logs => {
             let plan = solve(SolverInput {
@@ -734,6 +736,96 @@ fn render_correlate_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: R
         scroll: 0,
     }
     .render(theme, frame, area);
+}
+
+/// PRD-007 Slice 4 (#377): full-screen correlate view. Same data as the
+/// condensed popup; expanded to fill the viewport so the operator can
+/// read a long timeline without scrolling. Esc collapses back to the
+/// condensed popup (preserving the in-flight stream); q tears the entire
+/// overlay down.
+fn render_correlate_fullscreen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let Some(state) = app.correlate_state() else {
+        return;
+    };
+    Popup {
+        title: correlate_fullscreen_title(app, state),
+        body: correlate_fullscreen_body_lines(state, theme),
+        // 100%×100% — same Popup primitive, but stretched to fill the
+        // whole viewport so the chrome stays consistent with the
+        // condensed popup the operator just expanded out of.
+        size_pct: PopupSize {
+            width_pct: 100,
+            height_pct: 100,
+        },
+        dismiss_keys: vec![KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('Q')],
+        body_margin: Margin {
+            horizontal: 1,
+            vertical: 0,
+        },
+        scroll: 0,
+    }
+    .render(theme, frame, area);
+}
+
+fn correlate_fullscreen_title(app: &App, state: &CorrelateState) -> String {
+    let throb = app.throbber_glyph();
+    let (loading_marker, suffix) = if state.is_loading() {
+        if throb.is_empty() {
+            (String::new(), " collecting…")
+        } else {
+            (format!(" {throb}"), " collecting…")
+        }
+    } else {
+        (String::new(), "")
+    };
+    format!(
+        " correlate (full) — {}{}{} ",
+        state.entity.id, loading_marker, suffix
+    )
+}
+
+/// Same body composition as the condensed popup, but the action row at
+/// the bottom is rebound to match the fullscreen-only dismiss contract
+/// (`[esc] back`, `[q] close`).
+fn correlate_fullscreen_body_lines(state: &CorrelateState, theme: &Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if let Some(diag) = &state.diagnosis {
+        out.extend(diagnosis_banner_lines(diag, theme));
+    }
+    if !state.sources.is_empty() {
+        out.push(source_dots_line(state, theme));
+        out.push(Line::from(""));
+    }
+    if state.events.is_empty() && state.source_errors.is_empty() {
+        let msg = if state.is_loading() {
+            "loading timeline…".to_string()
+        } else {
+            format!("No events in the last 1h for {}", state.entity.id)
+        };
+        out.push(Line::from(Span::styled(
+            msg,
+            Style::default().fg(theme.muted),
+        )));
+    } else {
+        for e in &state.events {
+            out.push(format_popover_event(e, theme));
+        }
+        for se in &state.source_errors {
+            out.push(format_source_error(se, theme));
+        }
+    }
+    out.push(Line::from(""));
+    out.push(Line::from(vec![
+        Span::styled(
+            "[esc] back   ".to_string(),
+            Style::default().fg(theme.overlay_key),
+        ),
+        Span::styled(
+            "[q] close".to_string(),
+            Style::default().fg(theme.overlay_key),
+        ),
+    ]));
+    out
 }
 
 /// PRD-007 Slice 1 (#372): multi-match chooser popup. Centered ~50%×40%
