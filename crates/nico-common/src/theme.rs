@@ -1,4 +1,5 @@
 use ratatui::style::Color;
+use ratatui::widgets::{Block, Borders};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
@@ -66,6 +67,24 @@ pub const NO_COLOR_THEME: Theme = Theme {
 };
 
 impl Theme {
+    /// Block factory for an *outermost* view container — Scorecard frame,
+    /// Spotlight frame, logs overlay frame, popup frame. Carries
+    /// `Borders::ALL`. Pairs with [`Theme::plain_block`] so call sites
+    /// express intent (frame vs. inner widget) rather than copying border
+    /// flags around. See ADR-0008 §"Container vs. plain block split".
+    pub fn container_block(&self) -> Block<'static> {
+        Block::default().borders(Borders::ALL)
+    }
+
+    /// Block factory for an *inner* widget — anything inside an outer
+    /// frame that should not draw its own border. The Block still
+    /// accepts a title (rendered on its top row) so headers and section
+    /// labels keep their text. See ADR-0008 §"Container vs. plain block
+    /// split".
+    pub fn plain_block(&self) -> Block<'static> {
+        Block::default()
+    }
+
     pub fn from_name(s: &str) -> Result<Theme, String> {
         match s {
             "default" => Ok(DEFAULT),
@@ -321,6 +340,50 @@ mod tests {
     fn resolve_theme_with_invalid_flag_returns_err_even_without_no_color() {
         let err = resolve_theme_with(Some("solarized"), false, None).unwrap_err();
         assert!(err.contains("solarized"));
+    }
+
+    // --- container_block / plain_block split (issue #370) ---
+
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn container_block_shrinks_inner_area_by_borders() {
+        // A bordered block (Borders::ALL) shrinks `inner(area)` by 1 on
+        // each side. That's how render code expresses "this widget is an
+        // outermost frame with a visible border".
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let block = DEFAULT.container_block();
+        let inner = block.inner(area);
+        assert_eq!(
+            inner.width, 8,
+            "container_block inner should be area - 2 columns"
+        );
+        assert_eq!(
+            inner.height, 8,
+            "container_block inner should be area - 2 rows"
+        );
+    }
+
+    #[test]
+    fn plain_block_leaves_inner_area_unchanged() {
+        // No borders → `inner(area)` returns the area untouched. Render
+        // code uses this to express "this is an inner widget; don't draw
+        // a frame around it".
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let block = DEFAULT.plain_block();
+        let inner = block.inner(area);
+        assert_eq!(inner.width, 10);
+        assert_eq!(inner.height, 10);
     }
 
     #[test]

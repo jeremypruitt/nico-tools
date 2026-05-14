@@ -1526,11 +1526,15 @@ fn popup_renders_source_dots_row_during_loading_with_three_sources_pending() {
         s.contains('⟳'),
         "expected ⟳ Pending glyph in dots row:\n{s}"
     );
-    // No ● Landed glyph yet — none of the Sources reported.
-    assert!(
-        !s.contains('●'),
-        "no ● Landed glyph should appear before any SourceLanded update:\n{s}"
-    );
+    // No ● Landed glyph next to a Source name yet — none of the Sources
+    // reported. (The bottom-bar legend renders ● for OK; we look for the
+    // `● <source>` dots-row form specifically.)
+    for name in ["temporal", "postgres", "loki"] {
+        assert!(
+            !s.contains(&format!("● {name}")),
+            "no `● {name}` dot should appear before SourceLanded update:\n{s}"
+        );
+    }
 }
 
 #[test]
@@ -1671,6 +1675,197 @@ fn popup_renders_loaded_without_diagnosis_state_at_all_three_widths() {
             "timeline must still render at width {w}:\n{s}"
         );
     }
+}
+
+// --- severity legend (issue #370) ---
+//
+// The bottom bar carries a permanent severity legend so operators can
+// decode every glyph in the dashboard without consulting `?` help. At
+// medium/large widths the legend pairs each glyph with its label (Fail,
+// Warn, OK, Unknown); at small widths it collapses to glyphs-only so the
+// row still fits.
+
+#[test]
+fn severity_legend_line_at_wide_width_contains_all_four_labels() {
+    let line = severity_legend_line(&DEFAULT, 120);
+    let text = line_text(&line);
+    for label in ["Fail", "Warn", "OK", "Unknown"] {
+        assert!(
+            text.contains(label),
+            "expected {label:?} in legend: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn severity_legend_line_at_medium_width_contains_all_four_labels() {
+    // Medium = 60..90: still shows full text.
+    let line = severity_legend_line(&DEFAULT, 60);
+    let text = line_text(&line);
+    for label in ["Fail", "Warn", "OK", "Unknown"] {
+        assert!(
+            text.contains(label),
+            "expected {label:?} at width 60: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn severity_legend_line_at_small_width_renders_glyphs_only() {
+    // Below 60 cols: glyphs only, no text labels.
+    let line = severity_legend_line(&DEFAULT, 50);
+    let text = line_text(&line);
+    for label in ["Fail", "Warn", "OK", "Unknown"] {
+        assert!(
+            !text.contains(label),
+            "small-width legend must not include {label:?}: {text:?}"
+        );
+    }
+    // Glyphs still present.
+    for glyph in [
+        pip_glyph(&Status::Fail),
+        pip_glyph(&Status::Warn),
+        pip_glyph(&Status::Ok),
+        pip_glyph(&Status::Unknown),
+    ] {
+        assert!(
+            text.contains(glyph),
+            "expected glyph {glyph:?} at small width: {text:?}"
+        );
+    }
+}
+
+fn line_text(line: &Line) -> String {
+    let mut out = String::new();
+    for span in &line.spans {
+        out.push_str(&span.content);
+    }
+    out
+}
+
+#[test]
+fn scorecard_layout_renders_legend_labels_in_bottom_bar() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    let s = render_to_string(&mut app, 120, 24);
+    for label in ["Fail", "Warn", "OK", "Unknown"] {
+        assert!(
+            s.contains(label),
+            "legend label {label} missing from scorecard view:\n{s}"
+        );
+    }
+}
+
+#[test]
+fn spotlight_layout_renders_legend_labels_in_bottom_bar() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::ShowSpotlight);
+    let s = render_to_string(&mut app, 120, 24);
+    for label in ["Fail", "Warn", "OK", "Unknown"] {
+        assert!(
+            s.contains(label),
+            "legend label {label} missing from spotlight view:\n{s}"
+        );
+    }
+}
+
+// --- border-rule pass (issue #370) ---
+//
+// Inner widgets (header, drill panel, grid-empty placeholder,
+// Spotlight-empty placeholder) drop their own borders so only the
+// outermost frames (per-Scorecard cell, per-Spotlight card, logs overlay,
+// popup) carry a visible frame. Helps the scorecard read as one
+// integrated dashboard rather than a stack of boxes.
+
+#[test]
+fn drill_panel_does_not_render_its_own_border() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    let s = render_to_string(&mut app, 120, 24);
+    // The findings title still renders…
+    assert!(
+        s.contains("findings — cluster"),
+        "findings title missing:\n{s}"
+    );
+    // …but it should not be wrapped in a box: there must be no row of the
+    // form "┌ findings — cluster ─" — that's the border-with-title shape.
+    assert!(
+        !s.contains("┌ findings"),
+        "drill panel must not draw a top border:\n{s}"
+    );
+}
+
+#[test]
+fn scorecard_header_does_not_render_its_own_border() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    let s = render_to_string(&mut app, 120, 24);
+    // The "nico ops" title is still there…
+    assert!(s.contains("nico ops"), "header title missing:\n{s}");
+    // …without the surrounding box.
+    assert!(
+        !s.contains("┌ nico ops"),
+        "header must not draw a top border:\n{s}"
+    );
+}
+
+#[test]
+fn empty_grid_placeholder_does_not_render_its_own_border() {
+    let mut app = App::new();
+    // No snapshots → grid renders the empty `layers` placeholder.
+    let s = render_to_string(&mut app, 120, 24);
+    assert!(
+        !s.contains("┌ layers"),
+        "empty grid placeholder must not draw a border:\n{s}"
+    );
+}
+
+#[test]
+fn spotlight_no_incidents_empty_state_does_not_render_its_own_border() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![LayerSnapshot {
+        name: "cluster".into(),
+        status: Status::Ok,
+        evidence: "all green".into(),
+        findings: vec![],
+        duration_ms: 0,
+    }]));
+    app.handle(Action::ShowSpotlight);
+    let s = render_to_string(&mut app, 120, 24);
+    assert!(
+        !s.contains("┌ no incidents"),
+        "spotlight no-incidents placeholder must not draw a border:\n{s}"
+    );
+}
+
+#[test]
+fn scorecard_card_keeps_outer_border() {
+    // Outer frames (per-scorecard cell) must keep their visible border —
+    // that's how the grid renders as distinct, glanceable cells.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    let s = render_to_string(&mut app, 120, 24);
+    // Non-focused cells render `┌ <name>`; the focused one prefixes with
+    // `▶`, so we anchor on `┌ logs` (always non-focused at index 1).
+    assert!(
+        s.contains("┌ logs"),
+        "scorecard cell must keep its top border:\n{s}"
+    );
+}
+
+#[test]
+fn spotlight_card_keeps_outer_border() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::ShowSpotlight);
+    let s = render_to_string(&mut app, 120, 24);
+    // Spotlight card border carries the focused-row marker `▶` and the
+    // pip glyph; the corner glyph anchors the outer frame.
+    assert!(
+        s.contains("┌"),
+        "spotlight card must keep its outer border corner:\n{s}"
+    );
 }
 
 #[test]

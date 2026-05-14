@@ -71,6 +71,9 @@ pub struct LayoutPlan {
     pub header: Rect,
     pub body: Rect,
     pub drill: Rect,
+    /// One-row severity legend sandwiched between the drill panel and
+    /// the hint bar (issue #370). Pure read-only.
+    pub legend_bar: Rect,
     pub hint_bar: Rect,
     pub logs_overlay: Option<Rect>,
     pub breakpoint: Breakpoint,
@@ -80,7 +83,7 @@ pub struct LayoutPlan {
 pub fn solve(input: SolverInput) -> LayoutPlan {
     let breakpoint = Breakpoint::for_width(input.viewport.width);
 
-    let (header, body, drill, hint_bar) = match input.view {
+    let (header, body, drill, legend_bar, hint_bar) = match input.view {
         AppLayout::Scorecard => split_scorecard(input.viewport),
         AppLayout::Spotlight => split_scorecard(input.viewport),
     };
@@ -93,23 +96,25 @@ pub fn solve(input: SolverInput) -> LayoutPlan {
         header,
         body,
         drill,
+        legend_bar,
         hint_bar,
         logs_overlay,
         breakpoint,
     }
 }
 
-fn split_scorecard(area: Rect) -> (Rect, Rect, Rect, Rect) {
+fn split_scorecard(area: Rect) -> (Rect, Rect, Rect, Rect, Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
             Constraint::Min(7),    // body
             Constraint::Min(5),    // drill
+            Constraint::Length(1), // severity legend
             Constraint::Length(1), // hint bar
         ])
         .split(area);
-    (chunks[0], chunks[1], chunks[2], chunks[3])
+    (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4])
 }
 
 /// Width × height percentages for the centered logs-overlay modal at
@@ -180,22 +185,24 @@ mod tests {
 
         // Panes share the viewport's x/width and stack from top to bottom
         // covering the full height with no gaps and no overlaps.
-        for pane in [plan.header, plan.body, plan.drill, plan.hint_bar] {
+        for pane in [plan.header, plan.body, plan.drill, plan.legend_bar, plan.hint_bar] {
             assert_eq!(pane.x, viewport.x);
             assert_eq!(pane.width, viewport.width);
         }
         assert_eq!(plan.header.y, viewport.y);
         assert_eq!(plan.body.y, plan.header.y + plan.header.height);
         assert_eq!(plan.drill.y, plan.body.y + plan.body.height);
-        assert_eq!(plan.hint_bar.y, plan.drill.y + plan.drill.height);
+        assert_eq!(plan.legend_bar.y, plan.drill.y + plan.drill.height);
+        assert_eq!(plan.hint_bar.y, plan.legend_bar.y + plan.legend_bar.height);
         assert_eq!(
             plan.hint_bar.y + plan.hint_bar.height,
             viewport.y + viewport.height,
         );
 
-        // Constraints from the existing renderer: header fixed at 3,
-        // hint bar fixed at 1. Body and drill flex.
+        // Constraints from the existing renderer: header fixed at 3, legend
+        // bar fixed at 1, hint bar fixed at 1. Body and drill flex.
         assert_eq!(plan.header.height, 3);
+        assert_eq!(plan.legend_bar.height, 1);
         assert_eq!(plan.hint_bar.height, 1);
         assert!(plan.body.height >= 7);
         assert!(plan.drill.height >= 5);

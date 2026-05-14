@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use tui_big_text::{BigText, PixelSize};
 
@@ -84,6 +84,7 @@ fn render_scorecard_layout(app: &mut App, theme: &Theme, frame: &mut Frame) {
     let regions = render_grid(app, theme, frame, plan.body);
     app.set_card_regions(regions);
     render_drill(app, theme, frame, plan.drill);
+    render_legend_bar(theme, frame, plan.legend_bar);
     render_hint_bar(app, theme, frame, plan.hint_bar);
 
     match app.overlay() {
@@ -106,6 +107,7 @@ fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
             Constraint::Length(SPOTLIGHT_HEADER_HEIGHT),
             Constraint::Min(SPOTLIGHT_CARD_HEIGHT),
             Constraint::Length(1), // green footer
+            Constraint::Length(1), // severity legend
             Constraint::Length(1), // hint bar
         ])
         .split(area);
@@ -113,7 +115,8 @@ fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
     render_spotlight_header(app, theme, frame, chunks[0]);
     render_spotlight_cards(app, theme, frame, chunks[1]);
     render_spotlight_green_footer(app, theme, frame, chunks[2]);
-    render_spotlight_hint_bar(app, theme, frame, chunks[3]);
+    render_legend_bar(theme, frame, chunks[3]);
+    render_spotlight_hint_bar(app, theme, frame, chunks[4]);
 
     // Spotlight still honors the help overlay (`?`) so the operator can
     // see all keybinds, including the Spotlight-only ones. PRD-006 Slice
@@ -163,9 +166,9 @@ fn render_spotlight_header(app: &App, theme: &Theme, frame: &mut Frame, area: Re
 fn render_spotlight_cards(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let cards = app.spotlight_cards();
     if cards.is_empty() {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" no incidents ");
+        // Empty-state placeholder is an inner widget — title only, no
+        // border (issue #370 border-rule pass).
+        let block = theme.plain_block().title(" no incidents ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let line = Line::from(Span::styled(
@@ -205,15 +208,14 @@ fn render_spotlight_card(
     } else {
         format!("   {} ", snap.name)
     };
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![
-            Span::styled(
-                pip_glyph(&snap.status).to_string(),
-                Style::default().fg(pip_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(title),
-        ]));
+    // Per-card Spotlight frame is an outermost container — keep border.
+    let mut block = theme.container_block().title(Line::from(vec![
+        Span::styled(
+            pip_glyph(&snap.status).to_string(),
+            Style::default().fg(pip_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(title),
+    ]));
     if focused {
         block = block.border_style(
             Style::default()
@@ -332,8 +334,10 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         format!(" {timestamp}  {throbber} ")
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    // Header is an inner widget within the Scorecard view — title yes,
+    // border no (issue #370 border-rule pass).
+    let block = theme
+        .plain_block()
         .title(" nico ops ")
         .title_top(Line::from(title_right).right_aligned());
     let inner = block.inner(area);
@@ -344,7 +348,9 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Vec<Rect> {
     let snapshots = app.snapshots();
     if snapshots.is_empty() {
-        let block = Block::default().borders(Borders::ALL).title(" layers ");
+        // Empty-grid placeholder is an inner widget; the per-cell
+        // Scorecard frames below carry the only borders.
+        let block = theme.plain_block().title(" layers ");
         frame.render_widget(block, area);
         return Vec::new();
     }
@@ -410,9 +416,8 @@ fn render_scorecard(app: &App, idx: usize, theme: &Theme, frame: &mut Frame, are
         ));
         title_spans.push(Span::raw(" "));
     }
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(title_spans));
+    // Per-cell Scorecard frame is an outermost container — keep border.
+    let mut block = theme.container_block().title(Line::from(title_spans));
     if focused {
         block = block.border_style(
             Style::default()
@@ -465,7 +470,9 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         Some(s) => format!(" findings — {} ", s.name),
         None => " findings ".to_string(),
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    // Drill panel is an inner widget within the Scorecard view — title
+    // only, no border (issue #370 border-rule pass).
+    let block = theme.plain_block().title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -499,7 +506,8 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 /// can't render past the end. Empty `lines` yields a "no errors" empty
 /// state. Issue #158, ADR-0014.
 fn render_logs_panel(lines: &[LogLine], scroll: u16, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL);
+    // Logs overlay is an outermost frame (per ADR-0008 amendment).
+    let block = theme.container_block();
     let inner = block.inner(area);
     let total = lines.len();
     let max_offset = total.saturating_sub(inner.height as usize);
@@ -1018,6 +1026,43 @@ fn split_help_line(line: &str) -> (&str, &str) {
         }
         None => (line, ""),
     }
+}
+
+/// Renders the severity legend row into `area`. Single-row primitive used
+/// by both Scorecard and Spotlight layouts (issue #370).
+fn render_legend_bar(theme: &Theme, frame: &mut Frame, area: Rect) {
+    let line = severity_legend_line(theme, area.width);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Bottom-bar severity legend (issue #370). Decodes the four dashboard
+/// glyphs so operators don't have to consult `?` help. At width < 60 the
+/// row collapses to glyphs-only so the legend still fits next to the hint
+/// row at narrow widths; at 60+ each glyph carries its `Fail`/`Warn`/`OK`/
+/// `Unknown` label. Pure read-only; no interaction. Colors come from the
+/// active theme so it reads consistently across dracula/nord/gruvbox.
+pub fn severity_legend_line(theme: &Theme, width: u16) -> Line<'static> {
+    let glyphs_only = width < 60;
+    let entries: [(Status, &str); 4] = [
+        (Status::Fail, "Fail"),
+        (Status::Warn, "Warn"),
+        (Status::Ok, "OK"),
+        (Status::Unknown, "Unknown"),
+    ];
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (status, label)) in entries.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(if glyphs_only { " " } else { "  ·  " }));
+        }
+        spans.push(Span::styled(
+            pip_glyph(status).to_string(),
+            Style::default().fg(theme_color(theme, status)),
+        ));
+        if !glyphs_only {
+            spans.push(Span::raw(format!(" {label}")));
+        }
+    }
+    Line::from(spans)
 }
 
 /// 3-up grid is the design (see ADR-010); reflows to 2-up below 90 cols

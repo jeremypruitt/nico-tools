@@ -20,7 +20,7 @@ use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::Style;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 /// Centered bordered modal: title in the top border, body lines inside,
 /// dismiss keys consulted by [`Popup::dismisses`].
@@ -50,8 +50,10 @@ impl Popup {
     /// configured margin and scroll offset.
     pub fn render(&self, theme: &Theme, frame: &mut Frame, area: Rect) {
         let inner_area = centered(area, self.size_pct.width_pct, self.size_pct.height_pct);
-        let block = Block::default()
-            .borders(Borders::ALL)
+        // Popup frame is an outermost container — keep border (issue
+        // #370 border-rule pass).
+        let block = theme
+            .container_block()
             .title(self.title.clone())
             .style(Style::default().bg(theme.overlay_bg).fg(theme.overlay_fg));
         let inner = block.inner(inner_area);

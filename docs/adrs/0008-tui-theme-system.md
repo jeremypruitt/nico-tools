@@ -81,6 +81,17 @@ Invalid theme name → hard fail at startup with an error message listing all va
 - **`selected` as an 8th role**: discussed and dropped — selected row highlight uses `Modifier::REVERSED` on the existing cell style, which is theme-agnostic.
 - **Auto-detecting terminal background (dark vs light)**: deferred to a follow-up issue; graceful degradation is complex enough to warrant its own design pass.
 
+## Amendment — Container vs. plain block split (issue #370, 2026-05-13)
+
+PRD-006 Slice 4 introduces a two-method block factory on `Theme` so render call sites can express *intent* — "this is an outermost frame" vs. "this is an inner widget" — rather than each site copying `Borders::ALL` flags inline.
+
+- `Theme::container_block()` returns a `Block` with `Borders::ALL`. Callers add titles and styles on top. Used by the outermost view containers only: per-cell Scorecard frame, per-card Spotlight frame, logs overlay frame, popup frame.
+- `Theme::plain_block()` returns a `Block` with no borders. Callers may still attach a title (rendered on the first row of the area). Used by every inner widget: Scorecard header, drill-panel findings list, the empty-grid `layers` placeholder, the Spotlight `no incidents` placeholder.
+
+Both methods take `&self` so the split can later evolve to apply theme-specific defaults (e.g., bordered with a themed border colour) without churning call sites.
+
+The amendment also documents a bottom-bar pixel that pairs with the split: every layout (Scorecard + Spotlight) now carries a one-row severity legend immediately above the hint bar. `severity_legend_line(theme, width)` is the pure primitive: at width ≥ 60 it pairs each glyph with its `Fail`/`Warn`/`OK`/`Unknown` label; at width < 60 it collapses to glyphs-only so the row still fits. The legend is read-only — no interaction — and is rendered through the same `theme_color()` mapping used by every other glyph in the dashboard so the palette stays consistent.
+
 ## Related
 
 - ADR-004: Color semantics (plain-text output color roles)
